@@ -1432,23 +1432,171 @@ class MixedPrecisionTrainer:
         }
 
 
-# Insert LearnedBytePatcherEncoder class definition before EnhancedCTMConfig
-class LearnedBytePatcherEncoder(nn.Module):
-    def __init__(self, patch_size: int, embedding_dim: int, cnn_channels: int = 64):
-        super().__init__()
-        self.patch_size = patch_size
-        self.embedding_dim = embedding_dim
-        self.output_dim = embedding_dim # For consistency
+## Note: The following class definition should be inserted as requested.
+# It replaces the provided `DynamicEntropyPatcher` with an implementation
+# based on the logic from the "Byte Latent Transformer" paper.
 
-        self.conv_encoder = nn.Sequential(
-            nn.Conv1d(in_channels=1, out_channels=cnn_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(cnn_channels),
-            nn.ReLU(),
-            nn.Conv1d(cnn_channels, embedding_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm1d(embedding_dim),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1) # Pool to a single vector per patch
+class _EntropyProxyModel(nn.Module):
+    """
+    A learnable RNN-based model to estimate next-byte entropy and provide a
+    training loss for itself.
+    It predicts the probability distribution of the next byte and calculates entropy
+    from this distribution.
+    """
+    def __init__(self,
+                 byte_vocab_size: int = 256,
+                 embedding_dim: int = 64,
+                 hidden_dim: int = 128,
+                 num_layers: int = 1,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.byte_vocab_size = byte_vocab_size
+        self.embedding = nn.Embedding(byte_vocab_size, embedding_dim)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers,
+                              batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.fc = nn.Linear(hidden_dim, byte_vocab_size)
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, byte_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            byte_sequence: Tensor of shape (batch_size, seq_len), dtype=torch.uint8.
+
+        Returns:
+            A tuple containing:
+            - entropy_scores: Tensor of shape (batch_size, seq_len), dtype=torch.float32.
+                              Entropy of the predicted next-byte distribution at each position.
+            - aux_loss: Scalar tensor, the cross-entropy loss for next-byte prediction.
+        """
+        batch_size, seq_len = byte_sequence.shape
+        device = byte_sequence.device
+
+        # Embed byte sequence
+        embedded = self.embedding(byte_sequence)  # (batch_size, seq_len, embedding_dim)
+
+        # Get LSTM outputs for predicting the *next* byte
+        # For predicting byte at t+1, we use LSTM output at time t
+        # So, we pass the sequence up to seq_len-1 to predict bytes from 1 to seq_len
+        lstm_input = embedded[:, :-1, :] # (batch_size, seq_len-1, embedding_dim)
+        
+        if lstm_input.shape[1] == 0: # Handle sequences of length 1
+            # Cannot predict next byte for a sequence of length 1 in this setup
+            # Return zero loss and zero/uniform entropy
+            dummy_entropy = torch.zeros((batch_size, seq_len), device=device, dtype=torch.float32)
+            # Uniform entropy for the single byte if needed, or just zero
+            if seq_len > 0:
+                 dummy_entropy[:,0] = -torch.log(torch.tensor(1.0/self.byte_vocab_size, device=device))
+
+            return dummy_entropy, torch.tensor(0.0, device=device)
+
+        lstm_out, _ = self.lstm(lstm_input)  # (batch_size, seq_len-1, hidden_dim)
+        
+        # Get logits for the next byte prediction
+        # logits for byte_1, byte_2, ..., byte_{seq_len-1}
+        next_byte_logits = self.fc(lstm_out) # (batch_size, seq_len-1, byte_vocab_size)
+
+        # Calculate auxiliary loss for next-byte prediction
+        # Targets are byte_sequence from 1 to seq_len
+        targets = byte_sequence[:, 1:].long() # (batch_size, seq_len-1)
+        
+        # Reshape for CrossEntropyLoss: (N, C, d1, d2, ...) -> (batch_size * (seq_len-1), byte_vocab_size)
+        # Targets: (N, d1, d2, ...) -> (batch_size * (seq_len-1))
+        aux_loss = self.criterion(next_byte_logits.reshape(-1, self.byte_vocab_size), targets.reshape(-1))
+
+        # Calculate entropy scores from predicted probabilities
+        # We need entropy for each position t based on prediction for x_t
+        # The current next_byte_logits are for x_1, ..., x_{seq_len-1}
+        # For x_0, we don't have a prediction from LSTM, assume uniform entropy or a fixed high value.
+        
+        probs = F.softmax(next_byte_logits, dim=-1) # (batch_size, seq_len-1, byte_vocab_size)
+        entropy_from_predictions = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1) # (batch_size, seq_len-1)
+
+        # Initialize entropy_scores for the full sequence length
+        entropy_scores = torch.zeros((batch_size, seq_len), device=device, dtype=torch.float32)
+        
+        # Set entropy for the first byte (t=0) to a high value (e.g., log(vocab_size) for uniform)
+        # This ensures the first byte can start a patch, similar to the original heuristic.
+        entropy_scores[:, 0] = -torch.log(torch.tensor(1.0/self.byte_vocab_size, device=device))
+        
+        # Fill in entropies for t=1 to seq_len-1
+        if seq_len > 1:
+            entropy_scores[:, 1:] = entropy_from_predictions
+            
+        return entropy_scores, aux_loss
+
+class LearnedBytePatcherEncoder(nn.Module): #This is supposed to replace the DynamicEntropyPatcher and properly use dynamic byte patching based on complexity (entropy).
+    """
+    Implements the dynamic, entropy-based patching and encoding mechanism
+    inspired by the "Byte Latent Transformer" (BLT) paper.
+
+    This module segments a raw byte sequence into variable-length patches based on
+    next-byte entropy estimates, then encodes these patches into fixed-size vectors.
+    """
+    def __init__(self,
+                 embedding_dim: int,
+                 patch_cnn_channels: int,
+                 patching_mode: str = "global",
+                 global_threshold: float = 0.5,
+                 relative_threshold: float = 0.1,
+                 min_patch_size: int = 4,
+                 max_patch_size: int = 128,
+                 # New parameters for the learnable _EntropyProxyModel
+                 entropy_byte_vocab_size: int = 256,
+                 entropy_embedding_dim: int = 64,
+                 entropy_hidden_dim: int = 128,
+                 entropy_num_layers: int = 1,
+                 entropy_dropout: float = 0.1):
+        """
+        Args:
+            embedding_dim: The dimensionality of the output patch embeddings.
+            patch_cnn_channels: The number of channels for the internal CNN encoder.
+            patching_mode: The method for determining patch boundaries.
+                           Options: "global", "relative_monotonic".
+            global_threshold: The entropy threshold (θg) for the "global" mode.
+            relative_threshold: The relative entropy increase threshold (θr) for
+                                the "relative_monotonic" mode.
+            min_patch_size: The minimum number of bytes in a patch.
+            max_patch_size: The maximum number of bytes in a patch.
+            entropy_byte_vocab_size: Vocab size for the entropy model's byte embeddings.
+            entropy_embedding_dim: Embedding dimension for the entropy model.
+            entropy_hidden_dim: Hidden dimension for the entropy model's RNN.
+            entropy_num_layers: Number of RNN layers in the entropy model.
+            entropy_dropout: Dropout rate for the entropy model's RNN.
+        """
+        super().__init__()
+        if patching_mode not in ["global", "relative_monotonic"]:
+            raise ValueError("patching_mode must be 'global' or 'relative_monotonic'")
+
+        self.embedding_dim = embedding_dim
+        self.patching_mode = patching_mode
+        self.global_threshold = global_threshold
+        self.relative_threshold = relative_threshold
+        self.min_patch_size = min_patch_size
+        self.max_patch_size = max_patch_size
+
+        self.entropy_model = _EntropyProxyModel(
+            byte_vocab_size=entropy_byte_vocab_size,
+            embedding_dim=entropy_embedding_dim,
+            hidden_dim=entropy_hidden_dim,
+            num_layers=entropy_num_layers,
+            dropout=entropy_dropout
         )
+
+        # A CNN-based encoder to map variable-length byte patches to fixed-size embeddings.
+        self.patch_byte_encoder = nn.Sequential(
+            # Input shape: (N, 1, max_patch_size)
+            nn.Conv1d(in_channels=1, out_channels=patch_cnn_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(patch_cnn_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(patch_cnn_channels, embedding_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(embedding_dim),
+            nn.ReLU(inplace=True),
+            # Pool across the patch dimension to get a single vector per patch
+            nn.AdaptiveAvgPool1d(1) # Output shape: (N, embedding_dim, 1)
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -1456,27 +1604,110 @@ class LearnedBytePatcherEncoder(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, byte_sequence: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len_bytes = byte_sequence.shape
-        device = byte_sequence.device
-        
-        if seq_len_bytes % self.patch_size != 0:
-            padding_size = self.patch_size - (seq_len_bytes % self.patch_size)
-            padding = torch.zeros(batch_size, padding_size, dtype=byte_sequence.dtype, device=device)
-            byte_sequence = torch.cat([byte_sequence, padding], dim=1)
-            seq_len_bytes = byte_sequence.shape[1]
+    def forward(self, byte_sequence: torch.Tensor) -> Tuple[torch.Tensor, List[List[Tuple[int, int]]], torch.Tensor]:
+        """
+        Processes a batch of byte sequences by patching and encoding them.
 
-        num_patches = seq_len_bytes // self.patch_size
-        patches = byte_sequence.view(batch_size, num_patches, self.patch_size)
-        patches_flat = patches.reshape(batch_size * num_patches, self.patch_size)
+        Args:
+            byte_sequence: A tensor of raw bytes.
+                           Shape: (batch_size, seq_len_bytes), dtype=torch.uint8.
+
+        Returns:
+            A tuple containing:
+            - encoded_patches: A tensor of patch embeddings, padded to the max number
+                               of patches in the batch.
+                               Shape: (batch_size, max_num_patches, embedding_dim).
+            - patch_indices: A list of lists, where each inner list contains the
+                             (start, end) byte indices for each patch in a sequence.
+            - entropy_aux_loss: Scalar tensor, the auxiliary loss from the entropy model.
+        """
+        batch_size, seq_len = byte_sequence.shape
+        device = byte_sequence.device
+
+        # 1. Calculate entropy proxy scores and auxiliary loss for the entire batch
+        entropy_scores, entropy_aux_loss = self.entropy_model(byte_sequence)  # (batch_size, seq_len), scalar
+
+        all_patches_data = []
+        all_patch_indices = []
+        patches_per_sample = []  # To track how many patches each sample has
+
+        # 2. Segment each sequence in the batch into patches
+        for i in range(batch_size):
+            single_entropy = entropy_scores[i]
+            patch_indices_for_sample = []
+            current_start = 0
+
+            while current_start < seq_len:
+                # Search for a boundary within the allowed patch size window
+                scan_start = current_start + self.min_patch_size
+                scan_end = min(current_start + self.max_patch_size, seq_len)
+                found_boundary_at = -1
+
+                for t in range(scan_start, scan_end + 1):
+                    if t >= seq_len: break
+
+                    is_boundary = False
+                    if self.patching_mode == "global":
+                        if single_entropy[t] > self.global_threshold:
+                            is_boundary = True
+                    elif self.patching_mode == "relative_monotonic":
+                        # H(xt) - H(xt-1) > θr
+                        if (single_entropy[t] - single_entropy[t-1]) > self.relative_threshold:
+                            is_boundary = True
+                    
+                    if is_boundary:
+                        found_boundary_at = t
+                        break
+                
+                # Determine the final end of the patch
+                if found_boundary_at != -1:
+                    patch_end = found_boundary_at - 1 # End patch before the boundary
+                else:
+                    patch_end = min(current_start + self.max_patch_size - 1, seq_len - 1) # No boundary, take max size
+
+                patch_end = max(patch_end, current_start) # Ensure patch has at least one byte
+                
+                all_patches_data.append(byte_sequence[i, current_start : patch_end + 1])
+                patch_indices_for_sample.append((current_start, patch_end))
+                current_start = patch_end + 1
+            
+            all_patch_indices.append(patch_indices_for_sample)
+            patches_per_sample.append(len(patch_indices_for_sample))
+
+        # Handle case where no patches were generated (e.g., empty input)
+        if not all_patches_data:
+            return torch.zeros((batch_size, 0, self.embedding_dim), device=device), all_patch_indices, entropy_aux_loss
+
+        # 3. Prepare and encode all patches in a single batch for efficiency
+        padded_patches = []
+        for patch in all_patches_data:
+            padded_patch = F.pad(patch, (0, self.max_patch_size - patch.shape[0]), 'constant', 0)
+            padded_patches.append(padded_patch)
         
-        patches_float = patches_flat.float() / 127.5 - 1.0 # Normalize to [-1, 1]
-        patches_for_conv = patches_float.unsqueeze(1)
+        patches_tensor = torch.stack(padded_patches)
+        normalized_patches = patches_tensor.float() / 127.5 - 1.0 # Normalize to [-1, 1]
+        patches_for_cnn = normalized_patches.unsqueeze(1) # Add channel dim
         
-        encoded_patches_pooled = self.conv_encoder(patches_for_conv)
-        encoded_patches_vectors = encoded_patches_pooled.squeeze(-1)
-        output_features = encoded_patches_vectors.view(batch_size, num_patches, self.embedding_dim)
-        return output_features
+        encoded_patches_flat = self.patch_byte_encoder(patches_for_cnn).squeeze(-1)
+
+        # 4. Re-assemble encoded patches into a padded batch tensor
+        max_num_patches = max(patches_per_sample) if patches_per_sample else 0
+        encoded_patches_list = torch.split(encoded_patches_flat, patches_per_sample)
+        
+        padded_batch_list = []
+        for p_tensor in encoded_patches_list:
+            num_pads = max_num_patches - p_tensor.shape[0]
+            if num_pads > 0:
+                padding = torch.zeros(num_pads, self.embedding_dim, device=device)
+                p_tensor = torch.cat([p_tensor, padding], dim=0)
+            padded_batch_list.append(p_tensor)
+
+        if padded_batch_list:
+            final_batch_tensor = torch.stack(padded_batch_list)
+        else: # Handle empty input batch
+            final_batch_tensor = torch.zeros((batch_size, 0, self.embedding_dim), device=device)
+            
+        return final_batch_tensor, all_patch_indices, entropy_aux_loss
 
 @dataclass
 class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency in the target file
@@ -1495,8 +1726,26 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     patch_size: int = 16                   # <<< NEW: Size of byte patches
     patch_embedding_dim: int = 256         # <<< NEW: Output embedding dimension per patch from patcher
     patch_encoder_cnn_channels: int = 64   # <<< NEW: Intermediate channels for CNN patch encoder
+
+    # --- Dynamic Entropy Patching Options (Inspired by BLT paper) ---
+    use_dynamic_entropy_patcher: bool = True # Flag to enable dynamic entropy-based patching
+    entropy_patcher_threshold_type: str = "global"  # 'global' or 'relative_monotonic'
+    entropy_patcher_global_threshold: float = 0.75 # Entropy threshold for 'global' type
+    entropy_patcher_relative_threshold: float = 0.1 # Entropy diff threshold for 'relative_monotonic'
+    entropy_patcher_min_patch_size: int = 4      # Minimum number of bytes in a dynamic patch
+    entropy_patcher_max_patch_size: int = 128    # Maximum number of bytes in a dynamic patch (for CNN encoder)
     
-    # Fallback if not using learned_patch_encoder
+    # --- Learnable Entropy Model Parameters (for _EntropyProxyModel) ---
+    entropy_model_byte_vocab_size: int = 256
+    entropy_model_embedding_dim: int = 64
+    entropy_model_hidden_dim: int = 128
+    entropy_model_num_layers: int = 1
+    entropy_model_dropout: float = 0.1
+    entropy_model_loss_weight: float = 0.1 # Weight for its auxiliary loss contribution
+    # Note: These parameters are used if use_dynamic_entropy_patcher is True,
+    # as LearnedBytePatcherEncoder now instantiates the learnable _EntropyProxyModel.
+    
+    # Fallback if not using learned_patch_encoder or dynamic_entropy_patcher
     byte_embedding_dim: int = 256
     multi_granularity: bool = False # Default to False if patcher is preferred
     # multi_granularity_output_dim is complex to predefine, MGP should expose its output dim.
@@ -1654,13 +1903,25 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
 
         # Validations for new patch encoder
-        if self.use_learned_patch_encoder:
+        if self.use_dynamic_entropy_patcher:
+            if self.patch_embedding_dim <= 0:
+                raise ValueError("patch_embedding_dim must be positive if use_dynamic_entropy_patcher is True.")
+            if self.entropy_patcher_min_patch_size <= 0:
+                raise ValueError("entropy_patcher_min_patch_size must be positive.")
+            if self.entropy_patcher_max_patch_size < self.entropy_patcher_min_patch_size:
+                raise ValueError("entropy_patcher_max_patch_size must be >= entropy_patcher_min_patch_size.")
+            if self.entropy_patcher_threshold_type not in ["global", "relative_monotonic"]:
+                raise ValueError("entropy_patcher_threshold_type must be 'global' or 'relative_monotonic'.")
+            # Ensure learned_patch_encoder specific params are not primary if dynamic is on
+            if self.use_learned_patch_encoder:
+                print("Warning: 'use_learned_patch_encoder' is True, but 'use_dynamic_entropy_patcher' takes precedence.")
+        elif self.use_learned_patch_encoder: # Only if dynamic_entropy_patcher is False
             if self.patch_size <= 0:
                 raise ValueError("patch_size must be positive if use_learned_patch_encoder is True.")
             if self.patch_embedding_dim <= 0:
                 raise ValueError("patch_embedding_dim must be positive if use_learned_patch_encoder is True.")
-        elif self.multi_granularity and self.multi_granularity_output_dim <= 0: # Only if not using patcher
-            print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using learned patch encoder and MGP is active.")
+        elif self.multi_granularity and self.multi_granularity_output_dim <= 0: # Only if not using any patcher
+            print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
         
         # Validation for inferred_task_latent_dim (from previous refactoring, ensure it exists in config)
         if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim <= 0:
@@ -3128,20 +3389,38 @@ class EnhancedCTMDiffusion(nn.Module):
         self.config = config
         
         # Determine input dimension for the main encoder and task inference
-        if config.use_learned_patch_encoder:
+        self.dynamic_entropy_patcher = None
+        self.patcher_encoder = None
+        self.multi_granularity_processor = None
+        self.byte_embedding = None
+
+        if config.use_dynamic_entropy_patcher:
+            self.dynamic_entropy_patcher = LearnedBytePatcherEncoder(
+                embedding_dim=config.patch_embedding_dim,
+                patch_cnn_channels=config.patch_encoder_cnn_channels,
+                patching_mode=config.entropy_patcher_threshold_type,
+                global_threshold=config.entropy_patcher_global_threshold,
+                relative_threshold=config.entropy_patcher_relative_threshold,
+                min_patch_size=config.entropy_patcher_min_patch_size,
+                max_patch_size=config.entropy_patcher_max_patch_size,
+                # Pass parameters for the learnable _EntropyProxyModel
+                entropy_byte_vocab_size=config.entropy_model_byte_vocab_size,
+                entropy_embedding_dim=config.entropy_model_embedding_dim,
+                entropy_hidden_dim=config.entropy_model_hidden_dim,
+                entropy_num_layers=config.entropy_model_num_layers,
+                entropy_dropout=config.entropy_model_dropout
+            )
+            raw_feature_dim = config.patch_embedding_dim # Output of dynamic patcher is (batch, num_dynamic_patches, patch_embedding_dim)
+        elif config.use_learned_patch_encoder:
             self.patcher_encoder = LearnedBytePatcherEncoder(
                 patch_size=config.patch_size,
                 embedding_dim=config.patch_embedding_dim,
                 cnn_channels=config.patch_encoder_cnn_channels
             )
-            self.byte_embedding = None
-            self.multi_granularity_processor = None
             raw_feature_dim = config.patch_embedding_dim # Output of patcher is (batch, num_patches, patch_embedding_dim)
                                                        # The input_encoder will take patch_embedding_dim
         elif config.multi_granularity:
-            self.patcher_encoder = None
             self.multi_granularity_processor = MultiGranularityBinaryProcessor(config)
-            self.byte_embedding = None
             # MGP needs to expose its output dimension, e.g. self.multi_granularity_processor.output_dim
             # Using placeholder from config for now.
             raw_feature_dim = config.multi_granularity_output_dim # This needs to be accurate
@@ -3149,10 +3428,7 @@ class EnhancedCTMDiffusion(nn.Module):
                  print(f"Warning: MultiGranularityBinaryProcessor does not have 'output_dim'. Using config value {raw_feature_dim}.")
             else:
                  raw_feature_dim = self.multi_granularity_processor.output_dim
-
         else: # Fallback to simple byte embedding
-            self.patcher_encoder = None
-            self.multi_granularity_processor = None
             self.byte_embedding = nn.Embedding(256, config.byte_embedding_dim)
             raw_feature_dim = config.byte_embedding_dim
         
@@ -3384,10 +3660,10 @@ class EnhancedCTMDiffusion(nn.Module):
             return self.forward(byte_sequence, task_name, target_diffusion_output,
                               'ctm_controlled_diffusion', timestep)
     
-    def _prepare_input_features(self, byte_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _prepare_input_features(self, byte_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Prepares the input features for the CTM core, generates inferred task latent,
-        and HIPA control signal.
+        HIPA control signal, and potential auxiliary loss from the entropy model.
 
         Args:
             byte_sequence: Raw byte sequence tensor. Shape (batch_size, sequence_length).
@@ -3395,25 +3671,44 @@ class EnhancedCTMDiffusion(nn.Module):
 
         Returns:
             Tuple of:
-                - encoded_features: Features ready for CTM core. (batch_size, seq_len, ctm_input_dim)
+                - encoded_features: Features ready for CTM core. (batch_size, num_patches_or_seq, ctm_input_dim)
                 - inferred_task_latent: Latent vector representing the inferred task. (batch_size, inferred_task_latent_dim)
                 - hipa_control_signal: Signal to control HIPA activation. (batch_size, 1)
+                - entropy_aux_loss: Auxiliary loss from the learnable entropy model. Scalar tensor.
         """
         batch_size = byte_sequence.size(0)
         seq_len = byte_sequence.size(1) if byte_sequence.dim() > 1 else 1
         device = byte_sequence.device
+        entropy_aux_loss = torch.tensor(0.0, device=device) # Default to zero
 
-        if self.patcher_encoder:
-            # Input byte_sequence is (batch, seq_len_bytes)
-            raw_features = self.patcher_encoder(byte_sequence) # (batch, num_patches, patch_embedding_dim)
+        # patch_indices are currently not used further but returned by dynamic patcher
+        patch_indices = None
+
+        if self.dynamic_entropy_patcher:
+            # LearnedBytePatcherEncoder (when it's the dynamic one) now returns (encoded_patches, patch_indices, aux_loss)
+            raw_features, patch_indices, current_entropy_aux_loss = self.dynamic_entropy_patcher(byte_sequence)
+            entropy_aux_loss = current_entropy_aux_loss
+            # raw_features shape: (batch_size, num_dynamic_patches, embedding_dim)
+        elif self.patcher_encoder:
+            # This branch might be for a non-dynamic LearnedBytePatcherEncoder or an older setup.
+            # If it's also updated to return aux_loss, handle it. Otherwise, assume 2 return values.
+            patcher_output = self.patcher_encoder(byte_sequence)
+            if len(patcher_output) == 3:
+                raw_features, patch_indices, current_entropy_aux_loss = patcher_output
+                entropy_aux_loss = current_entropy_aux_loss
+            elif len(patcher_output) == 2:
+                raw_features, patch_indices = patcher_output
+            else: # Should be 2 or 3
+                raw_features = patcher_output # Fallback if it's just one tensor (unlikely for patcher)
+            # raw_features shape: (batch, num_patches, patch_embedding_dim)
         elif self.multi_granularity_processor:
             raw_features = self.multi_granularity_processor(byte_sequence)
         elif self.byte_embedding:
             raw_features = self.byte_embedding(byte_sequence.long())
         else:
-            raise ValueError("No valid byte processor configured (patcher, MGP, or byte_embedding).")
+            raise ValueError("No valid byte processor configured (dynamic, patcher, MGP, or byte_embedding).")
 
-        # `raw_features` is now a sequence of embeddings (e.g., per patch or per byte if not patcher)
+        # `raw_features` is now a sequence of embeddings (e.g., per patch or per byte)
         # For task inference, we need a fixed-size representation per batch item.
         # Typically, mean pooling over the sequence dimension (num_patches or seq_len).
         if raw_features.dim() == 3: # (batch, seq_dim, feat_dim)
@@ -3459,7 +3754,7 @@ class EnhancedCTMDiffusion(nn.Module):
         # raw_features is (batch, num_patches_or_seq, feature_dim)
         encoded_features = self.input_encoder(raw_features) # Output: (batch, num_patches_or_seq, ctm_input_dim)
 
-        return encoded_features, inferred_task_latent, hipa_control_signal
+        return encoded_features, inferred_task_latent, hipa_control_signal, entropy_aux_loss
     
     def forward_with_mixed_precision(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
         """Forward pass with automatic mixed precision."""
@@ -4244,8 +4539,10 @@ class EnhancedCTMDiffusion(nn.Module):
 
         # Prepare input features, get inferred latent and HIPA signal for the current batch
         # These will be used for CTM core, diffusion conditioning, EWC, and memory replay.
-        kv_features_for_ctm, current_inferred_latent, current_hipa_signal = \
+        kv_features_for_ctm, current_inferred_latent, current_hipa_signal, entropy_aux_loss = \
             self._prepare_input_features(byte_sequence)
+        
+        losses['entropy_model_aux_loss'] = entropy_aux_loss * self.config.entropy_model_loss_weight
 
         # --- CTM Core Logic ---
         # CTM core processes the features derived from the input byte_sequence.
