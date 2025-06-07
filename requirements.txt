@@ -1,0 +1,26 @@
+
+# Core Python packages
+safetensors==0.5.3
+numpy==1.24.3
+mediapy==1.2.4
+
+# Jupyter and visualization
+jupyterlab==4.0.5
+matplotlib==3.7.1
+seaborn==0.12.2
+
+# Deep learning frameworks
+torch==2.7.1
+flash-attn==2.7.4.post1
+deepspeed==0.17.0
+accelerate==1.7.0
+xformers==0.0.30
+
+
+# Hugging Face Transformers and Datasets
+transformers==4.36.2
+datasets==2.14.5
+
+# For CUDA GPU support (Optional, if needed in RunPod base image)
+# nvidia-pyindex
+# nvidia-tensorrt==8.6.1
