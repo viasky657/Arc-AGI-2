@@ -22,5 +22,5 @@ transformers==4.36.2
 datasets==2.14.5
 
 # For CUDA GPU support (Optional, if needed in RunPod base image)
-# nvidia-pyindex
-# nvidia-tensorrt==8.6.1
+nvidia-pyindex==1.0.9
+nvidia-tensorrt==99.0.0
