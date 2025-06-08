@@ -449,7 +449,13 @@ except ImportError:
     SuperLinear = None
     Squeeze = None
     compute_normalized_entropy = None
-    VALID_NEURON_SELECT_TYPES = ['first-last', 'random', 'random-pairing']
+    VALID_NEURON_SELECT_TYPES = ['# Legacy types
+    'first-last', 'random', 'random-pairing',
+    # Biologically-inspired types
+    'bio_hebbian', 'bio_plasticity', 'bio_competitive', 'bio_homeostatic',
+    'bio_evolutionary', 'bio_stdp', 'bio_criticality', 'bio_multi_objective',
+    # Hybrid approaches
+    'adaptive_random', 'performance_guided', 'task_aware']
 
 
 
@@ -1899,7 +1905,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             self.mcmc_output_space_dim = self.ctm_out_dims
         
         if hasattr(self, 'ctm_neuron_select_type') and \
-           VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
+           VALID_NEURON_SELECT_TYPES is not None and self.c not in VALID_NEURON_SELECT_TYPES:
             print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
 
         # Validations for new patch encoder
