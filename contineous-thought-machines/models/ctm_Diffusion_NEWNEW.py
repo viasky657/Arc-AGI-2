@@ -449,7 +449,7 @@ except ImportError:
     SuperLinear = None
     Squeeze = None
     compute_normalized_entropy = None
-    VALID_NEURON_SELECT_TYPES = ['# Legacy types
+    VALID_NEURON_SELECT_TYPES = [ #Legacy
     'first-last', 'random', 'random-pairing',
     # Biologically-inspired types
     'bio_hebbian', 'bio_plasticity', 'bio_competitive', 'bio_homeostatic',
