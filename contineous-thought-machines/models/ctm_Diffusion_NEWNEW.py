@@ -1905,7 +1905,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             self.mcmc_output_space_dim = self.ctm_out_dims
         
         if hasattr(self, 'ctm_neuron_select_type') and \
-           VALID_NEURON_SELECT_TYPES is not None and self.c not in VALID_NEURON_SELECT_TYPES:
+           VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
             print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
 
         # Validations for new patch encoder
