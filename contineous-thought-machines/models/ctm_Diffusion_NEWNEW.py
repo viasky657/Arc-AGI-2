@@ -410,7 +410,6 @@ class WINAEnhancedMLP(nn.Module):
         x_sparse = self.wina_sparsifier.apply_wina_gating(
             x, self.linear1.weight, "intermediate", f"linear1_{id(self.linear1.weight)}"
         )
-        
         # First linear transformation
         intermediate = self.linear1(x_sparse)
         intermediate = self.activation(intermediate)
@@ -426,6 +425,136 @@ class WINAEnhancedMLP(nn.Module):
         
         return output
 
+class SubquadraticAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
+                 epsilon=1e-6, poly_degree=5, scale=None): # Changed dim to embed_dim
+        super().__init__()
+        self.embed_dim = embed_dim # Store embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        if self.head_dim * self.num_heads != self.embed_dim:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+
+        self.scale = scale if scale is not None else self.head_dim ** -0.5
+
+        # Individual Q, K, V projections from the input query, key, value tensors
+        self.q_proj_layer = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
+        self.k_proj_layer = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
+        self.v_proj_layer = nn.Linear(embed_dim, embed_dim, bias=qkv_bias)
+        
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(embed_dim, embed_dim) # Output projection
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.epsilon = epsilon
+        if not (isinstance(poly_degree, int) and poly_degree >= 0):
+            raise ValueError("poly_degree must be a non-negative integer.")
+        self.poly_degree = poly_degree
+
+    def _taylor_exp_poly(self, y_tensor):
+        """
+        Computes Taylor approximation of exp(y) = sum_{i=0 to degree} y^i / i!
+        Assumes y_tensor contains values in a range [0, W] suitable for approximation.
+        """
+        approx_exp = torch.zeros_like(y_tensor)
+        term = torch.ones_like(y_tensor)  # Corresponds to y^0 / 0!
+        approx_exp += term
+        
+        for i in range(1, self.poly_degree + 1):
+            term = term * y_tensor / i  # Efficiently computes (y^i / i!) from (y^(i-1) / (i-1)!)
+            approx_exp += term
+        return approx_exp
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None,
+                need_weights: bool = True, # Standard MHA param, controls if attn_weights are returned
+                average_attn_weights: bool = True # Standard MHA param
+               ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        
+        B_q, N_q_orig, C_q = query.shape    # Batch, Query Seq Len, Query Dim (embed_dim)
+        B_kv, N_kv_orig, C_kv = key.shape # Batch, Key Seq Len, Key Dim (embed_dim)
+        # Value shape: B_kv, N_kv_orig, Value Dim (embed_dim)
+
+        # Project Q, K, V using dedicated layers
+        q_projected = self.q_proj_layer(query)  # (B_q, N_q_orig, embed_dim)
+        k_projected = self.k_proj_layer(key)    # (B_kv, N_kv_orig, embed_dim)
+        v_projected = self.v_proj_layer(value)  # (B_kv, N_kv_orig, embed_dim)
+
+        # Reshape and permute for multi-head processing
+        # q: (B_q, num_heads, N_q_orig, head_dim)
+        q = q_projected.reshape(B_q, N_q_orig, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        # k: (B_kv, num_heads, N_kv_orig, head_dim)
+        k = k_projected.reshape(B_kv, N_kv_orig, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        # v: (B_kv, num_heads, N_kv_orig, head_dim)
+        v = v_projected.reshape(B_kv, N_kv_orig, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        N_q_tokens = q.shape[-2]
+        N_k_tokens = k.shape[-2]
+
+        if N_k_tokens == 0: # Fallback for empty key/value sequence
+            context = torch.zeros(B_q, N_q_orig, self.embed_dim, device=q.device, dtype=q.dtype)
+            context = self.proj(context)
+            context = self.proj_drop(context)
+            return context, None
+
+        # Scaled dot-product scores: (B, H, N_q_tokens, N_k_tokens)
+        # Assuming B_q == B_kv for matmul, which is typical.
+        scaled_scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        
+        if attn_mask is not None:
+            # Correctly handle attention mask broadcasting.
+            # MHA expects mask to be (N_q, N_k), (B, N_q, N_k), or (B, H, N_q, N_k)
+            # If mask is (B, N_q, N_k), it needs to be unsqueezed for heads.
+            # If mask is (N_q, N_k), it needs to be unsqueezed for batch and heads.
+            if attn_mask.dim() == 2: # (N_q_tokens, N_k_tokens)
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # -> (1, 1, N_q_tokens, N_k_tokens)
+            elif attn_mask.dim() == 3: # (B, N_q_tokens, N_k_tokens)
+                attn_mask = attn_mask.unsqueeze(1)  # -> (B, 1, N_q_tokens, N_k_tokens)
+            # Mask should now be broadcastable with scaled_scores (B, H, N_q, N_k)
+            # The mask uses 0 for masked positions, 1 for unmasked.
+            # masked_fill expects a boolean mask where True means fill.
+            # So, if attn_mask has 0 for masked, we use `attn_mask == 0`.
+            scaled_scores = scaled_scores.masked_fill(attn_mask == 0, float('-inf'))
+
+
+        max_scores_per_query, _ = torch.max(scaled_scores, dim=-1, keepdim=True)
+        # Ensure N_k_tokens is float for division, and add small epsilon for log stability
+        log_N_div_eps_val = torch.log( (torch.tensor(float(N_k_tokens), device=q.device, dtype=q.dtype) / self.epsilon) + 1e-9)
+        c_val = max_scores_per_query - log_N_div_eps_val
+        x_for_poly = scaled_scores - c_val
+        
+        relevance_threshold = max_scores_per_query - log_N_div_eps_val
+        relevant_mask = (scaled_scores >= relevance_threshold)
+        
+        poly_output = torch.zeros_like(x_for_poly)
+        relevant_x_inputs = x_for_poly[relevant_mask]
+
+        if relevant_x_inputs.numel() > 0:
+            poly_output_relevant = self._taylor_exp_poly(torch.clamp(relevant_x_inputs, min=0.0))
+            poly_output = poly_output.masked_scatter(relevant_mask, poly_output_relevant)
+        
+        attn_sum = torch.sum(poly_output, dim=-1, keepdim=True)
+        stable_attn_sum = attn_sum + 1e-9
+        approx_attn_weights = poly_output / stable_attn_sum # (B, H, N_q_tokens, N_k_tokens)
+        
+        approx_attn_weights_dropped = self.attn_drop(approx_attn_weights)
+
+        context = torch.matmul(approx_attn_weights_dropped, v) # (B, H, N_q_tokens, head_dim)
+        
+        # Reshape context back to (B, N_q_orig, embed_dim)
+        context = context.transpose(1, 2).reshape(B_q, N_q_orig, self.embed_dim)
+        context = self.proj(context) # Output projection
+        context = self.proj_drop(context)
+        
+        returned_attn_weights = None
+        if need_weights:
+            if average_attn_weights: # As per nn.MultiheadAttention behavior
+                returned_attn_weights = approx_attn_weights.mean(dim=1) # (B, N_q_tokens, N_k_tokens)
+            else:
+                returned_attn_weights = approx_attn_weights # (B, H, N_q_tokens, N_k_tokens)
+                
+        return context, returned_attn_weights
+
 # MCMC Imports
 from .fenchel_young_mcmc import (
     MCMCConfig, DiscreteOutputSpace, BinaryHypercube, TopKPolytope,
@@ -440,9 +569,9 @@ from .mcmc_interpretability_solver import (
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
 # Import original CTM modules to preserve exact behavior
 try:
-    from models.modules import SynapseUNET, Squeeze, SuperLinear
+    from models.modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
     from models.utils import compute_normalized_entropy
-    from models.constants import VALID_NEURON_SELECT_TYPES
+    from models.constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
 except ImportError:
     print("Warning: Could not import original CTM modules. Using fallback implementations.")
     SynapseUNET = None
@@ -1812,7 +1941,22 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     # Sparse Attention Parameters
     sparse_attention_ratio: float = 0.1  # Keep only 10% of attention connections
     binary_pattern_size: int = 8  # Size of binary patterns to detect
+
+    # Attention Mechanism Type
+    attention_type: str = "subquadratic"  # Options: "standard", "binary_sparse", "subquadratic"
     
+    # Subquadratic Attention Parameters (if attention_type is "subquadratic")
+    subquadratic_attn_epsilon: float = 1e-6
+    subquadratic_attn_poly_degree: int = 5
+    attention_qkv_bias: bool = True # General QKV bias for attention mechanisms like Subquadratic or standard MHA
+    # attn_drop and proj_drop for subquadratic_attn will be mapped from ctm_dropout
+
+    # Positional Embedding Parameters
+    positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational-1d', 'learnable-fourier', multi-learnable-fourier' #Can set the value here. 
+    positional_embedding_dim: Optional[int] = None  # Dimension of the positional embedding, defaults to ctm_input_dim if None
+    reshape_patch_sequence_to_grid: bool = True # If True, reshape patch sequence to a 2D grid for 2D PEs. Must set to true if using 2D Grid for Positional Embeddings.
+    patch_grid_width: Optional[int] = None       # Desired width of the patch grid if reshaping
+
     # Pipeline Parallelism Parameters
     enable_pipeline_parallelism: bool = True
     pipeline_stages: int = 4  # CTM, MCMC, Diffusion prep, Diffusion exec
@@ -1907,6 +2051,20 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
         if hasattr(self, 'ctm_neuron_select_type') and \
            VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
             print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
+
+        if hasattr(self, 'positional_embedding_type') and self.positional_embedding_type is not None:
+            if VALID_POSITIONAL_EMBEDDING_TYPES is None: # Fallback if import failed
+                print(f"Warning: VALID_POSITIONAL_EMBEDDING_TYPES not available for validation.")
+            elif self.positional_embedding_type not in VALID_POSITIONAL_EMBEDDING_TYPES:
+                print(f"Warning: positional_embedding_type '{self.positional_embedding_type}' is not in VALID_POSITIONAL_EMBEDDING_TYPES ({VALID_POSITIONAL_EMBEDDING_TYPES}).")
+            if self.positional_embedding_dim is not None and self.positional_embedding_dim <= 0:
+                raise ValueError("positional_embedding_dim must be positive if set.")
+            
+            if self.reshape_patch_sequence_to_grid:
+                if self.patch_grid_width is None or self.patch_grid_width <= 0:
+                    raise ValueError("patch_grid_width must be a positive integer if reshape_patch_sequence_to_grid is True.")
+                if self.positional_embedding_type not in ['learnable-fourier', 'multi-learnable-fourier', 'custom-rotational']:
+                    print(f"Warning: reshape_patch_sequence_to_grid is True, but positional_embedding_type ('{self.positional_embedding_type}') is not a typical 2D PE. Ensure compatibility.")
 
         # Validations for new patch encoder
         if self.use_dynamic_entropy_patcher:
@@ -2068,19 +2226,41 @@ class OriginalCTMCore(nn.Module):
         
         # --- Input Processing / Attention ---
         # q_proj projects synchronisation_action (related to CTM's d_model) to ctm_input_dim for attention query
-        self.q_proj = nn.LazyLinear(self.d_input) if heads > 0 else None
+        self.q_proj = nn.LazyLinear(self.d_input) if heads > 0 else None # This q_proj is for CTM's internal query generation
         
-        # Use BinarySparseAttention if sparse attention is enabled, otherwise standard attention
-        if config.sparse_attention and heads > 0:
-            self.attention = BinarySparseAttention(
-                embed_dim=self.d_input,
-                num_heads=heads,
-                sparsity_ratio=config.sparse_attention_ratio,
-                binary_pattern_size=config.binary_pattern_size,
-                dropout=dropout
-            )
+        # Instantiate the chosen attention mechanism
+        if heads > 0:
+            if config.attention_type == "subquadratic":
+                self.attention = SubquadraticAttention(
+                    embed_dim=self.d_input, # d_input is the dimension for Q, K, V in CTM's attention
+                    num_heads=heads,
+                    qkv_bias=config.attention_qkv_bias,
+                    attn_drop=dropout, # Use general dropout from CTM config
+                    proj_drop=dropout, # Use general dropout from CTM config
+                    epsilon=config.subquadratic_attn_epsilon,
+                    poly_degree=config.subquadratic_attn_poly_degree,
+                    scale=None # Default scale calculation
+                )
+            elif config.attention_type == "binary_sparse":
+                self.attention = BinarySparseAttention(
+                    embed_dim=self.d_input,
+                    num_heads=heads,
+                    sparsity_ratio=config.sparse_attention_ratio,
+                    binary_pattern_size=config.binary_pattern_size,
+                    dropout=dropout
+                )
+            elif config.attention_type == "standard":
+                self.attention = nn.MultiheadAttention(
+                    embed_dim=self.d_input,
+                    num_heads=heads,
+                    dropout=dropout,
+                    batch_first=True,
+                    bias=config.attention_qkv_bias # Standard MHA also has a bias for qkv
+                )
+            else:
+                raise ValueError(f"Unsupported attention_type: {config.attention_type}")
         else:
-            self.attention = nn.MultiheadAttention(self.d_input, heads, dropout, batch_first=True) if heads > 0 else None
+            self.attention = None
         
         # --- Core CTM Modules ---
         # Synapses operate on CTM's internal d_model. Input to synapses is (attn_out + activated_state)
@@ -3484,6 +3664,22 @@ class EnhancedCTMDiffusion(nn.Module):
             nn.Sigmoid()
         )
 
+        # Positional Embedding Initialization
+        self.positional_embedding = None
+        if config.positional_embedding_type:
+            pe_dim = config.positional_embedding_dim if config.positional_embedding_dim is not None else config.ctm_input_dim
+            if config.positional_embedding_type == 'learnable-fourier':
+                self.positional_embedding = LearnableFourierPositionalEncoding(d_model=pe_dim)
+            elif config.positional_embedding_type == 'multi-learnable-fourier':
+                self.positional_embedding = MultiLearnableFourierPositionalEncoding(d_model=pe_dim)
+            elif config.positional_embedding_type == 'custom-rotational':
+                self.positional_embedding = CustomRotationalEmbedding(d_model=pe_dim)
+            elif config.positional_embedding_type == 'custom-rotational-1d':
+                # This expects input (B, C, L), so ensure features are shaped accordingly before passing
+                self.positional_embedding = CustomRotationalEmbedding1D(d_model=pe_dim)
+            else:
+                print(f"Warning: Unknown positional_embedding_type: {config.positional_embedding_type}. No positional embedding will be used.")
+
         # EWC components (Fisher and optimal params will be keyed by inferred task characteristics later)
         self.ewc_fisher_information: Dict[Any, Dict[str, torch.Tensor]] = defaultdict(dict) # Key type TBD
         self.ewc_optimal_params: Dict[Any, Dict[str, torch.Tensor]] = defaultdict(dict)   # Key type TBD
@@ -3760,6 +3956,73 @@ class EnhancedCTMDiffusion(nn.Module):
         # raw_features is (batch, num_patches_or_seq, feature_dim)
         encoded_features = self.input_encoder(raw_features) # Output: (batch, num_patches_or_seq, ctm_input_dim)
 
+        # Apply positional embedding if configured
+        if self.positional_embedding is not None:
+            if self.config.reshape_patch_sequence_to_grid and \
+               isinstance(self.positional_embedding, (LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding)):
+                
+                B, S, D = encoded_features.shape
+                W_patches = self.config.patch_grid_width
+                if W_patches is None: # Should be caught by config validation, but as a safeguard
+                    print(f"Warning: patch_grid_width is None but reshape_patch_sequence_to_grid is True. Defaulting width to sqrt(S).")
+                    W_patches = int(math.sqrt(S))
+                    if W_patches == 0: W_patches = 1 # Avoid zero width
+
+                H_patches = math.ceil(S / W_patches)
+                total_grid_elements = H_patches * W_patches
+                
+                # Pad if necessary
+                if S < total_grid_elements:
+                    padding_size = total_grid_elements - S
+                    padding = torch.zeros(B, padding_size, D, device=encoded_features.device, dtype=encoded_features.dtype)
+                    grid_sequence_features = torch.cat([encoded_features, padding], dim=1)
+                elif S > total_grid_elements: # Should not happen if H_patches is math.ceil
+                    grid_sequence_features = encoded_features[:, :total_grid_elements, :]
+                else:
+                    grid_sequence_features = encoded_features
+
+                # Reshape to grid: (B, H_patches, W_patches, D)
+                grid_features_hw_d = grid_sequence_features.reshape(B, H_patches, W_patches, D)
+                
+                # Permute for 2D PE: (B, D, H_patches, W_patches)
+                pe_input_grid = grid_features_hw_d.permute(0, 3, 1, 2)
+                
+                pos_emb_grid = self.positional_embedding(pe_input_grid) # Output (B, D, H_patches, W_patches)
+                
+                # Add positional embedding
+                grid_features_with_pe = pe_input_grid + pos_emb_grid
+                
+                # Permute back: (B, H_patches, W_patches, D)
+                grid_features_hw_d_with_pe = grid_features_with_pe.permute(0, 2, 3, 1)
+                
+                # Reshape back to sequence: (B, H_patches * W_patches, D)
+                # The CTM will now process a sequence of length H_patches * W_patches
+                encoded_features = grid_features_hw_d_with_pe.reshape(B, total_grid_elements, D)
+                print(f"Reshaped patch sequence to grid ({H_patches}x{W_patches}) and applied 2D PE. New sequence length: {encoded_features.shape[1]}")
+
+            elif isinstance(self.positional_embedding, CustomRotationalEmbedding1D):
+                # 1D PE: Expects (B, C, L). `encoded_features` is (B, S, D)
+                # Permute to (B, D, S)
+                pe_input_1d = encoded_features.permute(0, 2, 1)
+                pos_emb_1d = self.positional_embedding(pe_input_1d) # Output (B, D, S)
+                pos_emb_1d = pos_emb_1d.permute(0, 2, 1) # (B, S, D)
+                if pos_emb_1d.shape == encoded_features.shape:
+                    encoded_features = encoded_features + pos_emb_1d
+                else:
+                    print(f"Warning: 1D Rotational PE shape {pos_emb_1d.shape} mismatch with features {encoded_features.shape}. Skipping PE.")
+            
+            elif isinstance(self.positional_embedding, (LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding)) and not self.config.reshape_patch_sequence_to_grid:
+                 # 2D PE selected, but not reshaping. Apply as if 1D sequence with H=S, W=1 (or similar)
+                if encoded_features.dim() == 3: # (B, S, D)
+                    pe_input_seq_as_2d = encoded_features.permute(0, 2, 1).unsqueeze(-1) # (B, D, S, 1)
+                    pos_emb_seq_as_2d = self.positional_embedding(pe_input_seq_as_2d)
+                    pos_emb_seq_as_2d = pos_emb_seq_as_2d.squeeze(-1).permute(0, 2, 1)
+                    if pos_emb_seq_as_2d.shape == encoded_features.shape:
+                         encoded_features = encoded_features + pos_emb_seq_as_2d
+                    else:
+                        print(f"Warning: 2D PE (applied to sequence) shape {pos_emb_seq_as_2d.shape} mismatch with features {encoded_features.shape}. Skipping PE.")
+            # Add other PE types if necessary
+            
         return encoded_features, inferred_task_latent, hipa_control_signal, entropy_aux_loss
     
     def forward_with_mixed_precision(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
