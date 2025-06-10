@@ -2838,7 +2838,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         # Initialize Integration Flow + HiPA Sampler for ultra-fast generation
         self.integration_flow_sampler = IntegrationFlowHiPASampler(
             model=None,  # Will be set later when model is available
-            num_steps=config.diffusion_timesteps,
+            num_steps=config.diffusion_steps,
             beta_start=config.diffusion_beta_start,
             beta_end=config.diffusion_beta_end,
             sigma_min=0.01,
