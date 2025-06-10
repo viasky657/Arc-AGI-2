@@ -2891,7 +2891,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # CTM prediction history processor
         self.ctm_prediction_processor = nn.Sequential(
-            nn.Linear(config.out_dims * config.iterations, config.d_model),
+            nn.Linear(config.ctm_out_dims * config.ctm_iterations, config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model)
         )
