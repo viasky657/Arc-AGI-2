@@ -15,3 +15,6 @@ VALID_POSITIONAL_EMBEDDING_TYPES = [
     'learnable-fourier', 'multi-learnable-fourier',
     'custom-rotational', 'custom-rotational-1d'
 ]
+
+ARC_TRAIN_DIR = "./data/training"
+ARC_EVAL_DIR = "./data/evaluation"
