@@ -1469,7 +1469,7 @@ class MixedPrecisionTrainer:
         self.enabled = config.mixed_precision
         
         # Initialize GradScaler for mixed precision
-        self.scaler = torch.cuda.amp.GradScaler() if self.enabled and torch.cuda.is_available() else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.enabled and torch.cuda.is_available() else None
         
         # Track mixed precision statistics
         self.mp_stats = {
@@ -2339,13 +2339,15 @@ class OriginalCTMCore(nn.Module):
             i, j = torch.triu_indices(n_synch, n_synch)
             pairwise_product = outer[:, i, j]
             
-        elif self.neuron_select_type == 'random-pairing':
-            # For random-pairing, we compute the sync between specific pairs of neurons
+        elif self.neuron_select_type == 'random-pairing' or \
+             self.neuron_select_type.startswith('bio_') or \
+             self.neuron_select_type in ['adaptive_random', 'performance_guided', 'task_aware']:
+            # For random-pairing and bio/hybrid types, compute sync between specific pairs
             left = activated_state[:, neuron_indices_left]
             right = activated_state[:, neuron_indices_right]
             pairwise_product = left * right
         else:
-            raise ValueError("Invalid neuron selection type")
+            raise ValueError(f"Unhandled neuron selection type in compute_synchronisation: {self.neuron_select_type}")
         
         
         
@@ -2456,23 +2458,48 @@ class OriginalCTMCore(nn.Module):
         Initialize the left and right neuron indices based on the neuron selection type.
         This complexity is owing to legacy experiments, but we retain that these types of
         neuron selections are interesting to experiment with.
+        Uses EnhancedNeuronSelector for biological and hybrid types.
         """
-        if self.neuron_select_type=='first-last':
+        device = self.start_activated_state.device
+
+        # Ensure _enhanced_selector is initialized (it should be by get_neuron_select_type called in __init__)
+        if not hasattr(self, '_enhanced_selector'):
+             # Fallback initialization if somehow not set, though get_neuron_select_type should handle this.
+             self._enhanced_selector = EnhancedNeuronSelector(neuron_select_type=self.neuron_select_type)
+
+        if self.neuron_select_type.startswith('bio_') or \
+           self.neuron_select_type in ['adaptive_random', 'performance_guided', 'task_aware']:
+            # Use EnhancedNeuronSelector for these types.
+            # Pass activations=None as they are not available during initialization.
+            # The selector should handle this (e.g., by falling back to random or a default strategy).
+            neuron_indices_left, neuron_indices_right = self._enhanced_selector.select_neurons_for_synchronization(
+                activations=None,
+                synch_type=synch_type,
+                n_synch=n_synch,
+                d_model=d_model,
+                targets=None,
+                weights=None
+            )
+        elif self.neuron_select_type=='first-last':
             if synch_type == 'out':
-                neuron_indices_left = neuron_indices_right = torch.arange(0, n_synch)
+                neuron_indices_left = neuron_indices_right = torch.arange(0, n_synch, device=device)
             elif synch_type == 'action':
-                neuron_indices_left = neuron_indices_right = torch.arange(d_model-n_synch, d_model)
+                neuron_indices_left = neuron_indices_right = torch.arange(d_model-n_synch, d_model, device=device)
 
         elif self.neuron_select_type=='random':
-            neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
-            neuron_indices_right = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
+            # Ensure replace=False for unique neuron selection
+            neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch, replace=False)).to(device)
+            neuron_indices_right = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch, replace=False)).to(device)
 
         elif self.neuron_select_type=='random-pairing':
             assert n_synch > n_random_pairing_self, f"Need at least {n_random_pairing_self} pairs for {self.neuron_select_type}"
-            neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
-            neuron_indices_right = torch.concatenate((neuron_indices_left[:n_random_pairing_self], torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch-n_random_pairing_self))))
+            neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch, replace=False)).to(device)
+            # Ensure replace=False for the second part as well for unique neurons
+            neuron_indices_right_random_part = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch-n_random_pairing_self, replace=False)).to(device)
+            neuron_indices_right = torch.concatenate((neuron_indices_left[:n_random_pairing_self], neuron_indices_right_random_part))
+        else:
+            raise ValueError(f"Unhandled neuron selection type in initialize_left_right_neurons: {self.neuron_select_type}")
 
-        device = self.start_activated_state.device
         return neuron_indices_left.to(device), neuron_indices_right.to(device)
 
     def get_neuron_select_type(self):
@@ -2508,12 +2535,16 @@ class OriginalCTMCore(nn.Module):
         """
         Calculate the size of the synchronisation representation based on neuron selection type.
         """
-        if self.neuron_select_type == 'random-pairing':
+        if self.neuron_select_type == 'random-pairing' or \
+           self.neuron_select_type.startswith('bio_') or \
+           self.neuron_select_type in ['adaptive_random', 'performance_guided', 'task_aware']:
+            # For these types, n_synch neurons are selected and paired, resulting in n_synch synchronization values.
             synch_representation_size = n_synch
         elif self.neuron_select_type in ('first-last', 'random'):
+            # For these, a dense matrix of n_synch x n_synch is formed, and upper triangle is taken.
             synch_representation_size = (n_synch * (n_synch + 1)) // 2
         else:
-            raise ValueError(f"Invalid neuron selection type: {self.neuron_select_type}")
+            raise ValueError(f"Unhandled neuron selection type in calculate_synch_representation_size: {self.neuron_select_type}")
         return synch_representation_size
 
     def forward(self, x, track=False):
