@@ -2781,7 +2781,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # Enhanced CTM guidance processors (from ctm_guided_integration_flow.py)
         self.sync_to_flow_mapper = nn.Sequential(
-            nn.Linear(config.n_synch_out, config.d_model),
+            nn.Linear(config.ctm_n_synch_out, config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model * 2),
             nn.GELU(),
@@ -2868,7 +2868,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # CTM synchronization processor (strongest influence)
         self.ctm_sync_processor = nn.Sequential(
-            nn.Linear(config.n_synch_out, config.d_model),
+            nn.Linear(config.ctm_n_synch_out, config.d_model),
             nn.GELU(),
             nn.Linear(config.d_model, config.d_model * 2),
             nn.GELU(),
