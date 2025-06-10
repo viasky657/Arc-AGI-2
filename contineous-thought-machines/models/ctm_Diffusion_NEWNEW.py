@@ -1922,6 +1922,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     noise_schedule: str = "cosine" # e.g., "linear", "cosine"
     diffusion_beta_start: float = 0.0001
     diffusion_beta_end: float = 0.02
+    diffusion_timesteps: int = 1000 # Number of timesteps for the diffusion process
     ctm_diffusion_coupling_strength: float = 0.8 # How CTM influences diffusion
     adaptive_scheduling: bool = True  # CTM-adaptive diffusion timestep scheduling
     iterative_refinement: bool = True # Iterative CTM-diffusion refinement for sampling
