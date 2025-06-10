@@ -1607,7 +1607,7 @@ class _EntropyProxyModel(nn.Module):
         device = byte_sequence.device
 
         # Embed byte sequence
-        embedded = self.embedding(byte_sequence)  # (batch_size, seq_len, embedding_dim)
+        embedded = self.embedding(byte_sequence.long())  # (batch_size, seq_len, embedding_dim)
 
         # Get LSTM outputs for predicting the *next* byte
         # For predicting byte at t+1, we use LSTM output at time t

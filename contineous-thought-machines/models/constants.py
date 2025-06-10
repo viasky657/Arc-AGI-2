@@ -16,5 +16,5 @@ VALID_POSITIONAL_EMBEDDING_TYPES = [
     'custom-rotational', 'custom-rotational-1d'
 ]
 
-ARC_TRAIN_DIR = "./data/training"
-ARC_EVAL_DIR = "./data/evaluation"
+ARC_TRAIN_DIR = "../data/training"
+ARC_EVAL_DIR = "../data/evaluation"
