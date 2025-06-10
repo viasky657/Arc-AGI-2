@@ -569,11 +569,11 @@ from .mcmc_interpretability_solver import (
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
 # Import original CTM modules to preserve exact behavior
 try:
-    from models.modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
-    from models.utils import compute_normalized_entropy
-    from models.constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
+    from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
+    from .utils import compute_normalized_entropy
+    from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
 except ImportError:
-    print("Warning: Could not import original CTM modules. Using fallback implementations.")
+    print("Warning: Could not import original CTM modules (e.g. from .modules). Using fallback implementations.")
     SynapseUNET = None
     SuperLinear = None
     Squeeze = None
@@ -2124,9 +2124,9 @@ import torch
 import numpy as np
 import math
 
-from models.modules import SynapseUNET, Squeeze, SuperLinear
-from models.utils import compute_normalized_entropy
-from models.constants import VALID_NEURON_SELECT_TYPES
+from .modules import SynapseUNET, Squeeze, SuperLinear
+from .utils import compute_normalized_entropy
+from .constants import VALID_NEURON_SELECT_TYPES
 
 
 class OriginalCTMCore(nn.Module):
