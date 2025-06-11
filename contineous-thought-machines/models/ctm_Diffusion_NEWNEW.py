@@ -5112,8 +5112,8 @@ class EnhancedCTMDiffusion(nn.Module):
                  # This `forward` method's structure is a bit mixed.
                  # Let's assume if `target_diffusion_output` is provided, we are in a training context
                  # where `timestep` is also provided, and we should construct noisy input here.
-                 current_noise_for_loss = torch.randn_like(target_diffusion_output)
-                 diffusion_input_arg = self.diffusion.add_noise(target_diffusion_output, current_noise_for_loss, effective_timestep)
+                 current_noise_for_loss = torch.randn_like(numeric_target_diffusion_output)
+                 diffusion_input_arg = self.diffusion.add_noise(numeric_target_diffusion_output, current_noise_for_loss, effective_timestep)
                  output_dict['true_noise_for_loss'] = current_noise_for_loss # Store for loss calculation
             else: # Sampling or CTM-only modes where diffusion might be called for generation
                  diffusion_input_arg = kv_features_for_ctm # Or an initial noise for pure generation start
