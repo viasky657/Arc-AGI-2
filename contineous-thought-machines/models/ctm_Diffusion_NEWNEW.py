@@ -2003,48 +2003,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
         # Validate output dimensions
         if len(self.output_dims) != self.num_outputs:
             raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")
-  
-    # cross_modal_weight: float = 0.1 # If applicable for cross-modal tasks
-    lateral_connection_dim: int = 256 # For lateral positional embeddings in multi-task setup
-   
-    # CTM Control / Convergence Parameters (for CTM's interaction with diffusion/generation)
-    max_diffusion_steps: int = 100  # Max steps for CTM-controlled generation loop (distinct from diffusion_steps)
-    convergence_threshold: float = 0.01
-    efficiency_penalty_weight: float = 0.1
-    certainty_convergence_target: float = 0.8
-    thought_loop_detection: bool = True
-    loop_detection_window: int = 5
-    loop_similarity_threshold: float = 0.95
-    
-    vocab_size: Optional[int] = None # For task-specific output heads (e.g., if not purely binary)
-    num_tasks: int = 1 # General number of tasks, might be used by existing code. max_tasks is for CL.
-    unet_input_feature_dim: Optional[int] = None # <<< NEW: Standardized feature dimension for diffusion U-Net input
- 
-    # Audio Output Settings (for TTS tasks)
-    output_audio_bytes: bool = False # If True, model output (for generation) is converted to byte sequence. Target input is also expected as bytes.
-    audio_output_dtype_str: str = "float32" # Data type of raw audio samples ("float32", "int16")
-    audio_output_item_size: int = 4 # Automatically set in __post_init__ based on audio_output_dtype_str
 
-    # Enhanced MCMC Parameters
-    enable_enhanced_mcmc: bool = False
-    mcmc_config: Optional[MCMCConfig] = None # MCMCConfig from .fenchel_young_mcmc
-    mcmc_output_space_type: str = 'binary_hypercube' # e.g., 'binary_hypercube', 'top_k_polytope'
-    mcmc_output_space_dim: Optional[int] = None # Dimension of MCMC output space, defaults to ctm_out_dims
-    use_large_neighborhood_search: bool = True
-    lns_frequency: int = 10
-    lns_neighborhood_size: int = 20
-    enable_blackbox_solver: bool = True # For MCMC-based interpretability
-    mcmc_phi_network_hidden_dim: int = 128
-
-    def __post_init__(self):
-        # Validate output dimensions (this was the first __post_init__ in the file)
-        if hasattr(self, 'output_dims') and hasattr(self, 'num_outputs') and \
-           len(self.output_dims) != self.num_outputs:
-            raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")
-
-        # Second __post_init__ content from the file
+        # Merged content from the second __post_init__
         if hasattr(self, 'ctm_prediction_reshaper') and self.ctm_prediction_reshaper == [-1] and self.vocab_size is not None:
-             pass
+            pass
         if hasattr(self, 'ctm_dropout_nlm') and self.ctm_dropout_nlm is None and hasattr(self, 'ctm_dropout'):
             self.ctm_dropout_nlm = self.ctm_dropout
         if hasattr(self, 'mcmc_output_space_dim') and self.mcmc_output_space_dim is None and hasattr(self, 'ctm_out_dims'):
@@ -2078,25 +2040,20 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
                 raise ValueError("entropy_patcher_max_patch_size must be >= entropy_patcher_min_patch_size.")
             if self.entropy_patcher_threshold_type not in ["global", "relative_monotonic"]:
                 raise ValueError("entropy_patcher_threshold_type must be 'global' or 'relative_monotonic'.")
-            # Ensure learned_patch_encoder specific params are not primary if dynamic is on
             if self.use_learned_patch_encoder:
                 print("Warning: 'use_learned_patch_encoder' is True, but 'use_dynamic_entropy_patcher' takes precedence.")
-        elif self.use_learned_patch_encoder: # Only if dynamic_entropy_patcher is False
+        elif self.use_learned_patch_encoder:
             if self.patch_size <= 0:
                 raise ValueError("patch_size must be positive if use_learned_patch_encoder is True.")
             if self.patch_embedding_dim <= 0:
                 raise ValueError("patch_embedding_dim must be positive if use_learned_patch_encoder is True.")
-        elif self.multi_granularity and self.multi_granularity_output_dim <= 0: # Only if not using any patcher
+        elif self.multi_granularity and self.multi_granularity_output_dim <= 0:
             print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
         
-        # Validation for inferred_task_latent_dim (from previous refactoring, ensure it exists in config)
         if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim <= 0:
-             # Adding a default if it was missed in earlier config edits, or raise error
-             # For now, let's assume it should exist. If it was removed, this will fail.
-             # It was added in a previous step.
              if not hasattr(self, 'inferred_task_latent_dim'):
                  print("Warning: inferred_task_latent_dim not found in config, defaulting to 64.")
-                 self.inferred_task_latent_dim = 64 # Default if missing
+                 self.inferred_task_latent_dim = 64
              elif self.inferred_task_latent_dim <=0:
                   raise ValueError("inferred_task_latent_dim must be positive.")
  
@@ -2104,38 +2061,31 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             (not hasattr(self, 'hipa_num_heads') or self.hipa_num_heads <= 0):
              raise ValueError("hipa_num_heads must be positive if use_hipa_attention is True.")
  
-         # Determine audio_output_item_size
         if hasattr(self, 'audio_output_dtype_str'):
-             if self.audio_output_dtype_str == "float32":
-                 self.audio_output_item_size = 4
-             elif self.audio_output_dtype_str == "int16":
-                 self.audio_output_item_size = 2
-             else:
-                 if hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
-                     raise ValueError(f"Unsupported audio_output_dtype_str: {self.audio_output_dtype_str} when output_audio_bytes is True.")
-                 else:
-                     self.audio_output_item_size = 4 # Default if not critical
-         elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
-              # This case implies audio_output_dtype_str should have been defined.
-              # If it wasn't, audio_output_item_size might not be correctly set.
-              # However, the previous check for audio_output_dtype_str handles this.
-              # If audio_output_dtype_str is None here, it's an issue if output_audio_bytes is True.
-              if not hasattr(self, 'audio_output_dtype_str') or self.audio_output_dtype_str is None:
-                  raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
-              # audio_output_item_size would have been set by the block above.
-         else: # output_audio_bytes is False or not defined
-              self.audio_output_item_size = 4 # Default if not audio output or not specified
+            if self.audio_output_dtype_str == "float32":
+                self.audio_output_item_size = 4
+            elif self.audio_output_dtype_str == "int16":
+                self.audio_output_item_size = 2
+            else:
+                if hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
+                    raise ValueError(f"Unsupported audio_output_dtype_str: {self.audio_output_dtype_str} when output_audio_bytes is True.")
+                else:
+                    self.audio_output_item_size = 4
+        elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
+            if not hasattr(self, 'audio_output_dtype_str') or self.audio_output_dtype_str is None:
+                raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
+        else:
+            self.audio_output_item_size = 4
 
-         # Calculate unet_input_feature_dim if not set
-         if self.unet_input_feature_dim is None:
-             if self.max_sequence_length <= 0 or self.audio_output_item_size <= 0:
-                 raise ValueError("max_sequence_length and audio_output_item_size must be positive to calculate unet_input_feature_dim.")
-             self.unet_input_feature_dim = self.max_sequence_length // self.audio_output_item_size
-             if self.unet_input_feature_dim <= 0:
-                 raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
-         elif self.unet_input_feature_dim <= 0:
-             raise ValueError("unet_input_feature_dim, if set, must be positive.")
-
+        # Calculate unet_input_feature_dim if not set
+        if self.unet_input_feature_dim is None:
+            if self.max_sequence_length <= 0 or self.audio_output_item_size <= 0:
+                raise ValueError("max_sequence_length and audio_output_item_size must be positive to calculate unet_input_feature_dim.")
+            self.unet_input_feature_dim = self.max_sequence_length // self.audio_output_item_size
+            if self.unet_input_feature_dim <= 0:
+                raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
+        elif self.unet_input_feature_dim <= 0:
+            raise ValueError("unet_input_feature_dim, if set, must be positive.")
 
 import torch.nn as nn
 import torch
@@ -3715,6 +3665,37 @@ class EnhancedCTMDiffusion(nn.Module):
             nn.Sigmoid()
         )
 
+        # cross_modal_weight: float = 0.1 # If applicable for cross-modal tasks
+        lateral_connection_dim: int = 256 # For lateral positional embeddings in multi-task setup
+   
+         # CTM Control / Convergence Parameters (for CTM's interaction with diffusion/generation)
+        max_diffusion_steps: int = 100  # Max steps for CTM-controlled generation loop (distinct from diffusion_steps)
+        convergence_threshold: float = 0.01
+        efficiency_penalty_weight: float = 0.1
+        certainty_convergence_target: float = 0.8
+        thought_loop_detection: bool = True
+        loop_detection_window: int = 5
+        loop_similarity_threshold: float = 0.95
+    
+        vocab_size: Optional[int] = None # For task-specific output heads (e.g., if not purely binary)
+        num_tasks: int = 1 # General number of tasks, might be used by existing code. max_tasks is for CL.
+        unet_input_feature_dim: Optional[int] = None # <<< NEW: Standardized feature dimension for diffusion U-Net input
+ 
+        # Audio Output Settings (for TTS tasks)
+        output_audio_bytes: bool = False # If True, model output (for generation) is converted to byte sequence. Target input is also expected as bytes.
+        audio_output_dtype_str: str = "float32" # Data type of raw audio samples ("float32", "int16")
+        audio_output_item_size: int = 4 # Automatically set in __post_init__ based on audio_output_dtype_str
+
+        # Enhanced MCMC Parameters
+        enable_enhanced_mcmc: bool = False
+        mcmc_config: Optional[MCMCConfig] = None # MCMCConfig from .fenchel_young_mcmc
+        mcmc_output_space_type: str = 'binary_hypercube' # e.g., 'binary_hypercube', 'top_k_polytope'
+        mcmc_output_space_dim: Optional[int] = None # Dimension of MCMC output space, defaults to ctm_out_dims
+        use_large_neighborhood_search: bool = True
+        lns_frequency: int = 10
+        lns_neighborhood_size: int = 20
+        enable_blackbox_solver: bool = True # For MCMC-based interpretability
+        mcmc_phi_network_hidden_dim: int = 128
         # Positional Embedding Initialization
         self.positional_embedding = None
         if config.positional_embedding_type:
