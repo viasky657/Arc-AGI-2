@@ -1998,6 +1998,15 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     
     # Multi-task Learning Parameters
     max_tasks: int = 50  # Maximum number of tasks for continual learning
+# Added to resolve TypeError for unexpected keyword arguments
+    vocab_size: Optional[int] = None
+    enable_enhanced_mcmc: bool = True
+    output_audio_bytes: bool = False
+    inferred_task_latent_dim: Optional[int] = None # Default to None, __post_init__ handles it
+    use_hipa_attention: bool = False # Default to False
+    hipa_num_heads: Optional[int] = None # Default to None
+    audio_output_dtype_str: Optional[str] = "float32" # Default as per __post_init__ logic
+    unet_input_feature_dim: Optional[int] = None # Default to None, __post_init__ calculates it
     
     def __post_init__(self):
         # Validate output dimensions
