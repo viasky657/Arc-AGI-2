@@ -2059,12 +2059,11 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
         elif self.multi_granularity and self.multi_granularity_output_dim <= 0:
             print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
         
-        if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim <= 0:
-             if not hasattr(self, 'inferred_task_latent_dim'):
-                 print("Warning: inferred_task_latent_dim not found in config, defaulting to 64.")
-                 self.inferred_task_latent_dim = 64
-             elif self.inferred_task_latent_dim <=0:
-                  raise ValueError("inferred_task_latent_dim must be positive.")
+        if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim is None:
+            print("Warning: inferred_task_latent_dim not found or is None in config, defaulting to 64.")
+            self.inferred_task_latent_dim = 512
+        elif self.inferred_task_latent_dim <= 0: # This check is now safe
+            raise ValueError("inferred_task_latent_dim must be positive.")
  
         if hasattr(self, 'use_hipa_attention') and self.use_hipa_attention and \
             (not hasattr(self, 'hipa_num_heads') or self.hipa_num_heads <= 0):
