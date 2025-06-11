@@ -2018,7 +2018,8 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     
     vocab_size: Optional[int] = None # For task-specific output heads (e.g., if not purely binary)
     num_tasks: int = 1 # General number of tasks, might be used by existing code. max_tasks is for CL.
-
+    unet_input_feature_dim: Optional[int] = None # <<< NEW: Standardized feature dimension for diffusion U-Net input
+ 
     # Audio Output Settings (for TTS tasks)
     output_audio_bytes: bool = False # If True, model output (for generation) is converted to byte sequence. Target input is also expected as bytes.
     audio_output_dtype_str: str = "float32" # Data type of raw audio samples ("float32", "int16")
@@ -2114,10 +2115,26 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
                      raise ValueError(f"Unsupported audio_output_dtype_str: {self.audio_output_dtype_str} when output_audio_bytes is True.")
                  else:
                      self.audio_output_item_size = 4 # Default if not critical
-        elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
-             raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
-        else:
-             self.audio_output_item_size = 4 # Default
+         elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
+              # This case implies audio_output_dtype_str should have been defined.
+              # If it wasn't, audio_output_item_size might not be correctly set.
+              # However, the previous check for audio_output_dtype_str handles this.
+              # If audio_output_dtype_str is None here, it's an issue if output_audio_bytes is True.
+              if not hasattr(self, 'audio_output_dtype_str') or self.audio_output_dtype_str is None:
+                  raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
+              # audio_output_item_size would have been set by the block above.
+         else: # output_audio_bytes is False or not defined
+              self.audio_output_item_size = 4 # Default if not audio output or not specified
+
+         # Calculate unet_input_feature_dim if not set
+         if self.unet_input_feature_dim is None:
+             if self.max_sequence_length <= 0 or self.audio_output_item_size <= 0:
+                 raise ValueError("max_sequence_length and audio_output_item_size must be positive to calculate unet_input_feature_dim.")
+             self.unet_input_feature_dim = self.max_sequence_length // self.audio_output_item_size
+             if self.unet_input_feature_dim <= 0:
+                 raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
+         elif self.unet_input_feature_dim <= 0:
+             raise ValueError("unet_input_feature_dim, if set, must be positive.")
 
 
 import torch.nn as nn
@@ -3658,7 +3675,8 @@ class EnhancedCTMDiffusion(nn.Module):
         self.ctm_core = OriginalCTMCore(config)
         
         # Enhanced diffusion processor
-        self.diffusion = CTMControlledDiffusionProcessor(config, actual_noisy_input_dim=config.ctm_input_dim)
+        # actual_noisy_input_dim is now config.unet_input_feature_dim
+        self.diffusion = CTMControlledDiffusionProcessor(config, actual_noisy_input_dim=config.unet_input_feature_dim)
         
         # Input encoder: processes raw features (from patcher, MGP, or byte_embedding) to ctm_input_dim
         # raw_feature_dim is the embedding_dim of each item in the sequence from the preprocessor.
@@ -3739,6 +3757,9 @@ class EnhancedCTMDiffusion(nn.Module):
             self.mcmc_phi_network = None
             self.mcmc_output_space = None
             self.blackbox_solver = None
+
+        # Projection layer for sampling path: from ctm_input_dim to unet_input_feature_dim
+        self.sampling_kv_to_unet_input_proj = nn.Linear(config.ctm_input_dim, config.unet_input_feature_dim)
         
         # Initialize new optimization components
         self._initialize_optimization_components()
@@ -4860,7 +4881,8 @@ class EnhancedCTMDiffusion(nn.Module):
             # Check if it's already numeric (e.g. if called internally with non-byte target)
             if target_diffusion_output.dtype == torch.uint8:
                 try:
-                    numeric_target_diffusion_output = batched_bytes_to_numeric_tensor(target_diffusion_output, item_size=4, target_dtype=np.float32)
+                    item_size_for_numeric = self.config.audio_output_item_size
+                    numeric_target_diffusion_output = batched_bytes_to_numeric_tensor(target_diffusion_output, item_size=item_size_for_numeric, target_dtype=np.float32)
                 except ValueError as e:
                     print(f"Warning: Error converting byte target_diffusion_output to numeric: {e}. Using as is, which might be incorrect.")
                     numeric_target_diffusion_output = target_diffusion_output # Fallback, though likely problematic
@@ -5101,23 +5123,36 @@ class EnhancedCTMDiffusion(nn.Module):
             
             diffusion_input_arg = None
             if target_diffusion_output is not None: # Training with diffusion loss
-                 # We need the noisy version of target_diffusion_output.
-                 # This should have been prepared earlier if this is the main loss path.
-                 # The main forward() structure for training diffusion was:
-                 # noise = torch.randn_like(target_diffusion_output)
-                 # noisy_input_for_diffusion = self.diffusion.add_noise(target_diffusion_output, noise, effective_timestep)
-                 # For now, let's assume if target_diffusion_output is present, `processed_input` is actually the noisy input.
-                 # This part of the main forward needs to be very clear about what `processed_input` is.
-                 # Re-evaluating: `processed_input` is `kv_features_for_ctm`.
-                 # If training diffusion, the `self.diffusion` call needs the *noisy_input*.
-                 # This `forward` method's structure is a bit mixed.
-                 # Let's assume if `target_diffusion_output` is provided, we are in a training context
-                 # where `timestep` is also provided, and we should construct noisy input here.
-                 current_noise_for_loss = torch.randn_like(numeric_target_diffusion_output)
-                 diffusion_input_arg = self.diffusion.add_noise(numeric_target_diffusion_output, current_noise_for_loss, effective_timestep)
-                 output_dict['true_noise_for_loss'] = current_noise_for_loss # Store for loss calculation
+                 # numeric_target_diffusion_output is (B, L_bytes/item_size), e.g. (B, 2048)
+                 # Pad or truncate it to config.unet_input_feature_dim
+                 current_len = numeric_target_diffusion_output.shape[-1]
+                 target_unet_len = self.config.unet_input_feature_dim
+                 
+                 if current_len < target_unet_len:
+                     padding = torch.zeros(batch_size, target_unet_len - current_len, device=device, dtype=numeric_target_diffusion_output.dtype)
+                     clean_target_for_unet = torch.cat([numeric_target_diffusion_output, padding], dim=-1)
+                 elif current_len > target_unet_len:
+                     clean_target_for_unet = numeric_target_diffusion_output[:, :target_unet_len]
+                 else:
+                     clean_target_for_unet = numeric_target_diffusion_output
+                 # clean_target_for_unet is now (B, config.unet_input_feature_dim)
+
+                 current_noise_for_loss = torch.randn_like(clean_target_for_unet)
+                 diffusion_input_arg = self.diffusion.add_noise(clean_target_for_unet, current_noise_for_loss, effective_timestep)
+                 output_dict['true_noise_for_loss'] = current_noise_for_loss # For loss calculation against predicted noise
             else: # Sampling or CTM-only modes where diffusion might be called for generation
-                 diffusion_input_arg = kv_features_for_ctm # Or an initial noise for pure generation start
+                 # kv_features_for_ctm is (B, S_patches, config.ctm_input_dim)
+                 # Average over S_patches to get (B, config.ctm_input_dim)
+                 if kv_features_for_ctm.dim() == 3 and kv_features_for_ctm.shape[1] > 0:
+                    avg_kv_features = kv_features_for_ctm.mean(dim=1)
+                 elif kv_features_for_ctm.dim() == 2: # Already (B, D)
+                    avg_kv_features = kv_features_for_ctm
+                 else:
+                    print(f"Warning: kv_features_for_ctm has unexpected shape {kv_features_for_ctm.shape} in sampling path. Using zeros for avg_kv_features.")
+                    avg_kv_features = torch.zeros(batch_size, self.config.ctm_input_dim, device=device, dtype=kv_features_for_ctm.dtype)
+                 
+                 # Project avg_kv_features (ctm_input_dim) to unet_input_feature_dim
+                 diffusion_input_arg = self.sampling_kv_to_unet_input_proj(avg_kv_features)
 
             diffusion_call_output = self.diffusion( # This is CTMControlledDiffusionProcessor.forward
                 noisy_input=diffusion_input_arg, # Corrected argument name
