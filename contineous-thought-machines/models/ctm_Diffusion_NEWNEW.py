@@ -2771,14 +2771,14 @@ class CTMControlledDiffusionProcessor(nn.Module):
     8. Multi-resolution guidance for different data types
     """
     
-    def __init__(self, config: EnhancedCTMConfig):
+    def __init__(self, config: EnhancedCTMConfig, actual_noisy_input_dim: int):
         super().__init__()
         
         self.latent_dim = config.d_model
         self.coupling_strength = config.ctm_diffusion_coupling_strength
         self.adaptive_scheduling = config.adaptive_scheduling
         self.iterative_refinement = config.iterative_refinement
-        self.config = config
+        self.config = config # Storing the config for other parts of the class
         
         # Enhanced CTM guidance processors (from ctm_guided_integration_flow.py)
         self.sync_to_flow_mapper = nn.Sequential(
@@ -2903,8 +2903,9 @@ class CTMControlledDiffusionProcessor(nn.Module):
         )
         
         # Base noise prediction network
+        # The input dimension is actual_noisy_input_dim (from kv_features_for_ctm) + config.d_model (from time_emb)
         self.noise_predictor_base = nn.Sequential(
-            nn.Linear(config.ctm_input_dim + config.d_model, config.d_model * 2),  # noisy_input (ctm_input_dim) + time_emb (d_model)
+            nn.Linear(actual_noisy_input_dim + config.d_model, config.d_model * 2),
             nn.GELU(),
             nn.Linear(config.d_model * 2, config.d_model),
         )
@@ -3657,7 +3658,7 @@ class EnhancedCTMDiffusion(nn.Module):
         self.ctm_core = OriginalCTMCore(config)
         
         # Enhanced diffusion processor
-        self.diffusion = CTMControlledDiffusionProcessor(config)
+        self.diffusion = CTMControlledDiffusionProcessor(config, actual_noisy_input_dim=config.ctm_input_dim)
         
         # Input encoder: processes raw features (from patcher, MGP, or byte_embedding) to ctm_input_dim
         # raw_feature_dim is the embedding_dim of each item in the sequence from the preprocessor.
