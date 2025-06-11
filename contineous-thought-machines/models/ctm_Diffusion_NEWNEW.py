@@ -3717,8 +3717,8 @@ class EnhancedCTMDiffusion(nn.Module):
         self.ewc_optimal_params: Dict[Any, Dict[str, torch.Tensor]] = defaultdict(dict)   # Key type TBD
 
         # Memory Replay components (Bank will be organized by inferred task characteristics later)
-        # Storing (input_bytes, target_bytes, inferred_task_latent)
-        self.memory_bank: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        # Storing (input_bytes, target_bytes, inferred_task_latent, hipa_control_signal, metadata)
+        self.memory_bank: List[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict]] = []
 
         # Store MCMC configuration from EnhancedCTMConfig
         self.enable_enhanced_mcmc = config.enable_enhanced_mcmc
@@ -4930,13 +4930,26 @@ class EnhancedCTMDiffusion(nn.Module):
             # In self-supervised mode, task_name is not explicitly passed to forward.
             # Storing experiences with a default key. The third element in the tuple
             # is a placeholder for what was previously the task_name.
-            default_memory_key = "_self_supervised_data_"
+            default_memory_key = "_self_supervised_data_" # This string might be used in metadata
+
+            # Create a compatible experience tuple for the list-based memory_bank
+            # Placeholders are used as this block is conceptual and lacks full context for all tuple elements.
+            placeholder_inferred_latent = None
+            placeholder_hipa_signal = None
+            conceptual_metadata = {
+                'type': 'conceptual_self_supervised',
+                'original_key_info': default_memory_key, # Store the original string info in metadata
+                'timestamp': time.time(), # Consistent with add_to_memory_bank's metadata
+                'access_count': 0         # Consistent with add_to_memory_bank's metadata
+            }
             experience_to_store = (
                 byte_sequence.detach().cpu(),
                 target_diffusion_output.detach().cpu() if target_diffusion_output is not None else None,
-                default_memory_key # Using the key itself as a placeholder for task identifier
+                placeholder_inferred_latent,
+                placeholder_hipa_signal,
+                conceptual_metadata
             )
-            self.memory_bank[default_memory_key].append(experience_to_store)
+            self.memory_bank.append(experience_to_store) # Corrected to append to the list
             
             # Conceptual: Sample from memory bank and calculate replay loss
             # replay_batch_size = self.config.get('replay_batch_size', batch_size)
