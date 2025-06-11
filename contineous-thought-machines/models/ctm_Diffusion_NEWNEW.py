@@ -2904,7 +2904,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # Base noise prediction network
         self.noise_predictor_base = nn.Sequential(
-            nn.Linear(config.d_model * 2, config.d_model * 2),  #  input + time
+            nn.Linear(config.ctm_input_dim + config.d_model, config.d_model * 2),  # noisy_input (ctm_input_dim) + time_emb (d_model)
             nn.GELU(),
             nn.Linear(config.d_model * 2, config.d_model),
         )
