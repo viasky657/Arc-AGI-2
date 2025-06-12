@@ -1932,7 +1932,9 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     iterative_refinement: bool = True # Iterative CTM-diffusion refinement for sampling
     
     # Continual Learning Parameters
+    use_ewc: bool = True        # <<< NEW: Flag to enable/disable EWC loss calculation
     ewc_lambda: float = 1000.0  # Elastic Weight Consolidation strength
+    ewc_on_current_task_finetune: bool = False # If True, EWC penalty applies even if prev_task_key matches current_task_key
     memory_size: int = 10000    # Size of the episodic memory buffer for replay
     replay_ratio: float = 0.3   # Ratio of replay batches to new data batches
     fisher_update_freq: int = 1000 # How often to update Fisher matrix for EWC
@@ -4330,9 +4332,24 @@ class EnhancedCTMDiffusion(nn.Module):
         # The dynamic system handles expansion automatically
         self.dynamic_task_embedding._grow_embedding_to_size(new_size)
         
-      
-
     # --- EWC Methods ---
+    def _get_task_key_from_latent(self, latent_tensor: Optional[torch.Tensor]) -> Optional[str]:
+        """
+        Generates a string key from a latent tensor for EWC dictionary lookups.
+        Uses a hash of the rounded tensor values to create a consistent key.
+        Returns None if latent_tensor is None.
+        """
+        if latent_tensor is None:
+            return None
+        try:
+            # Ensure tensor is on CPU and detached for numpy conversion
+            # Round to a few decimal places to handle minor float variations if necessary
+            rounded_latent_bytes = (torch.round(latent_tensor.detach().cpu() * 10000) / 10000).numpy().tobytes()
+            return hashlib.sha256(rounded_latent_bytes).hexdigest()[:16] # Use a portion of the hash
+        except Exception as e:
+            print(f"Warning: Could not generate task key from latent: {e}")
+            return None
+
     def _compute_fisher_information_for_task(self, task_name: str, dataloader: torch.utils.data.DataLoader, device: torch.device):
         """
         Compute Fisher Information Matrix for Elastic Weight Consolidation (EWC) for general model parameters.
@@ -4658,22 +4675,31 @@ class EnhancedCTMDiffusion(nn.Module):
             # Fallback: just convert to float
             return byte_sequences.float()
 
-    def ewc_loss(self) -> torch.Tensor:
+    def ewc_loss(self, current_inferred_task_latent: Optional[torch.Tensor] = None) -> torch.Tensor:
         total_ewc_loss = torch.tensor(0.0, device=next(self.parameters()).device)
-        if not self.ewc_fisher_information: # No previous tasks
+        if not self.ewc_fisher_information or not self.config.use_ewc: # Check config flag
             return total_ewc_loss
 
-        for prev_task_name in self.ewc_fisher_information.keys():
-            task_fisher = self.ewc_fisher_information[prev_task_name]
-            task_optimal_params = self.ewc_optimal_params[prev_task_name]
-            
-            for name, param in self.named_parameters():
-                if param.requires_grad and name in task_fisher and name in task_optimal_params:
-                    fisher_val = task_fisher[name]
-                    optimal_param_val = task_optimal_params[name]
-                    total_ewc_loss += (fisher_val * (param - optimal_param_val).pow(2)).sum()
+        current_task_key = self._get_task_key_from_latent(current_inferred_task_latent)
+
+        for prev_task_key, task_fisher_params_dict in self.ewc_fisher_information.items():
+            # If a current_task_key is derived and matches a previous task key,
+            # skip EWC for this previous task unless ewc_on_current_task_finetune is True.
+            if current_task_key is not None and prev_task_key == current_task_key and \
+               not getattr(self.config, 'ewc_on_current_task_finetune', False):
+                # print(f"Skipping EWC for task key {prev_task_key} as it matches current task's latent-derived key.")
+                continue
+
+            task_optimal_params_dict = self.ewc_optimal_params.get(prev_task_key)
+            if task_fisher_params_dict and task_optimal_params_dict:
+                for param_name, param_instance in self.named_parameters():
+                    if param_instance.requires_grad:
+                        if param_name in task_optimal_params_dict and param_name in task_fisher_params_dict:
+                            optimal_param_val = task_optimal_params_dict[param_name]
+                            fisher_importance_val = task_fisher_params_dict[param_name]
+                            total_ewc_loss += (fisher_importance_val * (param_instance - optimal_param_val).pow(2)).sum()
         
-        return self.config.ewc_lambda * total_ewc_loss
+        return self.config.ewc_lambda * total_ewc_loss / 2.0 # Original had /2, keeping it
 
     # --- Memory Replay Methods ---
     def add_to_memory_bank(self, input_bytes: torch.Tensor,
