@@ -3058,11 +3058,15 @@ class CTMControlledDiffusionProcessor(nn.Module):
                 task_id = getattr(ctm_data, 'task_id', 0) if hasattr(ctm_data, 'task_id') else 0
                 
                 # Apply intelligent frequency enhancement
-                enhanced_noise, modality_config = self.task_aware_hipa(
-                    current_noise,
+                # Reshape current_noise (B, D) to (B, 1, D) for FrequencyDomainAwareAttention
+                current_noise_unsqueezed = current_noise.unsqueeze(1)
+                enhanced_noise_squeezed, modality_config = self.task_aware_hipa(
+                    current_noise_unsqueezed,
                     hipa_control_signal=hipa_control_signal,
                     context_hints={'ctm_data': ctm_data} if ctm_data is not None else None
                 )
+                # Reshape enhanced_noise (B, 1, D) back to (B, D)
+                enhanced_noise = enhanced_noise_squeezed.squeeze(1)
                 
                 # Log modality detection for debugging
                 if hasattr(self, '_debug_mode') and self._debug_mode:
