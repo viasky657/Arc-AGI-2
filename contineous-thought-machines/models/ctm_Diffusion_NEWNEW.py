@@ -3728,10 +3728,10 @@ class EnhancedCTMDiffusion(nn.Module):
         self.memory_bank: List[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict]] = []
 
         # Store MCMC configuration from EnhancedCTMConfig
-        self.enable_enhanced_mcmc = config.enable_enhanced_mcmc
-        self.mcmc_config_params = config.mcmc_config # Renamed to avoid conflict if MCMCConfig class is also self.mcmc_config
-        self.mcmc_output_space_type = config.mcmc_output_space_type
-        self.mcmc_output_space_dim_config = config.mcmc_output_space_dim # Renamed
+        self.enable_enhanced_mcmc = getattr(config, 'enable_enhanced_mcmc', False)
+        self.mcmc_config_params = getattr(config, 'mcmc_config', None) # Renamed to avoid conflict if MCMCConfig class is also self.mcmc_config
+        self.mcmc_output_space_type = getattr(config, 'mcmc_output_space_type', 'binary_hypercube')
+        self.mcmc_output_space_dim_config = getattr(config, 'mcmc_output_space_dim', None) # Renamed
         self.use_large_neighborhood_search = config.use_large_neighborhood_search
         self.lns_frequency = config.lns_frequency
         self.lns_neighborhood_size = config.lns_neighborhood_size
