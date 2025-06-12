@@ -3735,7 +3735,7 @@ class EnhancedCTMDiffusion(nn.Module):
         self.use_large_neighborhood_search = getattr(config, 'use_large_neighborhood_search', True)
         self.lns_frequency = getattr(config, 'lns_frequency', 10)
         self.lns_neighborhood_size = getattr(config, 'lns_neighborhood_size', 20)
-        self.enable_blackbox_solver = config.enable_blackbox_solver
+        self.enable_blackbox_solver = getattr(config, 'enable_blackbox_solver', False)
         self.mcmc_phi_network_hidden_dim = config.mcmc_phi_network_hidden_dim
 
         if self.enable_enhanced_mcmc:
