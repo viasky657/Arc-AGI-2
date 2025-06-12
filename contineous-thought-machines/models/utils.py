@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import re
 import os
+import numpy as np # For entropy calculation
 
 def compute_decay(T, params, clamp_lims=(0, 15)):
     """
@@ -120,3 +121,148 @@ def get_accuracy_and_loss_from_checkpoint(checkpoint, device="cpu"):
     train_accuracies = checkpoint.get('train_accuracies_most_certain', [])
     test_accuracies = checkpoint.get('test_accuracies_most_certain', [])
     return training_iteration, train_losses, test_losses, train_accuracies, test_accuracies
+
+class TaskAnalyzer:
+    """
+    Analyzes input data or context to determine task characteristics,
+    such as modality, to guide HIPA and other adaptive components.
+    """
+    def __init__(self, config=None):
+        """
+        Initializes the TaskAnalyzer.
+        Args:
+            config: Optional configuration object that might contain parameters
+                    for modality detection heuristics.
+        """
+        self.config = config
+        self.modality_heuristics = {
+            "audio": {"fft_dims": [-1], "freq_threshold": 0.2, "enhancement_strength": 0.5, "use_hipa": True},
+            "image": {"fft_dims": [-2, -1], "freq_threshold": 0.1, "enhancement_strength": 0.3, "use_hipa": True},
+            "text": {"use_hipa": False},
+            "Point Cloud": {"use_hipa": False},
+            "Textures": {"fft_dims": [-2, -1], "freq_threshold": 0.1, "enhancement_strength": 0.3, "use_hipa": True},
+            # For unknown/default, allow learned signal to decide. Provide generic continuous data params.
+            "unknown": {"use_hipa": True, "fft_dims": [-1], "freq_threshold": 0.15, "enhancement_strength": 0.25, "modality_type": "continuous_generic"},
+            "default": {"use_hipa": True, "fft_dims": [-1], "freq_threshold": 0.15, "enhancement_strength": 0.25, "modality_type": "continuous_generic"}
+        }
+
+    def _calculate_shannon_entropy(self, data_tensor: torch.Tensor) -> float:
+        """Helper to calculate Shannon entropy for a byte-like tensor."""
+        if data_tensor.numel() == 0:
+            return 0.0
+        # Ensure tensor is on CPU and is integer type for byte-like analysis
+        data_bytes = data_tensor.cpu().to(torch.uint8).numpy().tobytes()
+        if not data_bytes:
+            return 0.0
+        
+        counts = np.bincount(np.frombuffer(data_bytes, dtype=np.uint8))
+        probabilities = counts / len(data_bytes)
+        probabilities = probabilities[probabilities > 0] # Avoid log(0)
+        entropy = -np.sum(probabilities * np.log2(probabilities))
+        return entropy
+
+    def detect_modality(self, x: torch.Tensor, task_id: int = None, context_hints: dict = None) -> dict:
+        """
+        Detects the modality of the input data and returns a configuration for HIPA.
+
+        Args:
+            x (torch.Tensor): The input tensor. Shape can vary (e.g., B, S, D or B, C, H, W).
+            task_id (int, optional): An optional task identifier.
+            context_hints (dict, optional): Additional context hints, e.g., {'ctm_data': ctm_data_dict}.
+
+        Returns:
+            dict: A configuration dictionary for HIPA, including:
+                  'modality': Detected modality (e.g., 'audio', 'image', 'text', 'unknown').
+                  'use_hipa': Boolean indicating if HIPA should be applied.
+                  'fft_dims': Dimensions for FFT (e.g., [-1] for 1D, [-2, -1] for 2D).
+                  'freq_threshold': Threshold for high-frequency component detection.
+                  'enhancement_strength': Strength of frequency enhancement.
+                  'detection_source': String indicating how modality was determined.
+        """
+        # 1. Prioritize explicit hints
+        if context_hints:
+            if "expected_modality" in context_hints:
+                hinted_modality = context_hints["expected_modality"]
+                if hinted_modality in self.modality_heuristics:
+                    config = self.modality_heuristics[hinted_modality].copy()
+                    config['modality'] = hinted_modality
+                    config['detection_source'] = 'explicit_hint'
+                    # Allow further overrides from hints
+                    if "force_hipa_on" in context_hints and context_hints["force_hipa_on"]: config['use_hipa'] = True
+                    if "force_hipa_off" in context_hints and context_hints["force_hipa_off"]: config['use_hipa'] = False
+                    return config
+            if "filename" in context_hints: # Basic file extension check
+                filename = context_hints["filename"].lower()
+                if filename.endswith((".wav", ".mp3", ".flac")):
+                    config = self.modality_heuristics["audio"].copy(); config['modality'] = "audio"; config['detection_source'] = 'hint_filename_audio'; return config
+                if filename.endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                    config = self.modality_heuristics["image"].copy(); config['modality'] = "image"; config['detection_source'] = 'hint_filename_image'; return config
+                if filename.endswith((".txt", ".md", ".json", ".csv")):
+                    config = self.modality_heuristics["text"].copy(); config['modality'] = "text"; config['detection_source'] = 'hint_filename_text'; return config
+                if filename.endswith((".xyz", ".ply", ".obj", ".glb", ".pts")): # Common point cloud extensions
+                    config = self.modality_heuristics["Point Cloud"].copy(); config['modality'] = "Point Cloud"; config['detection_source'] = 'hint_filename_pointcloud'; return config
+
+
+        # 2. Tensor Shape and dtype Analysis
+        b = x.shape[0]
+        dims = x.shape[1:]
+        dtype = x.dtype
+
+        # Image-like (B, C, H, W)
+        if x.ndim == 4 and dims[0] in [1, 3, 4] and dims[1] > 16 and dims[2] > 16: # C, H, W
+            config = self.modality_heuristics["image"].copy()
+            config['modality'] = "image"
+            config['detection_source'] = 'shape_image_4d'
+            return config
+
+        # Point Cloud-like (B, N, 3 or 6)
+        if x.ndim == 3 and dims[1] in [3, 6] and dims[0] > 10: # N, D (D=3 for XYZ, 6 for XYZRGB/Normals)
+            config = self.modality_heuristics["Point Cloud"].copy()
+            config['modality'] = "Point Cloud"
+            config['detection_source'] = 'shape_point_cloud_3d'
+            return config
+
+        # Sequence-like (B, S, D)
+        if x.ndim == 3:
+            seq_len, feat_dim = dims[0], dims[1]
+            if feat_dim < 128 and seq_len > 256: 
+                config = self.modality_heuristics["audio"].copy() 
+                config['modality'] = "audio_or_long_sequence"
+                config['detection_source'] = 'shape_sequence_3d_long_narrow'
+                return config
+            else: 
+                config = self.modality_heuristics["text"].copy() 
+                config['modality'] = "generic_sequence_embeddings"
+                config['detection_source'] = 'shape_sequence_3d_generic'
+                return config
+
+        # Flat sequence / Raw bytes / Tokenized text (B, L)
+        if x.ndim == 2:
+            seq_len = dims[0]
+            if dtype == torch.long and seq_len > 1: 
+                config = self.modality_heuristics["text"].copy()
+                config['modality'] = "text_tokenized"
+                config['detection_source'] = 'shape_dtype_tokenized_text_2d'
+                return config
+            elif dtype == torch.uint8 and seq_len > 64: 
+                # entropy = self._calculate_shannon_entropy(x) # Example: could use entropy
+                if seq_len > 1024: 
+                    config = self.modality_heuristics["audio"].copy()
+                    config['modality'] = "audio_byte_stream"
+                    config['detection_source'] = 'shape_dtype_byte_stream_long_2d'
+                else:
+                    config = self.modality_heuristics["default"].copy()
+                    config['modality'] = "generic_byte_stream"
+                    config['detection_source'] = 'shape_dtype_byte_stream_short_2d'
+                return config
+            elif dtype in [torch.float32, torch.float16] and seq_len > 256: 
+                config = self.modality_heuristics["audio"].copy()
+                config['modality'] = "audio_signal_1d"
+                config['detection_source'] = 'shape_dtype_audio_signal_1d_2d'
+                return config
+
+        # 3. Fallback
+        config = self.modality_heuristics["unknown"].copy()
+        config['modality'] = "unknown"
+        config['detection_source'] = 'fallback_unknown'
+        return config

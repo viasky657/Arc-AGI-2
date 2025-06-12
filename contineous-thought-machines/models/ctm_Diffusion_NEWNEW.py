@@ -24,6 +24,10 @@ import pickle
 import os
 import hashlib
 import threading
+from typing import TYPE_CHECKING # For type hinting TaskAnalyzer
+
+if TYPE_CHECKING:
+    from .utils import TaskAnalyzer # Placeholder: Actual import path for TaskAnalyzer might differ
 import random
 from concurrent.futures import ThreadPoolExecutor
 import queue
@@ -2745,7 +2749,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
     8. Multi-resolution guidance for different data types
     """
     
-    def __init__(self, config: EnhancedCTMConfig, actual_noisy_input_dim: int):
+    def __init__(self, config: EnhancedCTMConfig, actual_noisy_input_dim: int, task_analyzer: 'TaskAnalyzer'): # Added task_analyzer
         super().__init__()
         
         self.latent_dim = config.d_model
@@ -2826,7 +2830,8 @@ class CTMControlledDiffusionProcessor(nn.Module):
         # Task-Aware HiPA system for intelligent frequency enhancement
         self.task_aware_hipa = FrequencyDomainAwareAttention(
             embed_dim=config.d_model,
-            num_heads=8
+            num_heads=8,
+            task_analyzer=task_analyzer # Pass the task_analyzer instance
         )
         
         # Integration Flow control parameters
@@ -3588,7 +3593,38 @@ class EnhancedCTMDiffusion(nn.Module):
     def __init__(self, config: EnhancedCTMConfig):
         super().__init__()
         self.config = config
-        
+
+        # Placeholder for TaskAnalyzer instantiation.
+        # Ensure TaskAnalyzer is imported (e.g., from .utils import TaskAnalyzer)
+        # and instantiated correctly (e.g., TaskAnalyzer(config=self.config) or TaskAnalyzer()).
+        # This is a placeholder instantiation.
+        try:
+            # Attempt to import and instantiate TaskAnalyzer
+            # This import path is a guess; adjust as necessary.
+            from .utils import TaskAnalyzer as ActualTaskAnalyzerClass
+            self.task_analyzer_instance = ActualTaskAnalyzerClass(config=self.config)
+        except ImportError:
+            print("Warning: TaskAnalyzer class not found or could not be imported. HIPA might not function correctly.")
+            # Create a dummy TaskAnalyzer if import fails, to prevent further errors during init.
+            # This dummy will likely cause issues at runtime if HIPA is used.
+            class DummyTaskAnalyzer:
+                def detect_modality(self, x, task_id=None, context_hints=None):
+                    print("Warning: Using DummyTaskAnalyzer. HIPA modality detection will not be accurate.")
+                    return {'use_hipa': False, 'modality': 'unknown', 'fft_dims': [], 'freq_threshold': 0.1, 'enhancement_strength': 0.0}
+            self.task_analyzer_instance = DummyTaskAnalyzer()
+        except TypeError as e:
+            print(f"Warning: TaskAnalyzer could not be instantiated with config: {e}. Trying without config.")
+            try:
+                self.task_analyzer_instance = ActualTaskAnalyzerClass()
+            except Exception as e_init:
+                print(f"Fatal: Could not instantiate TaskAnalyzer: {e_init}. HIPA will likely fail.")
+                # Fallback to dummy if all attempts fail
+                class DummyTaskAnalyzer:
+                    def detect_modality(self, x, task_id=None, context_hints=None):
+                        print("Warning: Using DummyTaskAnalyzer due to instantiation failure. HIPA modality detection will not be accurate.")
+                        return {'use_hipa': False, 'modality': 'unknown', 'fft_dims': [], 'freq_threshold': 0.1, 'enhancement_strength': 0.0}
+                self.task_analyzer_instance = DummyTaskAnalyzer()
+
         # Determine input dimension for the main encoder and task inference
         self.dynamic_entropy_patcher = None
         self.patcher_encoder = None
@@ -3641,7 +3677,11 @@ class EnhancedCTMDiffusion(nn.Module):
         
         # Enhanced diffusion processor
         # actual_noisy_input_dim is now config.unet_input_feature_dim
-        self.diffusion = CTMControlledDiffusionProcessor(config, actual_noisy_input_dim=config.unet_input_feature_dim)
+        self.diffusion = CTMControlledDiffusionProcessor(
+            config,
+            actual_noisy_input_dim=config.unet_input_feature_dim,
+            task_analyzer=self.task_analyzer_instance # Pass the TaskAnalyzer instance
+        )
         
         # Input encoder: processes raw features (from patcher, MGP, or byte_embedding) to ctm_input_dim
         # raw_feature_dim is the embedding_dim of each item in the sequence from the preprocessor.
@@ -5839,11 +5879,12 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
     
-    def __init__(self, embed_dim=512, num_heads=8):
+    def __init__(self, embed_dim=512, num_heads=8, task_analyzer: 'TaskAnalyzer'): # Added task_analyzer
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
+        self.task_analyzer = task_analyzer # Store the task_analyzer instance
         
         # Multi-head attention for frequency-aware processing
         self.freq_attention = nn.MultiheadAttention(
