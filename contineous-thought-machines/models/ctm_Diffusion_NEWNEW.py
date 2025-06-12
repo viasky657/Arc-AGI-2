@@ -5879,7 +5879,7 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
     
-    def __init__(self, embed_dim=512, num_heads=8, task_analyzer: 'TaskAnalyzer'): # Added task_analyzer
+    def __init__(self, embed_dim=512, num_heads=8, task_analyzer: 'TaskAnalyzer' = None): # Added task_analyzer
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
