@@ -3732,9 +3732,9 @@ class EnhancedCTMDiffusion(nn.Module):
         self.mcmc_config_params = getattr(config, 'mcmc_config', None) # Renamed to avoid conflict if MCMCConfig class is also self.mcmc_config
         self.mcmc_output_space_type = getattr(config, 'mcmc_output_space_type', 'binary_hypercube')
         self.mcmc_output_space_dim_config = getattr(config, 'mcmc_output_space_dim', None) # Renamed
-        self.use_large_neighborhood_search = config.use_large_neighborhood_search
-        self.lns_frequency = config.lns_frequency
-        self.lns_neighborhood_size = config.lns_neighborhood_size
+        self.use_large_neighborhood_search = getattr(config, 'use_large_neighborhood_search', True)
+        self.lns_frequency = getattr(config, 'lns_frequency', 10)
+        self.lns_neighborhood_size = getattr(config, 'lns_neighborhood_size', 20)
         self.enable_blackbox_solver = config.enable_blackbox_solver
         self.mcmc_phi_network_hidden_dim = config.mcmc_phi_network_hidden_dim
 
