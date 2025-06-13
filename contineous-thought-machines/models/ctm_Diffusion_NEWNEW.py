@@ -2910,10 +2910,15 @@ class CTMControlledDiffusionProcessor(nn.Module):
         )
         
         # Multi-head attention for CTM-guided noise prediction
+        # Now using target_noise_dim (2048) as the embedding dimension
         self.ctm_guided_attention = nn.MultiheadAttention(
-            config.d_model, num_heads=8, batch_first=True
+            self.target_noise_dim, num_heads=8, batch_first=True
         )
         
+        # Projection for the key and value of ctm_guided_attention
+        # Projects from config.d_model (512) to target_noise_dim (2048)
+        self.kv_projector_for_ctm_attention = nn.Linear(config.d_model, self.target_noise_dim)
+
         # Base noise prediction network
         # The input dimension is actual_noisy_input_dim (from kv_features_for_ctm) + config.d_model (from time_emb)
         self.noise_predictor_base = nn.Sequential(
@@ -3060,14 +3065,23 @@ class CTMControlledDiffusionProcessor(nn.Module):
             stacked_weights = torch.stack(influence_weights, dim=0)  # (num_influences,)
             
             # Apply learned weights
-            weighted_influences = stacked_influences * stacked_weights.view(1, -1, 1)
+            weighted_influences = stacked_influences * stacked_weights.view(1, -1, 1) # (B, num_influences, config.d_model)
             
+            # Project weighted_influences (keys and values) to target_noise_dim
+            # Original shape: (B, num_influences, config.d_model)
+            # Target shape for K,V: (B, num_influences, self.target_noise_dim)
+            batch_size_attn, num_influences_attn, _ = weighted_influences.shape
+            projected_kv_for_attention = self.kv_projector_for_ctm_attention(
+                weighted_influences.reshape(batch_size_attn * num_influences_attn, config.d_model)
+            ).reshape(batch_size_attn, num_influences_attn, self.target_noise_dim)
+
             # Use CTM-guided attention to combine influences
-            query = base_noise_pred.unsqueeze(1)  # (B, 1, d_model)
+            # Query is base_noise_pred (B, self.target_noise_dim)
+            query = base_noise_pred.unsqueeze(1)  # (B, 1, self.target_noise_dim)
             attended_influence, attention_weights = self.ctm_guided_attention(
-                query, weighted_influences, weighted_influences
+                query, projected_kv_for_attention, projected_kv_for_attention # K and V are projected
             )
-            attended_influence = attended_influence.squeeze(1)  # (B, d_model)
+            attended_influence = attended_influence.squeeze(1)  # (B, self.target_noise_dim)
             
             # Progressive refinement with CTM control
             current_noise = base_noise_pred
