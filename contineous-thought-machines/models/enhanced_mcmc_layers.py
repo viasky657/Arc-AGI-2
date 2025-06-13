@@ -53,7 +53,7 @@ class ExactOptimizationOracle:
         
         for candidate in search_space:
             # Compute objective: θ^T y + φ(y)
-            objective_value = torch.dot(theta, candidate)
+            objective_value = torch.dot(theta.squeeze(0), candidate)
             if self.phi_network is not None:
                 objective_value += self.phi_network(candidate).squeeze()
             
@@ -168,8 +168,8 @@ class CorrectionRatioMCMC(nn.Module):
         """
         # Energy difference: E(proposal) - E(current)
         # Original paper: Δ(k) = <θ, y'> + φ(y') - <θ, y(k)> - φ(y(k))
-        current_energy = torch.dot(theta, current) + self.phi_function(current).squeeze()
-        proposal_energy = torch.dot(theta, proposal) + self.phi_function(proposal).squeeze()
+        current_energy = torch.dot(theta.squeeze(0), current) + self.phi_function(current).squeeze()
+        proposal_energy = torch.dot(theta.squeeze(0), proposal) + self.phi_function(proposal).squeeze()
         energy_diff = proposal_energy - current_energy
         
         # Correction factor α_s = [ |Q(y)|/|Q(y')| ] * [ q_s(y',y) / q_s(y,y') ]
@@ -357,59 +357,128 @@ class CorrectionRatioMCMC(nn.Module):
                                             theta: torch.Tensor,
                                             target_state: Optional[torch.Tensor] = None,
                                             use_large_neighborhood: bool = False) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Estimate E[Y] under Gibbs distribution using multiple MCMC chains with corrections."""
-        all_samples = []
-        all_stats = []
-        
-        # Ensure persistent_states is initialized correctly for the number of chains
+        """Estimate E[Y] under Gibbs distribution using multiple MCMC chains with corrections.
+        Handles batched theta and target_state.
+        """
+        original_theta_ndim = theta.ndim
+        if original_theta_ndim == 1:
+            theta_batch = theta.unsqueeze(0)
+            if target_state is not None:
+                # Assuming target_state is (dim) if theta is (dim)
+                target_state_batch = target_state.unsqueeze(0) if target_state.ndim == 1 else target_state
+            else:
+                target_state_batch = None
+        elif original_theta_ndim == 2:
+            theta_batch = theta
+            if target_state is not None:
+                if target_state.ndim == 2 and target_state.shape[0] == theta.shape[0]: # Batched target
+                    target_state_batch = target_state
+                elif target_state.ndim == 1: # Unbatched target, will be broadcasted effectively
+                    target_state_batch = target_state
+                else:
+                    raise ValueError(f"target_state shape {target_state.shape} incompatible with batched theta {theta.shape}")
+            else:
+                target_state_batch = None
+        else:
+            raise ValueError(f"theta must be 1D or 2D, got {original_theta_ndim}D")
+
+        batch_size = theta_batch.shape[0]
+        batch_expectations = []
+        batch_overall_stats_list = []
+
+        # Ensure persistent_states is initialized correctly and on the correct device
+        current_device = theta_batch.device
         if self.persistent_states is None or len(self.persistent_states) != self.config.num_chains:
-            self.persistent_states = [self.output_space.random_state() for _ in range(self.config.num_chains)]
+            self.persistent_states = [self.output_space.random_state().to(current_device) for _ in range(self.config.num_chains)]
+        else: # Ensure existing states are on the correct device
+            for i in range(len(self.persistent_states)):
+                if self.persistent_states[i].device != current_device:
+                    self.persistent_states[i] = self.persistent_states[i].to(current_device)
 
-        for chain_id in range(self.config.num_chains):
-            # Determine if this specific chain should use an LNS step (e.g. only for LNSMCMC)
-            # For CorrectionRatioMCMC, use_large_neighborhood_step will be effectively false if not LNSMCMC.
-            # LNSMCMC class will pass its specific LNS parameters.
-            is_lns_sampler = isinstance(self, LargeNeighborhoodSearchMCMC)
+
+        for b_idx in range(batch_size):
+            current_theta_slice = theta_batch[b_idx]
+            current_target_slice = None
+            if target_state_batch is not None:
+                if target_state_batch.ndim == 2: # Batched target
+                    current_target_slice = target_state_batch[b_idx]
+                else: # Unbatched target (ndim == 1) or None
+                    current_target_slice = target_state_batch
+
+            all_samples_for_item = []
+            all_chain_stats_for_item = []
+
+            for chain_id in range(self.config.num_chains):
+                is_lns_sampler = isinstance(self, LargeNeighborhoodSearchMCMC)
+                samples, chain_stats_dict = self.sample_chain_corrected(
+                    current_theta_slice,
+                    chain_id,
+                    current_target_slice,
+                    use_large_neighborhood_step=(use_large_neighborhood and is_lns_sampler)
+                )
+                all_samples_for_item.extend(samples)
+                all_chain_stats_for_item.append(chain_stats_dict)
+
+            if not all_samples_for_item:
+                dim_fallback = self.output_space.dimension if hasattr(self.output_space, 'dimension') else current_theta_slice.shape[0]
+                zero_fallback_item = torch.zeros(dim_fallback, device=current_device, dtype=current_theta_slice.dtype)
+                batch_expectations.append(zero_fallback_item)
+                batch_overall_stats_list.append({
+                    'error': 'No samples collected for this batch item',
+                    'num_samples': 0,
+                    'avg_acceptance_rate': 0.0,
+                    'avg_acceptance_term_pk': 0.0,
+                    'sample_entropy': 0.0,
+                    'chain_stats': []
+                })
+                # print(f"Warning: No MCMC samples collected for batch item {b_idx}. Returning zeros for this item.")
+                continue
+
+            expectation_item = torch.mean(torch.stack(all_samples_for_item), dim=0)
+            batch_expectations.append(expectation_item)
+
+            avg_acceptance_item = np.mean([s.get('acceptance_rate', 0.0) for s in all_chain_stats_for_item]) if all_chain_stats_for_item else 0.0
+            avg_pk_item = np.mean([s.get('avg_acceptance_term_pk', 0.0) for s in all_chain_stats_for_item]) if all_chain_stats_for_item else 0.0
             
-            samples, stats = self.sample_chain_corrected(
-                theta, chain_id, target_state,
-                use_large_neighborhood_step=(use_large_neighborhood and is_lns_sampler)
-            )
-            all_samples.extend(samples)
-            all_stats.append(stats)
-        
-        if not all_samples:
-            # Fallback: return a zero tensor of appropriate shape if no samples
-            # This might happen if chain_length or num_chains is zero.
-            # Or if output_space.random_state() is problematic.
-            zero_fallback = torch.zeros_like(theta) if theta is not None else \
-                            (self.output_space.random_state() * 0.0) # Get shape from output space
-            print(f"Warning: No MCMC samples collected for theta: {theta}. Returning zeros.")
-            return zero_fallback, {
-                'error': 'No samples collected', 
-                'num_samples': 0, 
-                'avg_acceptance_rate': 0.0,
-                'sample_entropy': 0.0
-            }
+            sample_stack_for_entropy_item = torch.stack(all_samples_for_item).detach().cpu()
+            sample_entropy_item = compute_normalized_entropy(sample_stack_for_entropy_item)
 
-        expectation = torch.mean(torch.stack(all_samples), dim=0)
+            combined_stats_item = {
+                'num_samples': len(all_samples_for_item),
+                'avg_acceptance_rate': float(avg_acceptance_item),
+                'avg_acceptance_term_pk': float(avg_pk_item),
+                'sample_entropy': float(sample_entropy_item),
+                'chain_stats': all_chain_stats_for_item
+            }
+            batch_overall_stats_list.append(combined_stats_item)
+
+        final_expectation = torch.stack(batch_expectations)
+
+        total_num_samples_agg = sum(s['num_samples'] for s in batch_overall_stats_list)
         
-        avg_acceptance_overall = np.mean([s['acceptance_rate'] for s in all_stats if 'acceptance_rate' in s])
-        avg_step_acceptance_prob_overall = np.mean([s['avg_step_acceptance_prob'] for s in all_stats if 'avg_step_acceptance_prob' in s])
+        valid_acceptance_rates = [s['avg_acceptance_rate'] for s in batch_overall_stats_list if s.get('num_samples',0) > 0]
+        avg_acceptance_rate_agg = np.mean(valid_acceptance_rates) if valid_acceptance_rates else 0.0
         
-        # Compute entropy on the collected samples
-        # Ensure samples are on CPU and detached for entropy calculation if it involves numpy
-        sample_stack_for_entropy = torch.stack(all_samples).detach().cpu()
-        sample_entropy = compute_normalized_entropy(sample_stack_for_entropy)
-        
-        combined_stats = {
-            'num_samples': len(all_samples),
-            'avg_acceptance_rate': float(avg_acceptance_overall),
-            'avg_step_acceptance_prob': float(avg_step_acceptance_prob_overall),
-            'sample_entropy': float(sample_entropy),
-            'chain_stats': all_stats
+        valid_pk_terms = [s['avg_acceptance_term_pk'] for s in batch_overall_stats_list if s.get('num_samples',0) > 0]
+        avg_acceptance_term_pk_agg = np.mean(valid_pk_terms) if valid_pk_terms else 0.0
+
+        valid_entropies = [s['sample_entropy'] for s in batch_overall_stats_list if s.get('num_samples',0) > 0]
+        avg_sample_entropy_agg = np.mean(valid_entropies) if valid_entropies else 0.0
+
+        final_combined_stats = {
+            'num_total_samples': total_num_samples_agg,
+            'avg_acceptance_rate_across_batch': float(avg_acceptance_rate_agg),
+            'avg_acceptance_term_pk_across_batch': float(avg_acceptance_term_pk_agg),
+            'avg_sample_entropy_across_batch': float(avg_sample_entropy_agg),
+            'per_batch_item_stats': batch_overall_stats_list
         }
-        return expectation, combined_stats
+
+        if original_theta_ndim == 1:
+            final_expectation = final_expectation.squeeze(0)
+            # If squeezing expectation, should we also simplify stats if batch_size was 1?
+            # For now, stats structure remains batched even if input was 1D.
+
+        return final_expectation, final_combined_stats
     
     def forward(self, 
                 theta: torch.Tensor, 
