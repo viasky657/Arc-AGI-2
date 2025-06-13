@@ -3087,8 +3087,13 @@ class CTMControlledDiffusionProcessor(nn.Module):
             current_noise = base_noise_pred
             
             # Get primary CTM influences for refinement
-            sync_inf = ctm_influences[0] if len(ctm_influences) > 0 else torch.zeros_like(base_noise_pred)
-            state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros_like(base_noise_pred)
+            # These influences are config.d_model (512) dimensional.
+            batch_size_for_fallback = base_noise_pred.shape[0]
+            device_for_fallback = base_noise_pred.device
+            dtype_for_fallback = base_noise_pred.dtype
+
+            sync_inf = ctm_influences[0] if len(ctm_influences) > 0 else torch.zeros(batch_size_for_fallback, config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
+            state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros(batch_size_for_fallback, config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
             
             # Multi-stage refinement
             for i, refinement_layer in enumerate(self.ctm_noise_refinement):
