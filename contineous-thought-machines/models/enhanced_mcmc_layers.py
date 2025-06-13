@@ -447,7 +447,7 @@ class CorrectionRatioMCMC(nn.Module):
                 'num_samples': len(all_samples_for_item),
                 'avg_acceptance_rate': float(avg_acceptance_item),
                 'avg_acceptance_term_pk': float(avg_pk_item),
-                'sample_entropy': float(sample_entropy_item),
+                'sample_entropy': sample_entropy_item.tolist(), # Store list of per-sample entropies
                 'chain_stats': all_chain_stats_for_item
             }
             batch_overall_stats_list.append(combined_stats_item)
@@ -463,7 +463,8 @@ class CorrectionRatioMCMC(nn.Module):
         avg_acceptance_term_pk_agg = np.mean(valid_pk_terms) if valid_pk_terms else 0.0
 
         valid_entropies = [s['sample_entropy'] for s in batch_overall_stats_list if s.get('num_samples',0) > 0]
-        avg_sample_entropy_agg = np.mean(valid_entropies) if valid_entropies else 0.0
+        all_individual_entropies = [e for sublist in valid_entropies for e in sublist]
+        avg_sample_entropy_agg = np.mean(all_individual_entropies) if all_individual_entropies else 0.0
 
         final_combined_stats = {
             'num_total_samples': total_num_samples_agg,
