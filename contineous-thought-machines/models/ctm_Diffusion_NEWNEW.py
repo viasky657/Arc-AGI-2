@@ -2821,6 +2821,13 @@ class CTMControlledDiffusionProcessor(nn.Module):
         # GPU optimization: Enable flow refinement
         self.flow_refinement_enabled = True
         
+        # Task-Aware HiPA system for intelligent frequency enhancement
+        self.task_aware_hipa = FrequencyDomainAwareAttention(
+            embed_dim=config.d_model,
+            num_heads=8,
+            task_analyzer=task_analyzer # Pass the task_analyzer instance
+        )
+
         # Initialize Integration Flow + HiPA Sampler for ultra-fast generation
         self.integration_flow_sampler = IntegrationFlowHiPASampler(
             task_aware_hipa_module=self.task_aware_hipa, # Pass the HiPA module instance
@@ -2832,13 +2839,6 @@ class CTMControlledDiffusionProcessor(nn.Module):
             hipa_freq_threshold=0.1,
             integration_flow_strength=1.0,
             model_type='VE'  # Default to VE for CTM integration
-        )
-        
-        # Task-Aware HiPA system for intelligent frequency enhancement
-        self.task_aware_hipa = FrequencyDomainAwareAttention(
-            embed_dim=config.d_model,
-            num_heads=8,
-            task_analyzer=task_analyzer # Pass the task_analyzer instance
         )
         
         # Integration Flow control parameters
