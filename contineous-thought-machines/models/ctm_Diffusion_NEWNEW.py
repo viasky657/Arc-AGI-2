@@ -1940,6 +1940,8 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     replay_ratio: float = 0.3   # Ratio of replay batches to new data batches
     fisher_update_freq: int = 1000 # How often to update Fisher matrix for EWC
     replay_start_threshold: int = 1000 # Minimum number of items in memory bank before replay starts
+    replay_lambda: float = 1.0 # Weight for the memory replay loss
+    replay_buffer_strategy: str = "fifo" # Strategy for memory bank eviction: 'fifo', 'random', 'prioritized_composite'
     
     # Training Efficiency
     mixed_precision: bool = True
