@@ -2931,7 +2931,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
             num_train_timesteps=config.diffusion_timesteps, # Use diffusion_timesteps from main config
             beta_start=config.diffusion_beta_start,
             beta_end=config.diffusion_beta_end,
-            beta_schedule=config.noise_schedule if hasattr(config, 'noise_schedule') else "linear"
+            beta_schedule="linear" # Changed from config.noise_schedule to fix NotImplementedError for 'cosine'
         )
         
         # Learnable CTM influence weights
