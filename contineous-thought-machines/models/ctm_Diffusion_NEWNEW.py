@@ -2783,6 +2783,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
     
     def __init__(self, config: EnhancedCTMConfig, actual_noisy_input_dim: int, task_analyzer: 'TaskAnalyzer'): # Added task_analyzer
         super().__init__()
+        self.target_noise_dim = actual_noisy_input_dim # This is config.unet_input_feature_dim
         
         self.latent_dim = config.d_model
         self.coupling_strength = config.ctm_diffusion_coupling_strength
@@ -2825,11 +2826,11 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # Learned noise-to-data mapping (Integration Flow core)
         self.flow_predictor = nn.Sequential(
-            nn.Linear(config.d_model * 3, config.d_model * 2),  # noise + sync + certainty
+            nn.Linear(self.target_noise_dim * 3, config.d_model * 2),  # noise + sync + certainty
             nn.GELU(),
-            nn.Linear(config.d_model * 2, config.d_model),
+            nn.Linear(config.d_model * 2, config.d_model), # Intermediate
             nn.GELU(),
-            nn.Linear(config.d_model, config.d_model)
+            nn.Linear(config.d_model, self.target_noise_dim) # Output target_noise_dim
         )
         
         # Multi-resolution guidance for different data types
@@ -2848,7 +2849,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # Task-Aware HiPA system for intelligent frequency enhancement
         self.task_aware_hipa = FrequencyDomainAwareAttention(
-            embed_dim=config.d_model,
+            embed_dim=self.target_noise_dim, # Changed to target_noise_dim
             num_heads=8,
             task_analyzer=task_analyzer # Pass the task_analyzer instance
         )
@@ -2918,17 +2919,17 @@ class CTMControlledDiffusionProcessor(nn.Module):
         self.noise_predictor_base = nn.Sequential(
             nn.Linear(actual_noisy_input_dim + config.d_model, config.d_model * 2),
             nn.GELU(),
-            nn.Linear(config.d_model * 2, config.d_model),
+            nn.Linear(config.d_model * 2, self.target_noise_dim), # Changed output to target_noise_dim
         )
         
         # CTM-controlled noise refinement (multiple stages)
         self.ctm_noise_refinement = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(config.d_model * 3, config.d_model * 2),  # base + ctm_sync + ctm_state
+                nn.Linear(self.target_noise_dim + config.d_model * 2, config.d_model * 2),  # Changed input dim
                 nn.GELU(),
-                nn.Linear(config.d_model * 2, config.d_model),
+                nn.Linear(config.d_model * 2, config.d_model), # Intermediate
                 nn.GELU(),
-                nn.Linear(config.d_model, config.d_model)
+                nn.Linear(config.d_model, self.target_noise_dim) # Changed output to target_noise_dim
             ) for _ in range(4)  # 4 refinement stages
         ])
         
