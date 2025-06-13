@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 import random
 from concurrent.futures import ThreadPoolExecutor
 import queue
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import numpy as np
 
 
@@ -71,8 +72,8 @@ def batched_numeric_tensor_to_bytes(numeric_batch_tensor: torch.Tensor, source_d
 
     processed_list = []
     for i in range(numeric_batch_tensor.shape[0]):
-        # .cpu().numpy() and ensure it's the correct source_dtype before tobytes()
-        single_numeric_seq_np = numeric_batch_tensor[i].cpu().numpy().astype(source_dtype)
+        # .detach().cpu().numpy() and ensure it's the correct source_dtype before tobytes()
+        single_numeric_seq_np = numeric_batch_tensor[i].detach().cpu().numpy().astype(source_dtype)
         # Ensure the numpy array is C-contiguous for tobytes()
         if not single_numeric_seq_np.flags['C_CONTIGUOUS']:
             single_numeric_seq_np = np.ascontiguousarray(single_numeric_seq_np)
@@ -2822,7 +2823,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # Initialize Integration Flow + HiPA Sampler for ultra-fast generation
         self.integration_flow_sampler = IntegrationFlowHiPASampler(
-            model=None,  # Will be set later when model is available
+            task_aware_hipa_module=self.task_aware_hipa, # Pass the HiPA module instance
             num_steps=config.diffusion_steps,
             beta_start=config.diffusion_beta_start,
             beta_end=config.diffusion_beta_end,
@@ -2925,11 +2926,13 @@ class CTMControlledDiffusionProcessor(nn.Module):
         )
         
         # Standard diffusion schedule
-        self.register_buffer('betas', torch.linspace(
-            config.diffusion_beta_start, config.diffusion_beta_end, config.diffusion_timesteps
-        ))
-        self.register_buffer('alphas', 1.0 - self.betas)
-        self.register_buffer('alpha_bars', torch.cumprod(self.alphas, dim=0))
+        # Initialize a scheduler for sampling methods like denoise_one_step
+        self.sampling_noise_scheduler = DDPMScheduler(
+            num_train_timesteps=config.diffusion_timesteps, # Use diffusion_timesteps from main config
+            beta_start=config.diffusion_beta_start,
+            beta_end=config.diffusion_beta_end,
+            beta_schedule=config.noise_schedule if hasattr(config, 'noise_schedule') else "linear"
+        )
         
         # Learnable CTM influence weights
         self.sync_influence_weight = nn.Parameter(torch.tensor(1.0))  # Strong sync influence
@@ -3550,37 +3553,37 @@ class CTMControlledDiffusionProcessor(nn.Module):
         predicted_value = model_output_tuple[0]
 
 
-        # 2. Use the scheduler to compute the previous sample
+        # 2. Use the sampling_noise_scheduler to compute the previous sample
         # Ensure the arguments match the specific scheduler being used.
-        if hasattr(self.noise_scheduler, 'step'):
+        if hasattr(self, 'sampling_noise_scheduler') and hasattr(self.sampling_noise_scheduler, 'step'):
             # For DDPMScheduler, DDIMScheduler from diffusers
-            # DDIMScheduler step signature: step(model_output, timestep, sample, eta=0.0, use_clipped_alpha=False, generator=None, variance_noise=None)
-            # DDPMScheduler step signature: step(model_output, timestep, sample, generator=None, return_dict=True)
-            
             scheduler_step_kwargs = {
                 "model_output": predicted_value,
-                "timestep": timestep, # Pass the tensor timestep
+                "timestep": timestep,
                 "sample": x_t,
                 "generator": generator
             }
-            if "eta" in self.noise_scheduler.step.__code__.co_varnames: # Check if scheduler's step accepts eta
+            # Check if scheduler's step method accepts 'eta'
+            import inspect
+            sig = inspect.signature(self.sampling_noise_scheduler.step)
+            if "eta" in sig.parameters:
                  scheduler_step_kwargs["eta"] = eta
             
-            scheduler_output = self.noise_scheduler.step(**scheduler_step_kwargs)
+            scheduler_output = self.sampling_noise_scheduler.step(**scheduler_step_kwargs)
             
-            if isinstance(scheduler_output, dict): # Diffusers schedulers often return a dict
+            if isinstance(scheduler_output, dict):
                  prev_sample = scheduler_output.get('prev_sample')
-                 if prev_sample is None: # some might use 'pred_original_sample'
+                 if prev_sample is None:
                      prev_sample = scheduler_output.get('pred_original_sample')
-            elif hasattr(scheduler_output, 'prev_sample'): # Older diffusers or custom
+            elif hasattr(scheduler_output, 'prev_sample'):
                 prev_sample = scheduler_output.prev_sample
-            else: # If it returns just the tensor
+            else:
                 prev_sample = scheduler_output
 
             if prev_sample is None:
-                raise ValueError("Scheduler output did not contain 'prev_sample' or 'pred_original_sample'.")
+                raise ValueError("sampling_noise_scheduler output did not contain 'prev_sample' or 'pred_original_sample'.")
         else:
-            raise NotImplementedError(f"Scheduler {type(self.noise_scheduler)} does not have a standard 'step' method.")
+            raise NotImplementedError(f"CTMControlledDiffusionProcessor.sampling_noise_scheduler is not defined or has no 'step' method.")
             
         return prev_sample
 
@@ -3802,6 +3805,14 @@ class EnhancedCTMDiffusion(nn.Module):
 
         # Projection layer for sampling path: from ctm_input_dim to unet_input_feature_dim
         self.sampling_kv_to_unet_input_proj = nn.Linear(config.ctm_input_dim, config.unet_input_feature_dim)
+
+        # Initialize a training noise scheduler for EnhancedCTMDiffusion
+        self.training_noise_scheduler = DDPMScheduler(
+            num_train_timesteps=config.diffusion_timesteps,
+            beta_start=config.diffusion_beta_start,
+            beta_end=config.diffusion_beta_end,
+            beta_schedule=config.noise_schedule if hasattr(config, 'noise_schedule') else "linear"
+        )
         
         # Initialize new optimization components
         self._initialize_optimization_components()
@@ -4969,32 +4980,47 @@ class EnhancedCTMDiffusion(nn.Module):
             if kv_features_for_ctm.size(1) != numeric_target_diffusion_output.size(1) and hasattr(self.diffusion, 'unet') and numeric_target_diffusion_output.ndim > 1:
                  print(f"Warning: Sequence length mismatch between CTM features ({kv_features_for_ctm.size(1)}) and numeric diffusion target ({numeric_target_diffusion_output.size(1)}). This might affect conditioning.")
 
-            # Use diffusion processor's scheduler instead of non-existent self.diffusion_scheduler
-            if hasattr(self.diffusion, 'scheduler'):
-                t = torch.randint(0, self.diffusion.scheduler.num_train_timesteps, (batch_size,), device=byte_sequence.device).long()
+            # Use EnhancedCTMDiffusion's own training_noise_scheduler for the noising process
+            if hasattr(self, 'training_noise_scheduler'):
+                t = torch.randint(0, self.training_noise_scheduler.config.num_train_timesteps, (batch_size,), device=byte_sequence.device).long()
                 # Generate noise based on the numeric target's shape and type
                 noise = torch.randn_like(numeric_target_diffusion_output)
-                noisy_input = self.diffusion.scheduler.add_noise(numeric_target_diffusion_output, noise, t)
+                # Use a distinct variable name for the noisy input passed to the diffusion processor
+                noisy_input_for_diffusion_processor = self.training_noise_scheduler.add_noise(numeric_target_diffusion_output, noise, t)
                 
-                if hasattr(self.diffusion, 'unet'):
-                    predicted_noise_or_x0 = self.diffusion.unet(noisy_input, t, condition=kv_features_for_ctm)
-                    if hasattr(self.diffusion.scheduler, 'config') and hasattr(self.diffusion.scheduler.config, 'prediction_type'):
-                        if self.diffusion.scheduler.config.prediction_type == "epsilon":
-                            diffusion_loss = F.mse_loss(predicted_noise_or_x0, noise)
-                        elif self.diffusion.scheduler.config.prediction_type == "sample":
-                            # Loss is between predicted numeric and target numeric
-                            diffusion_loss = F.mse_loss(predicted_noise_or_x0, numeric_target_diffusion_output)
-                        else: # Other types like v_prediction
-                            print(f"Unsupported diffusion prediction type: {self.diffusion.scheduler.config.prediction_type}")
-                            diffusion_loss = torch.tensor(0.0, device=byte_sequence.device) # Placeholder
-                    else:
-                        # Default to epsilon prediction if config not available
-                        diffusion_loss = F.mse_loss(predicted_noise_or_x0, noise)
+                # CTMControlledDiffusionProcessor.forward (self.diffusion) is the model that predicts noise (or x0)
+                # It needs the noisy input, timestep, and CTM conditioning data.
+                # kv_features_for_ctm was prepared earlier from byte_sequence.
+                ctm_data_for_diffusion_conditioning = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
+
+                # Get the prediction from the diffusion processor
+                # The diffusion processor's forward method is CTMControlledDiffusionProcessor.forward
+                prediction_output_tuple = self.diffusion(
+                    noisy_input=noisy_input_for_diffusion_processor,
+                    timestep=t,
+                    ctm_data=ctm_data_for_diffusion_conditioning,
+                    hipa_control_signal=current_hipa_signal # Pass HIPA signal
+                )
+
+                if isinstance(prediction_output_tuple, tuple): # If it returns (prediction, guidance_info)
+                    predicted_noise_or_x0 = prediction_output_tuple[0]
                 else:
-                    print("Warning: Diffusion UNet not defined. Using zero diffusion loss.")
-                    diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
+                    predicted_noise_or_x0 = prediction_output_tuple
+
+                # Determine loss based on the training_noise_scheduler's prediction type
+                if hasattr(self.training_noise_scheduler, 'config') and hasattr(self.training_noise_scheduler.config, 'prediction_type'):
+                    if self.training_noise_scheduler.config.prediction_type == "epsilon":
+                        diffusion_loss = F.mse_loss(predicted_noise_or_x0, noise)
+                    elif self.training_noise_scheduler.config.prediction_type == "sample":
+                        diffusion_loss = F.mse_loss(predicted_noise_or_x0, numeric_target_diffusion_output)
+                    else:
+                        print(f"Unsupported diffusion prediction type in training_noise_scheduler: {self.training_noise_scheduler.config.prediction_type}")
+                        diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
+                else: # Default to epsilon prediction if config not available
+                    diffusion_loss = F.mse_loss(predicted_noise_or_x0, noise)
             else:
-                print("Warning: Diffusion scheduler not defined. Using zero diffusion loss.")
+                # This case should ideally not be reached if training_noise_scheduler is always initialized
+                print("CRITICAL WARNING: EnhancedCTMDiffusion.training_noise_scheduler not defined. Using zero diffusion loss.")
                 diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
             losses['diffusion_loss'] = diffusion_loss
         else:
@@ -6357,10 +6383,11 @@ class CTMIntegrationFlowTrainer:
 class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diffusion Controller CTM Class function. 
     """Advanced Integration Flow sampler with Task-Aware HiPA for CTM integration."""
     
-    def __init__(self, model, num_steps=50, beta_start=0.0001, beta_end=0.02,
+    def __init__(self, task_aware_hipa_module: FrequencyDomainAwareAttention, num_steps=50, beta_start=0.0001, beta_end=0.02,
                  sigma_min=0.01, sigma_max=50.0, hipa_freq_threshold=0.1,
                  integration_flow_strength=1.0, model_type='VE'):
-        self.model = model
+        # self.model = model # model argument removed, context_fn will be passed to sample methods
+        self.task_aware_hipa = task_aware_hipa_module # Store the passed HiPA module
         self.num_steps = num_steps
         self.model_type = model_type
         self.sigma_min = sigma_min
