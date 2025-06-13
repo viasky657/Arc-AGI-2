@@ -3839,7 +3839,7 @@ class EnhancedCTMDiffusion(nn.Module):
             num_train_timesteps=config.diffusion_timesteps,
             beta_start=config.diffusion_beta_start,
             beta_end=config.diffusion_beta_end,
-            beta_schedule=config.noise_schedule if hasattr(config, 'noise_schedule') else "linear"
+            beta_schedule=("squaredcos_cap_v2" if config.noise_schedule == "cosine" else config.noise_schedule) if hasattr(config, 'noise_schedule') else "linear"
         )
         
         # Initialize new optimization components
