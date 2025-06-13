@@ -3072,7 +3072,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
             # Target shape for K,V: (B, num_influences, self.target_noise_dim)
             batch_size_attn, num_influences_attn, _ = weighted_influences.shape
             projected_kv_for_attention = self.kv_projector_for_ctm_attention(
-                weighted_influences.reshape(batch_size_attn * num_influences_attn, config.d_model)
+                weighted_influences.reshape(batch_size_attn * num_influences_attn, self.config.d_model)
             ).reshape(batch_size_attn, num_influences_attn, self.target_noise_dim)
 
             # Use CTM-guided attention to combine influences
