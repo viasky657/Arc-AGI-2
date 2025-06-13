@@ -1936,7 +1936,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     ewc_lambda: float = 1000.0  # Elastic Weight Consolidation strength
     ewc_on_current_task_finetune: bool = False # If True, EWC penalty applies even if prev_task_key matches current_task_key
     use_memory_replay: bool = True # <<< NEW: Flag to enable/disable memory replay
-    memory_size: int = 10000    # Size of the episodic memory buffer for replay
+    memory_bank_size: int = 10000    # Size of the episodic memory buffer for replay
     replay_ratio: float = 0.3   # Ratio of replay batches to new data batches
     fisher_update_freq: int = 1000 # How often to update Fisher matrix for EWC
     
