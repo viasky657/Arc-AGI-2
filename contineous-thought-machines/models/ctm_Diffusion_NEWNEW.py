@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING # For type hinting TaskAnalyzer
 if TYPE_CHECKING:
     from .utils import TaskAnalyzer # Placeholder: Actual import path for TaskAnalyzer might differ
 import random
+import copy # For JEPA target encoder deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import queue
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
@@ -2017,6 +2018,18 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     hipa_num_heads: Optional[int] = None # Default to None
     audio_output_dtype_str: Optional[str] = "float32" # Default as per __post_init__ logic
     unet_input_feature_dim: Optional[int] = None # Default to None, __post_init__ calculates it
+
+    # --- JEPA Training Parameters (Integrated with LearnedBytePatcherEncoder) ---
+    use_jepa_training: bool = False
+    # jepa_embed_dim will be derived from patch_embedding_dim if dynamic_entropy_patcher is used
+    jepa_predictor_hidden_dim: int = 512 # Hidden dimension of JEPA predictor MLP
+    jepa_mask_ratio_min: float = 0.15 # Min proportion of patch sequence to mask for target
+    jepa_mask_ratio_max: float = 0.75 # Max proportion of patch sequence to mask for target
+    jepa_context_scale_min: float = 0.3 # Min proportion of patches for context
+    jepa_context_scale_max: float = 0.7 # Max proportion of patches for context
+    jepa_momentum_beta: float = 0.996 # Momentum for target encoder update
+    jepa_loss_weight: float = 0.1 # Weight for the JEPA loss component
+    jepa_num_target_blocks: int = 1 # Number of target blocks to predict
     
     def __post_init__(self):
         # Validate output dimensions
@@ -2104,6 +2117,18 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
                 raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
         elif self.unet_input_feature_dim <= 0:
             raise ValueError("unet_input_feature_dim, if set, must be positive.")
+
+        if self.use_jepa_training:
+            if not (0 < self.jepa_mask_ratio_min < 1 and 0 < self.jepa_mask_ratio_max < 1 and self.jepa_mask_ratio_min <= self.jepa_mask_ratio_max):
+                raise ValueError("JEPA mask ratios must be between 0 and 1, with min <= max.")
+            if not (0 < self.jepa_context_scale_min < 1 and 0 < self.jepa_context_scale_max < 1 and self.jepa_context_scale_min <= self.jepa_context_scale_max):
+                raise ValueError("JEPA context scales must be between 0 and 1, with min <= max.")
+            if not (0 <= self.jepa_momentum_beta < 1):
+                raise ValueError("jepa_momentum_beta must be between 0 and 1.")
+            if self.jepa_num_target_blocks <= 0:
+                raise ValueError("jepa_num_target_blocks must be positive.")
+            if not self.use_dynamic_entropy_patcher:
+                print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
 
 import torch.nn as nn
 import torch
@@ -3618,21 +3643,24 @@ class EnhancedCTMDiffusion(nn.Module):
             # This dummy will likely cause issues at runtime if HIPA is used.
             class DummyTaskAnalyzer:
                 def detect_modality(self, x, task_id=None, context_hints=None):
-                    print("Warning: Using DummyTaskAnalyzer. HIPA modality detection will not be accurate.")
+                    # print("Warning: Using DummyTaskAnalyzer. HIPA modality detection will not be accurate.")
                     return {'use_hipa': False, 'modality': 'unknown', 'fft_dims': [], 'freq_threshold': 0.1, 'enhancement_strength': 0.0}
             self.task_analyzer_instance = DummyTaskAnalyzer()
         except TypeError as e:
-            print(f"Warning: TaskAnalyzer could not be instantiated with config: {e}. Trying without config.")
+            # print(f"Warning: TaskAnalyzer could not be instantiated with config: {e}. Trying without config.")
             try:
                 self.task_analyzer_instance = ActualTaskAnalyzerClass()
             except Exception as e_init:
-                print(f"Fatal: Could not instantiate TaskAnalyzer: {e_init}. HIPA will likely fail.")
+                # print(f"Fatal: Could not instantiate TaskAnalyzer: {e_init}. HIPA will likely fail.")
                 # Fallback to dummy if all attempts fail
                 class DummyTaskAnalyzer:
                     def detect_modality(self, x, task_id=None, context_hints=None):
-                        print("Warning: Using DummyTaskAnalyzer due to instantiation failure. HIPA modality detection will not be accurate.")
+                        # print("Warning: Using DummyTaskAnalyzer due to instantiation failure. HIPA modality detection will not be accurate.")
                         return {'use_hipa': False, 'modality': 'unknown', 'fft_dims': [], 'freq_threshold': 0.1, 'enhancement_strength': 0.0}
                 self.task_analyzer_instance = DummyTaskAnalyzer()
+        
+        # Ensure 'copy' is imported for deepcopy
+        import copy
 
         # Determine input dimension for the main encoder and task inference
         self.dynamic_entropy_patcher = None
@@ -3858,6 +3886,33 @@ class EnhancedCTMDiffusion(nn.Module):
             'batch_sizes': [],
             'sample_priorities': []
         }
+
+        # --- JEPA Components Initialization (Integrated with LearnedBytePatcherEncoder) ---
+        if self.config.use_jepa_training:
+            if not self.config.use_dynamic_entropy_patcher:
+                raise ValueError("JEPA training requires 'use_dynamic_entropy_patcher' to be True, as it uses LearnedBytePatcherEncoder.")
+            if self.dynamic_entropy_patcher is None: # This is the online encoder
+                 raise ValueError("self.dynamic_entropy_patcher (LearnedBytePatcherEncoder) must be initialized before JEPA components if use_jepa_training is True.")
+
+            # Target encoder is a momentum copy of the online patcher (dynamic_entropy_patcher)
+            self.jepa_target_patch_encoder = copy.deepcopy(self.dynamic_entropy_patcher)
+            for param_target in self.jepa_target_patch_encoder.parameters():
+                param_target.requires_grad = False
+            
+            # Predictor operates on patch embeddings
+            # The input/output dim for predictor is patch_embedding_dim from the patcher
+            jepa_io_dim = self.config.patch_embedding_dim
+            # Output dimension of the predictor should be num_target_blocks * patch_embedding_dim
+            predictor_output_dim = jepa_io_dim * self.config.jepa_num_target_blocks
+            self.jepa_predictor = JEPAPredictor(
+                input_dim=jepa_io_dim,
+                hidden_dim=self.config.jepa_predictor_hidden_dim,
+                output_dim=predictor_output_dim # Predict embeddings for all target blocks
+            )
+            print(f"JEPA components initialized. Predictor I/O dim: {jepa_io_dim}, Output dim: {predictor_output_dim}")
+        else:
+            self.jepa_target_patch_encoder = None
+            self.jepa_predictor = None
     
     def get_optimized_batch_size(self) -> int:
         """Get the current optimized batch size from adaptive batch sampler."""
@@ -4947,14 +5002,63 @@ class EnhancedCTMDiffusion(nn.Module):
         losses = {}
         batch_size = byte_sequence.size(0)
         device = byte_sequence.device
+        
+        losses['jepa_loss'] = torch.tensor(0.0, device=device)
+        # The aux loss from dynamic_entropy_patcher (online JEPA encoder) is handled by _prepare_input_features
+        # No separate jepa_context_aux_loss or jepa_target_aux_loss needed here for now.
 
-        # Prepare input features, get inferred latent and HIPA signal for the current batch
-        # These will be used for CTM core, diffusion conditioning, EWC, and memory replay.
+        # Prepare input features using the online encoder (dynamic_entropy_patcher)
+        # This also gives us the online_patch_embeddings (kv_features_for_ctm) and their original byte indices.
+        # kv_features_for_ctm, current_inferred_latent, current_hipa_signal, entropy_aux_loss are computed once
         kv_features_for_ctm, current_inferred_latent, current_hipa_signal, entropy_aux_loss = \
             self._prepare_input_features(byte_sequence)
         
         losses['entropy_model_aux_loss'] = entropy_aux_loss * self.config.entropy_model_loss_weight
+        online_patch_embeddings = kv_features_for_ctm # Shape: (B, S_patches, D_embed)
 
+        # --- JEPA Loss Calculation ---
+        if self.config.use_jepa_training and self.training and \
+           self.jepa_target_patch_encoder is not None and self.jepa_predictor is not None and \
+           self.dynamic_entropy_patcher is not None: # Ensure online encoder (dynamic_entropy_patcher) is also available
+            try:
+                with torch.no_grad():
+                    # Target encoder processes the original byte sequence
+                    # LearnedBytePatcherEncoder returns (embeddings, indices, aux_loss)
+                    target_patch_embeddings, _target_patch_indices, _target_aux_loss = \
+                        self.jepa_target_patch_encoder(byte_sequence)
+                    # target_patch_embeddings shape: (B, S_patches, D_embed)
+
+                # Create masked views from patch embeddings
+                # online_patch_embeddings are from self.dynamic_entropy_patcher (via _prepare_input_features)
+                context_representation, actual_target_representation = self._jepa_create_masked_patch_views(
+                    online_patch_embeddings, # These are the kv_features_for_ctm
+                    target_patch_embeddings
+                )
+
+                if context_representation is not None and actual_target_representation is not None:
+                    # context_representation is (B, D_embed)
+                    # actual_target_representation is (B, num_target_blocks, D_embed)
+                    predicted_target_representation_flat = self.jepa_predictor(context_representation) # (B, num_target_blocks * D_embed)
+                    
+                    # Reshape predicted_target_representation to match actual_target_representation
+                    predicted_target_representation = predicted_target_representation_flat.view(
+                        batch_size, # batch_size is defined at the start of the forward method
+                        self.config.jepa_num_target_blocks,
+                        self.config.patch_embedding_dim
+                    )
+                    
+                    current_jepa_loss = F.mse_loss(predicted_target_representation, actual_target_representation.detach())
+                    losses['jepa_loss'] = current_jepa_loss * self.config.jepa_loss_weight
+                else:
+                    # Masking might not have produced valid context/target (e.g., too few patches)
+                    losses['jepa_loss'] = torch.tensor(0.0, device=device)
+
+            except Exception as e_jepa:
+                print(f"Error during JEPA processing in forward pass: {e_jepa}")
+                import traceback
+                traceback.print_exc()
+                losses['jepa_loss'] = torch.tensor(0.0, device=device)
+        
         # --- CTM Core Logic ---
         # CTM core processes the features derived from the input byte_sequence.
         # ctm_output_features = self.ctm_core(kv_features_for_ctm) # If CTM core is a separate module
@@ -5942,6 +6046,103 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
     config.iterative_refinement = True
     return config
 
+    def _jepa_create_masked_patch_views(self,
+                                      online_patch_embeddings: torch.Tensor,
+                                      target_patch_embeddings: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Creates context and target representations from sequences of patch embeddings for JEPA.
+        Masking is applied at the patch sequence level. This version aims to select
+        one context block and one target block per sample.
+
+        Args:
+            online_patch_embeddings: (B, S_patches, D_embed) from the online encoder.
+            target_patch_embeddings: (B, S_patches, D_embed) from the target encoder.
+
+        Returns:
+            Tuple of (context_representation, actual_target_representation), or (None, None) if masking fails.
+            context_representation: (B, D_embed) - selected context patch from online encoder.
+            actual_target_representation: (B, num_target_blocks, D_embed) - selected target patches from target encoder.
+        """
+        B, S_patches, D_embed = online_patch_embeddings.shape
+        device = online_patch_embeddings.device
+
+        if S_patches < 2: # Need at least one patch for context and one for target
+            return None, None
+
+        batch_context_reps = []
+        batch_target_reps = []
+
+        for b_idx in range(B):
+            # 1. Determine context block size
+            context_scale = random.uniform(self.config.jepa_context_scale_min, self.config.jepa_context_scale_max)
+            num_context_patches = max(1, int(S_patches * context_scale))
+            # Ensure there's enough space for at least num_target_blocks patches left after context
+            num_context_patches = min(num_context_patches, S_patches - self.config.jepa_num_target_blocks)
+
+            if num_context_patches <= 0: # Not enough patches to form a context and have targets
+                continue
+
+            # 2. Select context block
+            # Ensure there's enough space for context block and target blocks
+            if S_patches < num_context_patches + self.config.jepa_num_target_blocks:
+                continue
+
+            all_indices = torch.arange(S_patches, device=device)
+            
+            # Randomly select start for context block
+            # Max start index for context ensures that context_block + target_blocks fit
+            max_context_start_idx = S_patches - num_context_patches - self.config.jepa_num_target_blocks
+            if max_context_start_idx < 0: # Should be caught by S_patches check above, but for safety
+                continue
+            
+            context_start_idx = random.randint(0, max_context_start_idx)
+            context_indices = all_indices[context_start_idx : context_start_idx + num_context_patches]
+            context_block_embeddings = online_patch_embeddings[b_idx, context_indices, :] # (num_context_patches, D_embed)
+            context_rep = context_block_embeddings.mean(dim=0) # (D_embed) - Average context patches
+
+            # 3. Select target blocks (non-overlapping with context)
+            # Create a mask for available target indices
+            available_target_mask = torch.ones(S_patches, dtype=torch.bool, device=device)
+            available_target_mask[context_indices] = False # Mask out context indices
+            
+            potential_target_indices = all_indices[available_target_mask]
+
+            if len(potential_target_indices) < self.config.jepa_num_target_blocks:
+                continue # Not enough non-overlapping patches left for the required number of target blocks
+            
+            # Shuffle potential target indices and select
+            shuffled_potential_target_indices = potential_target_indices[torch.randperm(len(potential_target_indices), device=device)]
+            actual_target_indices = shuffled_potential_target_indices[:self.config.jepa_num_target_blocks]
+            
+            selected_target_patches = target_patch_embeddings[b_idx, actual_target_indices, :] # (num_target_blocks, D_embed)
+            target_rep = selected_target_patches # Keep as distinct blocks, shape (num_target_blocks, D_embed)
+
+            batch_context_reps.append(context_rep) # List of (D_embed)
+            batch_target_reps.append(target_rep)   # List of (num_target_blocks, D_embed)
+
+        if not batch_context_reps or not batch_target_reps:
+            return None, None
+
+        return torch.stack(batch_context_reps), torch.stack(batch_target_reps)
+
+    @torch.no_grad()
+    def _update_jepa_target_encoder(self):
+        """
+        Performs momentum update of the JEPA target patch encoder parameters
+        using the online patch encoder (self.dynamic_entropy_patcher).
+        This should be called by the training loop after optimizer.step().
+        """
+        if not self.config.use_jepa_training or \
+           self.dynamic_entropy_patcher is None or self.jepa_target_patch_encoder is None:
+            # Only update if JEPA is active and both encoders exist.
+            # No self.training check here, as it might be called during eval for consistency if needed,
+            # though typically only during training.
+            return
+        
+        m = self.config.jepa_momentum_beta
+        for param_online, param_target in zip(self.dynamic_entropy_patcher.parameters(), self.jepa_target_patch_encoder.parameters()):
+            param_target.data.mul_(m).add_((1 - m) * param_online.data)
+
 
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
@@ -6606,3 +6807,31 @@ class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diff
         x_final = self._apply_hipa_attention(x, task_id=task_id, freq_domain=True)
         
         return x_final
+
+class JEPAPredictor(nn.Module):
+    """
+    MLP predictor for JEPA.
+    Predicts target patch embedding(s) from context patch embedding(s).
+    Input dimension should be the patch_embedding_dim from LearnedBytePatcherEncoder.
+    Output dimension will be patch_embedding_dim * num_target_blocks.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int): # output_dim here is patch_embedding_dim * num_target_blocks
+        super().__init__()
+        # Ensure hidden_dim is reasonable
+        # The output_dim passed here is already patch_embedding_dim * num_target_blocks
+        actual_hidden_dim = max(hidden_dim, input_dim // 2, output_dim // 4, 64) # Adjusted output_dim factor for hidden layer
+
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, actual_hidden_dim),
+            nn.LayerNorm(actual_hidden_dim),
+            nn.GELU(),
+            nn.Linear(actual_hidden_dim, actual_hidden_dim),
+            nn.LayerNorm(actual_hidden_dim),
+            nn.GELU(),
+            nn.Linear(actual_hidden_dim, output_dim) # This output_dim is patch_embedding_dim * num_target_blocks
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x is expected to be the representation of context patches, e.g., (B, D_embed)
+        # Output will be (B, patch_embedding_dim * num_target_blocks)
+        return self.network(x)
