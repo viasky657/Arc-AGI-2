@@ -2964,6 +2964,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
             beta_end=config.diffusion_beta_end,
             beta_schedule="linear" # Changed from config.noise_schedule to fix NotImplementedError for 'cosine'
         )
+        self.alpha_bars = self.sampling_noise_scheduler.alphas_cumprod
         
         # Learnable CTM influence weights
         self.sync_influence_weight = nn.Parameter(torch.tensor(1.0))  # Strong sync influence
