@@ -3386,7 +3386,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
     def add_noise(self, x_start: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Add noise to clean data according to diffusion schedule"""
         # Get alpha_bar for the given timesteps
-        alpha_bar = self.alpha_bars[timesteps]
+        alpha_bar = self.alpha_bars[timesteps.to(self.alpha_bars.device)]
         
         # Reshape alpha_bar to match x_start dimensions
         while len(alpha_bar.shape) < len(x_start.shape):
