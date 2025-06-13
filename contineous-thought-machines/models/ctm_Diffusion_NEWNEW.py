@@ -4703,20 +4703,31 @@ class EnhancedCTMDiffusion(nn.Module):
         return self.config.ewc_lambda * total_ewc_loss / 2.0 # Original had /2, keeping it
 
     # --- Memory Replay Methods ---
-    def add_to_memory_bank(self, input_bytes: torch.Tensor,
-                             target_bytes: Optional[torch.Tensor],
-                             inferred_task_latent: torch.Tensor):
-        """Adds an experience to the memory bank with its inferred task latent."""
+    def add_to_memory_bank(self,
+                             input_bytes: torch.Tensor,
+                             target_diffusion_output: Optional[torch.Tensor], # Renamed from target_bytes to match call
+                             inferred_task_latent: Optional[torch.Tensor],    # Made Optional
+                             hipa_control_signal: Optional[torch.Tensor],   # Added
+                             task_key: Any,                                 # Added
+                             metadata: Dict):                               # Added (from call)
+        """Adds an experience to the memory bank with its inferred task latent and other relevant info."""
         if not self.config.use_memory_replay:
             return
 
         # Detach and move to CPU to save GPU memory
-        metadata = {'timestamp': time.time(), 'access_count': 0}
+        # Use metadata from the call, augmented with timestamp and access_count if not present.
+        stored_metadata = metadata.copy()
+        stored_metadata.setdefault('timestamp', time.time())
+        stored_metadata.setdefault('access_count', 0)
+        # stored_metadata['task_key_from_call_site'] = task_key # Optionally store task_key within metadata too
+
         experience = (
             input_bytes.detach().cpu(),
-            target_bytes.detach().cpu() if target_bytes is not None else None,
-            inferred_task_latent.detach().cpu(),
-            metadata
+            target_diffusion_output.detach().cpu() if target_diffusion_output is not None else None,
+            inferred_task_latent.detach().cpu() if inferred_task_latent is not None else None,
+            hipa_control_signal.detach().cpu() if hipa_control_signal is not None else None,
+            task_key,  # Store task_key as a separate element
+            stored_metadata
         )
         
         self.memory_bank.append(experience) # self.memory_bank is List
@@ -4761,7 +4772,7 @@ class EnhancedCTMDiffusion(nn.Module):
         The sample_tuple is (input_bytes, target_bytes, inferred_task_latent, metadata_dict).
         `current_inferred_task_latent` can be used to prioritize similar latents.
         """
-        _input_bytes, _target_bytes, sample_latent, metadata = sample_tuple
+        _input_bytes, _target_bytes, sample_latent, _sample_hipa, _sample_task_key, metadata = sample_tuple
         
         # Access penalty: less accessed samples are preferred
         access_count = metadata.get('access_count', 0)
@@ -4826,7 +4837,7 @@ class EnhancedCTMDiffusion(nn.Module):
         replay_inputs_cpu, replay_targets_cpu_list, replay_latents_cpu = [], [], []
         
         for sample_tuple in chosen_samples_tuples:
-            inp_cpu, target_cpu, latent_cpu, metadata = sample_tuple
+            inp_cpu, target_cpu, latent_cpu, _hipa_signal_cpu, _task_key_cpu, metadata = sample_tuple
             replay_inputs_cpu.append(inp_cpu)
             replay_targets_cpu_list.append(target_cpu) # List of Tensors or Nones
             replay_latents_cpu.append(latent_cpu)
