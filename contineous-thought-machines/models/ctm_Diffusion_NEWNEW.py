@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 import queue
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import numpy as np
+from .knowledge_store import UKS # <<< NEW: Import UKS
 
 
 def batched_bytes_to_numeric_tensor(byte_batch_tensor: torch.Tensor, item_size: int = 4, target_dtype: np.dtype = np.dtype(np.float32)) -> torch.Tensor:
@@ -2030,7 +2031,13 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     jepa_momentum_beta: float = 0.996 # Momentum for target encoder update
     jepa_loss_weight: float = 0.1 # Weight for the JEPA loss component
     jepa_num_target_blocks: int = 1 # Number of target blocks to predict
-    
+
+    # --- Knowledge Store Parameters ---
+    use_knowledge_store: bool = True # <<< NEW: Flag to enable/disable UKS integration
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "password"
+
     def __post_init__(self):
         # Validate output dimensions
         if len(self.output_dims) != self.num_outputs:
@@ -2206,8 +2213,10 @@ class OriginalCTMCore(nn.Module):
 
     """
 
-    def __init__(self, config: EnhancedCTMConfig):
+    def __init__(self, config: EnhancedCTMConfig, knowledge_store: Optional[UKS] = None):
         super(OriginalCTMCore, self).__init__()
+        self.config = config
+        self.knowledge_store = knowledge_store
 
         # --- Core Parameters from Config ---
         self.iterations = config.ctm_iterations
@@ -2301,6 +2310,14 @@ class OriginalCTMCore(nn.Module):
 
         # --- Output Procesing (projects from CTM's synchronisation to ctm_out_dims) ---
         self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
+
+        # --- Reward Signal Processing ---
+        if self.config.use_knowledge_store:
+            self.reward_signal_processor = nn.Sequential(
+                nn.Linear(1, self.d_model // 4),
+                nn.GELU(),
+                nn.Linear(self.d_model // 4, self.d_model)
+            )
 
     # --- Core CTM Methods ---
 
@@ -2735,6 +2752,38 @@ class OriginalCTMCore(nn.Module):
                 else:
                     pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
             
+            # --- Query Knowledge Store for Reward Signal ---
+            # This is the "read" part of the learning loop.
+            # The model checks if its current state is associated with known positive outcomes.
+            if self.config.use_knowledge_store and hasattr(self, 'knowledge_store') and self.knowledge_store is not None:
+                # A simplified check based on the current sync level
+                avg_sync_out = synchronisation_out.mean().item() if 'synchronisation_out' in locals() else 0
+                current_state_label = "high_sync" if avg_sync_out > 0.5 else "low_sync"
+                
+                known_outcomes = self.knowledge_store.find_outcomes_for_state(current_state_label)
+                for outcome in known_outcomes:
+                    if outcome.get('valence') == 'positive':
+                        # Create a "reward signal" and inject it into the synaptic input
+                        # This reinforces the current line of thought.
+                        reward_signal = torch.ones_like(pre_synapse_input) * outcome.get('weight', 1.0) * 0.1 # Small boost
+                        pre_synapse_input = pre_synapse_input + reward_signal
+                        # print(f"Injecting reward signal for state: {current_state_label}") # For debugging
+
+            # --- Query Knowledge Store for Reward Signal ---
+            if self.config.use_knowledge_store and self.knowledge_store is not None:
+                # A simplified check based on the current sync level from the *previous* step
+                avg_sync_out = synchronisation_out.mean().item()
+                current_state_label = "high_sync" if avg_sync_out > 0.5 else "low_sync"
+                
+                known_outcomes = self.knowledge_store.find_outcomes_for_state(current_state_label)
+                if known_outcomes:
+                    reward_signal = torch.zeros_like(pre_synapse_input)
+                    for outcome in known_outcomes:
+                        if outcome.get('valence') == 'positive':
+                            # Create a "reward signal" and inject it into the synaptic input
+                            reward_signal += torch.ones_like(pre_synapse_input) * outcome.get('weight', 1.0) * 0.1 # Small boost
+                    pre_synapse_input = pre_synapse_input + reward_signal
+
             # Apply synapses
             state = self.synapses(pre_synapse_input)
             
@@ -2744,6 +2793,30 @@ class OriginalCTMCore(nn.Module):
             
             # Apply neuron-level models
             activated_state = self.trace_processor(state_trace)
+
+            # --- Inject Reward Signal into Activated State ---
+            # This is the "read" part of the learning loop, now fully implemented.
+            # The model checks if its current state is associated with known positive outcomes
+            # and injects a processed reward signal directly into its internal state.
+            if self.config.use_knowledge_store and self.knowledge_store is not None:
+                avg_sync_out = synchronisation_out.mean().item()
+                current_state_label = "high_sync" if avg_sync_out > 0.5 else "low_sync"
+                
+                known_outcomes = self.knowledge_store.find_outcomes_for_state(current_state_label)
+                if known_outcomes:
+                    total_reward_value = 0.0
+                    for outcome in known_outcomes:
+                        if outcome.get('valence') == 'positive':
+                            total_reward_value += outcome.get('weight', 1.0)
+                    
+                    if total_reward_value > 0:
+                        # Process the scalar reward value into a high-dimensional reward vector
+                        reward_input = torch.tensor([[total_reward_value]], device=device, dtype=torch.float32)
+                        reward_vector = self.reward_signal_processor(reward_input) # (1, d_model)
+                        
+                        # Add the reward vector to the activated state, reinforcing this pattern
+                        activated_state = activated_state + reward_vector.squeeze(0) * 0.1 # Apply with a small factor
+
             tracking_data['activated_states'].append(activated_state.clone())
             
             # Calculate synchronisation for output predictions
@@ -3648,7 +3721,23 @@ class EnhancedCTMDiffusion(nn.Module):
     def __init__(self, config: EnhancedCTMConfig):
         super().__init__()
         self.config = config
+        self.device_container = nn.Parameter(torch.empty(0)) # Helper to get device
 
+        # --- Knowledge Store Initialization ---
+        if self.config.use_knowledge_store:
+            try:
+                self.knowledge_store = UKS(
+                    uri=self.config.neo4j_uri,
+                    user=self.config.neo4j_user,
+                    password=self.config.neo4j_password
+                )
+                print("Successfully connected to Neo4j knowledge store.")
+            except Exception as e:
+                print(f"CRITICAL: Failed to connect to Neo4j knowledge store: {e}")
+                self.knowledge_store = None
+        else:
+            self.knowledge_store = None
+ 
         # Placeholder for TaskAnalyzer instantiation.
         # Ensure TaskAnalyzer is imported (e.g., from .utils import TaskAnalyzer)
         # and instantiated correctly (e.g., TaskAnalyzer(config=self.config) or TaskAnalyzer()).
@@ -3731,7 +3820,7 @@ class EnhancedCTMDiffusion(nn.Module):
         self.mixed_precision_trainer = MixedPrecisionTrainer(self, config)
 
         # Core CTM
-        self.ctm_core = OriginalCTMCore(config)
+        self.ctm_core = OriginalCTMCore(config, self.knowledge_store)
         
         # Enhanced diffusion processor
         # actual_noisy_input_dim is now config.unet_input_feature_dim
@@ -5279,6 +5368,10 @@ class EnhancedCTMDiffusion(nn.Module):
         # If MCMC ran, its expectation is preferred, otherwise direct CTM output.
         final_ctm_representation = mcmc_expectation if mcmc_expectation is not None else theta_candidate_from_ctm
 
+        # --- Update Knowledge Store ---
+        if ctm_data and self.knowledge_store:
+            self._update_knowledge_store(ctm_data)
+
         # --- 3. Mode-Specific Outputs & Diffusion ---
         if mode == 'ctm_only':
             output_dict['final_output'] = final_ctm_representation # Could be original ctm_data['final_sync_out']
@@ -6016,6 +6109,49 @@ class EnhancedCTMDiffusion(nn.Module):
         return benchmark_results
 
 
+    def _update_knowledge_store(self, ctm_data: Dict[str, torch.Tensor]):
+        """
+        Observes CTM internal states and populates the Neo4j knowledge store.
+        """
+        if not self.knowledge_store or not self.config.use_knowledge_store:
+            return
+
+        try:
+            if 'final_sync_out' in ctm_data:
+                sync_data = ctm_data['final_sync_out']
+                if sync_data.numel() > 0:
+                    avg_sync = sync_data.mean().item()
+                    
+                    sync_level_label = "high_sync" if avg_sync > 0.5 else "low_sync"
+
+                    # Create nodes and the base relationship in Neo4j
+                    # These calls are now idempotent Cypher queries.
+                    self.knowledge_store.get_or_add_thing("ctm_state")
+                    self.knowledge_store.get_or_add_thing("has_pattern")
+                    self.knowledge_store.get_or_add_thing(sync_level_label)
+                    
+                    base_relationship = self.knowledge_store.add_statement(
+                        "ctm_state", "has_pattern", sync_level_label
+                    )
+
+                    # Add a conditional relationship (clause) if sync is very high
+                    if avg_sync > 0.75 and base_relationship.element_id:
+                        # Use the new action module to record the outcome
+                        action_outcome_relationship = self.knowledge_store.add_action_outcome(
+                            action_label="take_action_A",
+                            outcome_label="reward",
+                            valence="positive"
+                        )
+
+                        # Link the base relationship to this action outcome conditionally
+                        if action_outcome_relationship.element_id:
+                            self.knowledge_store.add_clause(
+                                base_relationship, "if", action_outcome_relationship
+                            )
+        except Exception as e:
+            print(f"Warning: Failed to update knowledge store: {e}")
+
+
 # Configuration helpers
     def iterative_generation(self, condition: torch.Tensor, num_steps: int = 3) -> torch.Tensor:
         """
@@ -6040,6 +6176,12 @@ class EnhancedCTMDiffusion(nn.Module):
             output = output + refinement
             
         return output
+
+    def close(self):
+        """Safely close connections, including the knowledge store."""
+        if self.knowledge_store:
+            self.knowledge_store.close()
+            print("Neo4j knowledge store connection closed.")
 
 def create_enhanced_config_for_text_generation(vocab_size: int) -> EnhancedCTMConfig:
     """Create enhanced configuration for text generation with strong CTM control"""

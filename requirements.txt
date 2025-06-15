@@ -24,3 +24,6 @@ datasets==2.14.5
 # For CUDA GPU support (Optional, if needed in RunPod base image)
 nvidia-pyindex==1.0.9
 nvidia-tensorrt==99.0.0
+
+# Database drivers
+neo4j==5.20.0
