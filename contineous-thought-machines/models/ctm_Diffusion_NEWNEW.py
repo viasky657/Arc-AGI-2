@@ -575,23 +575,23 @@ from .mcmc_interpretability_solver import (
 )
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
 # Import original CTM modules to preserve exact behavior
-try:
-    from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
-    from .utils import compute_normalized_entropy
-    from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
-except ImportError:
-    print("Warning: Could not import original CTM modules (e.g. from .modules). Using fallback implementations.")
-    SynapseUNET = None
-    SuperLinear = None
-    Squeeze = None
-    compute_normalized_entropy = None
-    VALID_NEURON_SELECT_TYPES = [ #Legacy
-    'first-last', 'random', 'random-pairing',
-    # Biologically-inspired types
-    'bio_hebbian', 'bio_plasticity', 'bio_competitive', 'bio_homeostatic',
-    'bio_evolutionary', 'bio_stdp', 'bio_criticality', 'bio_multi_objective',
-    # Hybrid approaches
-    'adaptive_random', 'performance_guided', 'task_aware']
+# try:
+from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
+from .utils import compute_normalized_entropy
+from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
+# except ImportError:
+#     print("Warning: Could not import original CTM modules (e.g. from .modules). Using fallback implementations.")
+#     SynapseUNET = None
+#     SuperLinear = None
+#     Squeeze = None
+#     compute_normalized_entropy = None
+#     VALID_NEURON_SELECT_TYPES = [ #Legacy
+#     'first-last', 'random', 'random-pairing',
+#     # Biologically-inspired types
+#     'bio_hebbian', 'bio_plasticity', 'bio_competitive', 'bio_homeostatic',
+#     'bio_evolutionary', 'bio_stdp', 'bio_criticality', 'bio_multi_objective',
+#     # Hybrid approaches
+#     'adaptive_random', 'performance_guided', 'task_aware']
 
 
 
