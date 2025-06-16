@@ -34,7 +34,6 @@ from concurrent.futures import ThreadPoolExecutor
 import queue
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 import numpy as np
-from .knowledge_store import UKS # <<< NEW: Import UKS
 
 
 def batched_bytes_to_numeric_tensor(byte_batch_tensor: torch.Tensor, item_size: int = 4, target_dtype: np.dtype = np.dtype(np.float32)) -> torch.Tensor:
@@ -1666,7 +1665,7 @@ class _EntropyProxyModel(nn.Module):
             
         return entropy_scores, aux_loss
 
-class LearnedBytePatcherEncoder(nn.Module): #This is supposed to replace the DynamicEntropyPatcher and properly use dynamic byte patching based on complexity (entropy).
+class DynamicEntropyPatcher(nn.Module): # Implements dynamic byte patching based on complexity (entropy).
     """
     Implements the dynamic, entropy-based patching and encoding mechanism
     inspired by the "Byte Latent Transformer" (BLT) paper.
@@ -1864,8 +1863,6 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     dropout: float = 0.1
     
     # --- Byte Processing Options ---
-    use_learned_patch_encoder: bool = True # <<< NEW: Flag to use LearnedBytePatcherEncoder
-    patch_size: int = 16                   # <<< NEW: Size of byte patches
     patch_embedding_dim: int = 256         # <<< NEW: Output embedding dimension per patch from patcher
     patch_encoder_cnn_channels: int = 64   # <<< NEW: Intermediate channels for CNN patch encoder
 
@@ -1934,17 +1931,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     adaptive_scheduling: bool = True  # CTM-adaptive diffusion timestep scheduling
     iterative_refinement: bool = True # Iterative CTM-diffusion refinement for sampling
     
-    # Continual Learning Parameters
-    use_ewc: bool = True        # <<< NEW: Flag to enable/disable EWC loss calculation
-    ewc_lambda: float = 1000.0  # Elastic Weight Consolidation strength
-    ewc_on_current_task_finetune: bool = False # If True, EWC penalty applies even if prev_task_key matches current_task_key
-    use_memory_replay: bool = True # <<< NEW: Flag to enable/disable memory replay
-    memory_bank_size: int = 10000    # Size of the episodic memory buffer for replay
-    replay_ratio: float = 0.3   # Ratio of replay batches to new data batches
-    fisher_update_freq: int = 1000 # How often to update Fisher matrix for EWC
-    replay_start_threshold: int = 1000 # Minimum number of items in memory bank before replay starts
-    replay_lambda: float = 1.0 # Weight for the memory replay loss
-    replay_buffer_strategy: str = "fifo" # Strategy for memory bank eviction: 'fifo', 'random', 'prioritized_composite'
+
     
     # Training Efficiency
     mixed_precision: bool = True
@@ -2033,10 +2020,6 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     jepa_num_target_blocks: int = 1 # Number of target blocks to predict
 
     # --- Knowledge Store Parameters ---
-    use_knowledge_store: bool = True # <<< NEW: Flag to enable/disable UKS integration
-    neo4j_uri: str = "bolt://localhost:7687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: str = "password"
 
     def __post_init__(self):
         # Validate output dimensions
@@ -2079,13 +2062,6 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
                 raise ValueError("entropy_patcher_max_patch_size must be >= entropy_patcher_min_patch_size.")
             if self.entropy_patcher_threshold_type not in ["global", "relative_monotonic"]:
                 raise ValueError("entropy_patcher_threshold_type must be 'global' or 'relative_monotonic'.")
-            if self.use_learned_patch_encoder:
-                print("Warning: 'use_learned_patch_encoder' is True, but 'use_dynamic_entropy_patcher' takes precedence.")
-        elif self.use_learned_patch_encoder:
-            if self.patch_size <= 0:
-                raise ValueError("patch_size must be positive if use_learned_patch_encoder is True.")
-            if self.patch_embedding_dim <= 0:
-                raise ValueError("patch_embedding_dim must be positive if use_learned_patch_encoder is True.")
         elif self.multi_granularity and self.multi_granularity_output_dim <= 0:
             print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
         
@@ -2213,10 +2189,10 @@ class OriginalCTMCore(nn.Module):
 
     """
 
-    def __init__(self, config: EnhancedCTMConfig, knowledge_store: Optional[UKS] = None):
+    def __init__(self, config: EnhancedCTMConfig):
         super(OriginalCTMCore, self).__init__()
         self.config = config
-        self.knowledge_store = knowledge_store
+        self.knowledge_store = None
 
         # --- Core Parameters from Config ---
         self.iterations = config.ctm_iterations
@@ -2311,13 +2287,6 @@ class OriginalCTMCore(nn.Module):
         # --- Output Procesing (projects from CTM's synchronisation to ctm_out_dims) ---
         self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
 
-        # --- Reward Signal Processing ---
-        if self.config.use_knowledge_store:
-            self.reward_signal_processor = nn.Sequential(
-                nn.Linear(1, self.d_model // 4),
-                nn.GELU(),
-                nn.Linear(self.d_model // 4, self.d_model)
-            )
 
     # --- Core CTM Methods ---
 
@@ -2752,37 +2721,6 @@ class OriginalCTMCore(nn.Module):
                 else:
                     pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
             
-            # --- Query Knowledge Store for Reward Signal ---
-            # This is the "read" part of the learning loop.
-            # The model checks if its current state is associated with known positive outcomes.
-            if self.config.use_knowledge_store and hasattr(self, 'knowledge_store') and self.knowledge_store is not None:
-                # A simplified check based on the current sync level
-                avg_sync_out = synchronisation_out.mean().item() if 'synchronisation_out' in locals() else 0
-                current_state_label = "high_sync" if avg_sync_out > 0.5 else "low_sync"
-                
-                known_outcomes = self.knowledge_store.find_outcomes_for_state(current_state_label)
-                for outcome in known_outcomes:
-                    if outcome.get('valence') == 'positive':
-                        # Create a "reward signal" and inject it into the synaptic input
-                        # This reinforces the current line of thought.
-                        reward_signal = torch.ones_like(pre_synapse_input) * outcome.get('weight', 1.0) * 0.1 # Small boost
-                        pre_synapse_input = pre_synapse_input + reward_signal
-                        # print(f"Injecting reward signal for state: {current_state_label}") # For debugging
-
-            # --- Query Knowledge Store for Reward Signal ---
-            if self.config.use_knowledge_store and self.knowledge_store is not None:
-                # A simplified check based on the current sync level from the *previous* step
-                avg_sync_out = synchronisation_out.mean().item()
-                current_state_label = "high_sync" if avg_sync_out > 0.5 else "low_sync"
-                
-                known_outcomes = self.knowledge_store.find_outcomes_for_state(current_state_label)
-                if known_outcomes:
-                    reward_signal = torch.zeros_like(pre_synapse_input)
-                    for outcome in known_outcomes:
-                        if outcome.get('valence') == 'positive':
-                            # Create a "reward signal" and inject it into the synaptic input
-                            reward_signal += torch.ones_like(pre_synapse_input) * outcome.get('weight', 1.0) * 0.1 # Small boost
-                    pre_synapse_input = pre_synapse_input + reward_signal
 
             # Apply synapses
             state = self.synapses(pre_synapse_input)
@@ -2794,28 +2732,6 @@ class OriginalCTMCore(nn.Module):
             # Apply neuron-level models
             activated_state = self.trace_processor(state_trace)
 
-            # --- Inject Reward Signal into Activated State ---
-            # This is the "read" part of the learning loop, now fully implemented.
-            # The model checks if its current state is associated with known positive outcomes
-            # and injects a processed reward signal directly into its internal state.
-            if self.config.use_knowledge_store and self.knowledge_store is not None:
-                avg_sync_out = synchronisation_out.mean().item()
-                current_state_label = "high_sync" if avg_sync_out > 0.5 else "low_sync"
-                
-                known_outcomes = self.knowledge_store.find_outcomes_for_state(current_state_label)
-                if known_outcomes:
-                    total_reward_value = 0.0
-                    for outcome in known_outcomes:
-                        if outcome.get('valence') == 'positive':
-                            total_reward_value += outcome.get('weight', 1.0)
-                    
-                    if total_reward_value > 0:
-                        # Process the scalar reward value into a high-dimensional reward vector
-                        reward_input = torch.tensor([[total_reward_value]], device=device, dtype=torch.float32)
-                        reward_vector = self.reward_signal_processor(reward_input) # (1, d_model)
-                        
-                        # Add the reward vector to the activated state, reinforcing this pattern
-                        activated_state = activated_state + reward_vector.squeeze(0) * 0.1 # Apply with a small factor
 
             tracking_data['activated_states'].append(activated_state.clone())
             
@@ -3723,20 +3639,7 @@ class EnhancedCTMDiffusion(nn.Module):
         self.config = config
         self.device_container = nn.Parameter(torch.empty(0)) # Helper to get device
 
-        # --- Knowledge Store Initialization ---
-        if self.config.use_knowledge_store:
-            try:
-                self.knowledge_store = UKS(
-                    uri=self.config.neo4j_uri,
-                    user=self.config.neo4j_user,
-                    password=self.config.neo4j_password
-                )
-                print("Successfully connected to Neo4j knowledge store.")
-            except Exception as e:
-                print(f"CRITICAL: Failed to connect to Neo4j knowledge store: {e}")
-                self.knowledge_store = None
-        else:
-            self.knowledge_store = None
+        self.knowledge_store = None
  
         # Placeholder for TaskAnalyzer instantiation.
         # Ensure TaskAnalyzer is imported (e.g., from .utils import TaskAnalyzer)
@@ -3779,7 +3682,7 @@ class EnhancedCTMDiffusion(nn.Module):
         self.byte_embedding = None
 
         if config.use_dynamic_entropy_patcher:
-            self.dynamic_entropy_patcher = LearnedBytePatcherEncoder(
+            self.dynamic_entropy_patcher = DynamicEntropyPatcher(
                 embedding_dim=config.patch_embedding_dim,
                 patch_cnn_channels=config.patch_encoder_cnn_channels,
                 patching_mode=config.entropy_patcher_threshold_type,
@@ -3795,14 +3698,6 @@ class EnhancedCTMDiffusion(nn.Module):
                 entropy_dropout=config.entropy_model_dropout
             )
             raw_feature_dim = config.patch_embedding_dim # Output of dynamic patcher is (batch, num_dynamic_patches, patch_embedding_dim)
-        elif config.use_learned_patch_encoder:
-            self.patcher_encoder = LearnedBytePatcherEncoder(
-                patch_size=config.patch_size,
-                embedding_dim=config.patch_embedding_dim,
-                cnn_channels=config.patch_encoder_cnn_channels
-            )
-            raw_feature_dim = config.patch_embedding_dim # Output of patcher is (batch, num_patches, patch_embedding_dim)
-                                                       # The input_encoder will take patch_embedding_dim
         elif config.multi_granularity:
             self.multi_granularity_processor = MultiGranularityBinaryProcessor(config)
             # MGP needs to expose its output dimension, e.g. self.multi_granularity_processor.output_dim
@@ -3820,7 +3715,7 @@ class EnhancedCTMDiffusion(nn.Module):
         self.mixed_precision_trainer = MixedPrecisionTrainer(self, config)
 
         # Core CTM
-        self.ctm_core = OriginalCTMCore(config, self.knowledge_store)
+        self.ctm_core = OriginalCTMCore(config)
         
         # Enhanced diffusion processor
         # actual_noisy_input_dim is now config.unet_input_feature_dim
@@ -3913,14 +3808,6 @@ class EnhancedCTMDiffusion(nn.Module):
                 self.positional_embedding = CustomRotationalEmbedding1D(d_model=pe_dim)
             else:
                 print(f"Warning: Unknown positional_embedding_type: {config.positional_embedding_type}. No positional embedding will be used.")
-
-        # EWC components (Fisher and optimal params will be keyed by inferred task characteristics later)
-        self.ewc_fisher_information: Dict[Any, Dict[str, torch.Tensor]] = defaultdict(dict) # Key type TBD
-        self.ewc_optimal_params: Dict[Any, Dict[str, torch.Tensor]] = defaultdict(dict)   # Key type TBD
-
-        # Memory Replay components (Bank will be organized by inferred task characteristics later)
-        # Storing (input_bytes, target_bytes, inferred_task_latent, hipa_control_signal, metadata)
-        self.memory_bank: List[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Dict]] = []
 
         # Store MCMC configuration from EnhancedCTMConfig
         self.enable_enhanced_mcmc = getattr(config, 'enable_enhanced_mcmc', False)
@@ -4163,18 +4050,6 @@ class EnhancedCTMDiffusion(nn.Module):
             raw_features, patch_indices, current_entropy_aux_loss = self.dynamic_entropy_patcher(byte_sequence)
             entropy_aux_loss = current_entropy_aux_loss
             # raw_features shape: (batch_size, num_dynamic_patches, embedding_dim)
-        elif self.patcher_encoder:
-            # This branch might be for a non-dynamic LearnedBytePatcherEncoder or an older setup.
-            # If it's also updated to return aux_loss, handle it. Otherwise, assume 2 return values.
-            patcher_output = self.patcher_encoder(byte_sequence)
-            if len(patcher_output) == 3:
-                raw_features, patch_indices, current_entropy_aux_loss = patcher_output
-                entropy_aux_loss = current_entropy_aux_loss
-            elif len(patcher_output) == 2:
-                raw_features, patch_indices = patcher_output
-            else: # Should be 2 or 3
-                raw_features = patcher_output # Fallback if it's just one tensor (unlikely for patcher)
-            # raw_features shape: (batch, num_patches, patch_embedding_dim)
         elif self.multi_granularity_processor:
             raw_features = self.multi_granularity_processor(byte_sequence)
         elif self.byte_embedding:
@@ -4484,23 +4359,6 @@ class EnhancedCTMDiffusion(nn.Module):
             'solver_diagnostics': solver_diagnostics
         }
 
-    # def _initialize_dynamic_task_system(self): # Obsolete: Task system is now inferred
-    #     """Initialize the dynamic task embedding system."""
-    #     pass
-
-    
-    # def get_task_id(self, task_name: str) -> int: # Obsolete
-    #     pass
-    #
-    # def get_task_embedding(self, task_name: str) -> torch.Tensor: # Obsolete
-    #     pass
-    #
-    # def get_all_task_names(self) -> List[str]: # Obsolete
-    #     return []
-    #
-    # def get_num_registered_tasks(self) -> int: # Obsolete
-    #     return 0
-    #
     # def _expand_task_embedding(self, new_size: int): # Obsolete
         """
         Legacy method for backward compatibility.
@@ -4512,560 +4370,6 @@ class EnhancedCTMDiffusion(nn.Module):
         # The dynamic system handles expansion automatically
         self.dynamic_task_embedding._grow_embedding_to_size(new_size)
         
-    # --- EWC Methods ---
-    def _get_task_key_from_latent(self, latent_tensor: Optional[torch.Tensor]) -> Optional[str]:
-        """
-        Generates a string key from a latent tensor for EWC dictionary lookups.
-        Uses a hash of the rounded tensor values to create a consistent key.
-        Returns None if latent_tensor is None.
-        """
-        if latent_tensor is None:
-            return None
-        try:
-            # Ensure tensor is on CPU and detached for numpy conversion
-            # Round to a few decimal places to handle minor float variations if necessary
-            rounded_latent_bytes = (torch.round(latent_tensor.detach().cpu() * 10000) / 10000).numpy().tobytes()
-            return hashlib.sha256(rounded_latent_bytes).hexdigest()[:16] # Use a portion of the hash
-        except Exception as e:
-            print(f"Warning: Could not generate task key from latent: {e}")
-            return None
-
-    def _compute_fisher_information_for_task(self, task_name: str, dataloader: torch.utils.data.DataLoader, device: torch.device):
-        """
-        Compute Fisher Information Matrix for Elastic Weight Consolidation (EWC) for general model parameters.
-        
-        The Fisher Information Matrix approximates the importance of each parameter
-        for the given task by computing the second derivative of the log-likelihood
-        with respect to the parameters.
-        
-        Args:
-            task_name: Name of the task for which to compute Fisher information. Used as a key for storing results.
-            dataloader: DataLoader providing samples for Fisher computation.
-            device: Device to perform computations on.
-        """
-        # Removed DynamicTaskEmbedding related checks and get_task_id calls.
-        # A simple task_id_map might be used in __init__ if task_name needs to be mapped to an integer for some reason,
-        # but for EWC Fisher/optimal_params, task_name string key is sufficient.
-
-        print(f"Computing Fisher Information for task: {task_name}")
-        self.eval()  # Set model to evaluation mode
-        
-        # Initialize Fisher information dictionary for all trainable parameters
-        fisher_info = {
-            name: torch.zeros_like(param, device=device)
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        }
-        
-        total_samples = 0
-        # task_id is no longer used here for Fisher computation on general parameters.
-        
-        try:
-            for batch_idx, batch_data in enumerate(dataloader):
-                # Handle different dataloader formats
-                if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
-                    inputs, targets = batch_data[0], batch_data[1]
-                else:
-                    inputs = batch_data
-                    targets = None
-                
-                inputs = inputs.to(device) # These are byte sequences
-                if targets is not None:
-                    targets = targets.to(device)
-                
-                batch_size = inputs.size(0)
-                total_samples += batch_size
-                
-                # Clear gradients
-                self.zero_grad()
-                
-                # Determine the appropriate loss computation based on input type and model configuration
-                loss_for_fisher = self._compute_task_specific_loss_for_fisher(
-                    inputs, targets, task_name, device # task_id removed
-                )
-                
-                if loss_for_fisher is None:
-                    print(f"Warning: Could not compute loss for Fisher information at batch {batch_idx}")
-                    continue
-                
-                # Compute gradients
-                loss_for_fisher.backward()
-                
-                # Accumulate squared gradients (Fisher Information approximation)
-                for name, param in self.named_parameters():
-                    if param.grad is not None and param.requires_grad and name in fisher_info:
-                        fisher_info[name] += param.grad.data.pow(2)
-                
-                # Clear gradients after accumulation
-                self.zero_grad()
-                
-                if batch_idx % 10 == 0:
-                    print(f"Fisher computation progress: {batch_idx + 1}/{len(dataloader)} batches")
-        
-        except Exception as e:
-            print(f"Error during Fisher computation for task {task_name}: {str(e)}")
-            self.train()
-            return
-        
-        # Normalize by total number of samples
-        if total_samples > 0:
-            for name in fisher_info:
-                fisher_info[name] /= total_samples
-        
-        # Store Fisher information and optimal parameters
-        self.ewc_fisher_information[task_name] = fisher_info
-        self.ewc_optimal_params[task_name] = {
-            name: param.clone().detach()
-            for name, param in self.named_parameters()
-            if param.requires_grad
-        }
-        
-        print(f"Fisher Information computation completed for task: {task_name}")
-        print(f"Processed {total_samples} samples across {len(dataloader)} batches")
-        
-        self.train()  # Set back to train mode
-    
-    def _compute_task_specific_loss_for_fisher(self, inputs: torch.Tensor, targets: torch.Tensor,
-                                             task_name: str, device: torch.device) -> torch.Tensor: # task_id removed
-        """
-        Compute the task-specific loss for Fisher Information computation.
-        
-        This method handles different input types and computes the appropriate loss
-        based on the model's training objective for the given task.
-        
-        Args:
-            inputs: Input tensor (could be byte sequences, images, etc.)
-            targets: Target tensor (optional, could be None)
-            task_name: Name of the current task (passed to sub-methods if needed)
-            device: Device for computations
-            
-        Returns:
-            Loss tensor for backpropagation, or None if computation fails
-        """
-        try:
-            # Case 1: Inputs are byte sequences (long tensors)
-            if inputs.dtype == torch.long:
-                return self._compute_ctm_loss_for_fisher(inputs, targets, task_name, device) # task_id replaced with task_name
-            
-            # Case 2: Inputs are continuous data (float tensors) - suitable for diffusion
-            elif inputs.dtype in [torch.float32, torch.float16, torch.float64]:
-                return self._compute_diffusion_loss_for_fisher(inputs, targets, task_name, device) # task_id replaced with task_name
-            
-            # Case 3: Mixed or unknown input type - try to infer appropriate method
-            else:
-                print(f"Warning: Unknown input dtype {inputs.dtype} for Fisher computation")
-                # Try converting to float and use diffusion loss
-                try:
-                    float_inputs = inputs.float()
-                    return self._compute_diffusion_loss_for_fisher(float_inputs, targets, task_name, device) # task_id replaced with task_name
-                except:
-                    return None
-                    
-        except Exception as e:
-            print(f"Error in task-specific loss computation: {str(e)}")
-            return None
-    
-    def _compute_ctm_loss_for_fisher(self, input_bytes: torch.Tensor, target_bytes: torch.Tensor,
-                                   task_name: str, device: torch.device) -> torch.Tensor: # task_id replaced with task_name
-        """
-        Compute CTM-based loss for Fisher Information when inputs are byte sequences.
-        
-        Args:
-            input_bytes: Input byte sequences
-            target_bytes: Target byte sequences (can be None)
-            task_name: Name of the task (used for logging or if model has task-specific heads not via task_id)
-            device: Device for computations
-            
-        Returns:
-            Loss tensor for Fisher computation
-        """
-        try:
-            # Use the model's main forward pass which handles byte sequences
-            if target_bytes is not None:
-                # If we have targets, use them for supervised loss
-                # The main forward method no longer takes task_name.
-                # If task_name is needed for specific head selection, that logic would be internal to forward
-                # or this method needs to be adapted if forward's behavior for 'ctm_only' changes.
-                output_dict = self.forward(
-                    byte_sequence=input_bytes,
-                    target_diffusion_output=target_bytes, # This might be an issue if mode='ctm_only' doesn't use it
-                    mode='ctm_only'
-                )
-                output = output_dict.get('final_output') # Assuming 'final_output' is the CTM's prediction
-                if output is None:
-                    print(f"Error: 'final_output' not found in self.forward output during _compute_ctm_loss_for_fisher for task {task_name}")
-                    return None
-                
-                # Compute loss based on the output type
-                if output.dtype == torch.long:
-                    # Classification/discrete output
-                    if target_bytes.dim() > 1:
-                        target_bytes = target_bytes.view(-1)
-                    if output.dim() > 2:
-                        output = output.view(-1, output.size(-1))
-                    loss = F.cross_entropy(output, target_bytes, ignore_index=-1)
-                else:
-                    # Continuous output
-                    loss = F.mse_loss(output, target_bytes.float())
-            else:
-                # No targets available - use self-supervised approach
-                # Use the model's internal loss computation
-                try:
-                    # Try using get_loss_with_ctm_guidance if available
-                    if hasattr(self, 'get_loss_with_ctm_guidance'): # get_loss_with_ctm_guidance takes task_id, this needs update if kept
-                        # This path might be problematic as get_loss_with_ctm_guidance expects task_id
-                        # For now, assuming it's not the primary path or will be adapted.
-                        # If task_id is essential here, it needs to be derived from task_name.
-                        # For simplicity, let's assume this path is less critical or task_id is not strictly needed for it.
-                        print(f"Warning: get_loss_with_ctm_guidance in _compute_ctm_loss_for_fisher might need task_id adaptation for task {task_name}")
-                        # Placeholder: use a default task_id or skip if task_id is crucial and not derivable.
-                        # For now, let's assume it can proceed without explicit task_id or uses a default.
-                        x_start = self._convert_bytes_to_diffusion_input(input_bytes)
-                        # If get_loss_with_ctm_guidance is kept, it needs to be callable without task_id or with task_name
-                        # For now, let's assume it can be called with a default task_id=0 if task_name is not directly usable.
-                        loss, _ = self.get_loss_with_ctm_guidance(x_start, 0) # Using default task_id 0
-                    else:
-                        # Fallback: use reconstruction loss
-                        output_dict_rec = self.forward(input_bytes, mode='ctm_only')
-                        output_rec = output_dict_rec.get('final_output')
-                        if output_rec is None: return None
-                        # Self-reconstruction loss
-                        loss = F.mse_loss(output_rec.float(), input_bytes.float()) # Assuming input_bytes are suitable targets
-                except Exception as e_ssl:
-                    print(f"Error in self-supervised CTM loss for Fisher for task {task_name}: {e_ssl}")
-                    # Final fallback: simple forward pass output mean (less ideal)
-                    output_dict_ff = self.forward(input_bytes, mode='ctm_only')
-                    output_ff = output_dict_ff.get('final_output')
-                    if output_ff is None: return None
-                    loss = output_ff.mean()
-            
-            return loss
-            
-        except Exception as e:
-            print(f"Error in CTM loss computation for Fisher: {str(e)}")
-            return None
-    
-    def _compute_diffusion_loss_for_fisher(self, x_start: torch.Tensor, targets: torch.Tensor,
-                                         task_name: str, device: torch.device) -> torch.Tensor: # task_id replaced with task_name
-        """
-        Compute diffusion-based loss for Fisher Information when inputs are continuous data.
-        
-        Args:
-            x_start: Clean input data for diffusion
-            targets: Target data (can be None) - typically noise for diffusion loss.
-            task_name: Name of the task (used for logging or if model has task-specific heads)
-            device: Device for computations
-            
-        Returns:
-            Loss tensor for Fisher computation
-        """
-        try:
-            # Generate random timesteps for diffusion
-            batch_size = x_start.size(0)
-            timesteps = torch.randint(0, self.config.diffusion_steps, (batch_size,), device=device)
-            
-            # Generate noise
-            noise = torch.randn_like(x_start) # This is the typical target for noise prediction models
-            
-            # Add noise to clean data
-            noisy_x = self.diffusion.add_noise(x_start, noise, timesteps) # Use self.diffusion (instance of CTMControlledDiffusionProcessor)
-            
-            # Get model prediction
-            try:
-                # CTMControlledDiffusionProcessor.forward does not take task_embedding or task_id anymore.
-                # It might take ctm_data if conditioning is still desired.
-                # For Fisher on general params, we want the model's output based on noisy_x and timesteps.
-                # If CTM guidance is part of the loss, ctm_data needs to be constructed.
-                # For simplicity, let's assume a basic diffusion pass for Fisher.
-                # The `diffusion` attribute is an instance of CTMControlledDiffusionProcessor.
-                predicted_noise_or_x0 = self.diffusion( # Call the forward method of the diffusion processor
-                    noisy_input=noisy_x,
-                    timestep=timesteps
-                    # ctm_data could be passed here if needed for conditioning during Fisher.
-                    # If not, the diffusion processor should handle ctm_data=None.
-                )
-                # The CTMControlledDiffusionProcessor.forward returns the predicted noise (or x0 depending on its internal config)
-                # Assuming it predicts noise (epsilon)
-                # If targets for this function are meant to be the noise, then use that.
-                # If targets are None or x_start, then the loss is against the generated `noise`.
-                
-                # The original code used F.mse_loss(predicted_noise, noise)
-                # Let's stick to that, assuming predicted_noise_or_x0 is indeed the predicted noise.
-                # If self.diffusion.scheduler.config.prediction_type is "sample", then target is x_start.
-                # For Fisher, we need a consistent target. Usually, it's the noise.
-                
-                # Check if diffusion processor itself has a scheduler and prediction_type
-                # to be consistent with main forward pass logic.
-                # This part is complex as it depends on how self.diffusion (CTMControlledDiffusionProcessor)
-                # is structured and what its forward method returns.
-                # The CTMControlledDiffusionProcessor's forward returns the predicted noise.
-                loss = F.mse_loss(predicted_noise_or_x0, noise)
-
-                
-                if isinstance(predicted_noise, dict):
-                    predicted_noise = predicted_noise.get('final_output', predicted_noise.get('output'))
-                
-                # Compute noise prediction loss
-                loss = F.mse_loss(predicted_noise, noise)
-                
-            except Exception as e_diff_pred:
-                print(f"Error during diffusion prediction for Fisher task {task_name}: {e_diff_pred}")
-                # Fallback: use main forward method if direct diffusion_processor call fails
-                # This requires main forward to be set to a diffusion mode.
-                try:
-                    # The main forward might be too complex for a simple Fisher loss.
-                    # A direct MSE loss on noisy vs clean might be a simpler fallback if above fails.
-                    print(f"Falling back to MSE loss between noisy_x and x_start for Fisher on task {task_name}")
-                    loss = F.mse_loss(noisy_x, x_start)
-                except Exception as e_fallback:
-                    print(f"Error in fallback diffusion loss for Fisher task {task_name}: {e_fallback}")
-                    loss = torch.mean(torch.abs(noisy_x - x_start)) # Absolute last resort
-            
-            return loss
-            
-        except Exception as e:
-            print(f"Error in diffusion loss computation for Fisher: {str(e)}")
-            return None
-    
-    def _convert_bytes_to_diffusion_input(self, byte_sequences: torch.Tensor) -> torch.Tensor:
-        """
-        Convert byte sequences to appropriate input format for diffusion model.
-        
-        This is a simplified conversion - in practice, you might need more
-        sophisticated conversion based on your specific data pipeline.
-        
-        Args:
-            byte_sequences: Input byte sequences
-            
-        Returns:
-            Tensor suitable for diffusion processing
-        """
-        try:
-            # Simple approach: normalize byte values to [-1, 1] range
-            normalized = (byte_sequences.float() / 127.5) - 1.0
-            
-            # If the sequences are 1D, add a channel dimension
-            if normalized.dim() == 2:
-                normalized = normalized.unsqueeze(1)
-            
-            return normalized
-            
-        except Exception as e:
-            print(f"Error converting bytes to diffusion input: {str(e)}")
-            # Fallback: just convert to float
-            return byte_sequences.float()
-
-    def ewc_loss(self, current_inferred_task_latent: Optional[torch.Tensor] = None) -> torch.Tensor:
-        total_ewc_loss = torch.tensor(0.0, device=next(self.parameters()).device)
-        if not self.ewc_fisher_information or not self.config.use_ewc: # Check config flag
-            return total_ewc_loss
-
-        current_task_key = self._get_task_key_from_latent(current_inferred_task_latent)
-
-        for prev_task_key, task_fisher_params_dict in self.ewc_fisher_information.items():
-            # If a current_task_key is derived and matches a previous task key,
-            # skip EWC for this previous task unless ewc_on_current_task_finetune is True.
-            if current_task_key is not None and prev_task_key == current_task_key and \
-               not getattr(self.config, 'ewc_on_current_task_finetune', False):
-                # print(f"Skipping EWC for task key {prev_task_key} as it matches current task's latent-derived key.")
-                continue
-
-            task_optimal_params_dict = self.ewc_optimal_params.get(prev_task_key)
-            if task_fisher_params_dict and task_optimal_params_dict:
-                for param_name, param_instance in self.named_parameters():
-                    if param_instance.requires_grad:
-                        if param_name in task_optimal_params_dict and param_name in task_fisher_params_dict:
-                            optimal_param_val = task_optimal_params_dict[param_name]
-                            fisher_importance_val = task_fisher_params_dict[param_name]
-                            total_ewc_loss += (fisher_importance_val * (param_instance - optimal_param_val).pow(2)).sum()
-        
-        return self.config.ewc_lambda * total_ewc_loss / 2.0 # Original had /2, keeping it
-
-    # --- Memory Replay Methods ---
-    def add_to_memory_bank(self,
-                             input_bytes: torch.Tensor,
-                             target_diffusion_output: Optional[torch.Tensor], # Renamed from target_bytes to match call
-                             inferred_task_latent: Optional[torch.Tensor],    # Made Optional
-                             hipa_control_signal: Optional[torch.Tensor],   # Added
-                             task_key: Any,                                 # Added
-                             metadata: Dict):                               # Added (from call)
-        """Adds an experience to the memory bank with its inferred task latent and other relevant info."""
-        if not self.config.use_memory_replay:
-            return
-
-        # Detach and move to CPU to save GPU memory
-        # Use metadata from the call, augmented with timestamp and access_count if not present.
-        stored_metadata = metadata.copy()
-        stored_metadata.setdefault('timestamp', time.time())
-        stored_metadata.setdefault('access_count', 0)
-        # stored_metadata['task_key_from_call_site'] = task_key # Optionally store task_key within metadata too
-
-        experience = (
-            input_bytes.detach().cpu(),
-            target_diffusion_output.detach().cpu() if target_diffusion_output is not None else None,
-            inferred_task_latent.detach().cpu() if inferred_task_latent is not None else None,
-            hipa_control_signal.detach().cpu() if hipa_control_signal is not None else None,
-            task_key,  # Store task_key as a separate element
-            stored_metadata
-        )
-        
-        self.memory_bank.append(experience) # self.memory_bank is List
-        self._manage_memory_intelligently()
-
-    # _calculate_importance_scores and _update_diversity_scores are removed for now.
-    # They were complex and task_name specific.
-    # Scoring for replay can be simplified or re-introduced later based on inferred_task_latent.
-
-    def _manage_memory_intelligently(self):
-        """
-        Manages the memory bank size.
-        The memory_bank is now a global list of tuples.
-        """
-        if not self.config.use_memory_replay:
-            return
-
-        if len(self.memory_bank) > self.config.memory_bank_size:
-            num_to_evict = len(self.memory_bank) - self.config.memory_bank_size
-            
-            strategy = self.config.replay_buffer_strategy
-            if strategy == 'fifo':
-                self.memory_bank = self.memory_bank[num_to_evict:]
-            elif strategy == 'random':
-                for _ in range(num_to_evict):
-                    if not self.memory_bank: break # Should not happen if len > size
-                    evict_idx = random.randint(0, len(self.memory_bank) - 1)
-                    self.memory_bank.pop(evict_idx)
-            # Add more sophisticated strategies later if needed, e.g., based on latent clustering
-            # or by re-calculating a simplified composite score for eviction.
-            else: # Default to FIFO
-                self.memory_bank = self.memory_bank[num_to_evict:]
-            # print(f"Managed global memory bank. Size now: {len(self.memory_bank)}")
-
-    # _migrate_legacy_samples and _apply_temporal_decay are removed as they were
-    # tied to the old dict-based sample structure and task-specific logic.
-
-    def _calculate_composite_score_for_replay(self, sample_tuple: Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict],
-                                             current_inferred_task_latent: Optional[torch.Tensor] = None) -> float:
-        """
-        Calculates a composite score for a sample for prioritized replay.
-        The sample_tuple is (input_bytes, target_bytes, inferred_task_latent, metadata_dict).
-        `current_inferred_task_latent` can be used to prioritize similar latents.
-        """
-        _input_bytes, _target_bytes, sample_latent, _sample_hipa, _sample_task_key, metadata = sample_tuple
-        
-        # Access penalty: less accessed samples are preferred
-        access_count = metadata.get('access_count', 0)
-        # Lower access_count means higher score (less penalty)
-        access_score = 1.0 / (1.0 + access_count * getattr(self.config, 'replay_access_penalty_factor', 0.1))
-        
-        score = access_score # Base score
-
-        # Optional: Prioritize samples with similar inferred_task_latent to current context
-        if current_inferred_task_latent is not None and hasattr(self.config, 'replay_prioritize_latent_similarity') and self.config.replay_prioritize_latent_similarity:
-            try:
-                # Cosine similarity, ensure latents are on CPU and detached for numpy
-                sim = F.cosine_similarity(current_inferred_task_latent.cpu().detach().unsqueeze(0),
-                                          sample_latent.cpu().detach().unsqueeze(0))
-                similarity_score = (sim.item() + 1) / 2 # Normalize to 0-1
-                score += getattr(self.config, 'replay_latent_similarity_weight', 0.5) * similarity_score
-            except Exception: # Broad except for safety in scoring
-                pass # Ignore if similarity calculation fails
-
-        # Placeholder for diversity scoring based on latents (e.g. distance to other sampled latents in batch)
-        # This would require knowing other samples being considered for the batch.
-        return score
-
-    def get_replay_batch(self, current_batch_size: int, device: torch.device,
-                         current_inferred_task_latent: Optional[torch.Tensor] = None) \
-                         -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
-        """
-        Samples a batch of experiences from the global memory bank for replay.
-        Returns (replayed_inputs, replayed_targets, replayed_inferred_task_latents).
-        `current_inferred_task_latent` can be used for prioritized sampling.
-        """
-        if not self.config.use_memory_replay or not self.memory_bank:
-            return None
-
-        num_to_sample = min(current_batch_size, len(self.memory_bank))
-        if num_to_sample == 0:
-            return None
-
-        chosen_samples_tuples: List[Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict]]
-        
-        strategy = self.config.replay_buffer_strategy
-        
-        if strategy == 'uniform_random' or strategy == 'fifo': # FIFO for sampling is like uniform from recent
-            chosen_indices = np.random.choice(len(self.memory_bank), num_to_sample, replace=False)
-            chosen_samples_tuples = [self.memory_bank[i] for i in chosen_indices]
-        elif strategy == 'prioritized_composite':
-            sample_weights = np.array([self._calculate_composite_score_for_replay(s, current_inferred_task_latent) for s in self.memory_bank])
-            sample_weights = np.maximum(sample_weights, 1e-6) # Ensure positive
-            if sample_weights.sum() == 0: # Fallback if all scores are zero
-                chosen_indices = np.random.choice(len(self.memory_bank), num_to_sample, replace=False)
-            else:
-                sample_weights /= sample_weights.sum() # Normalize
-                try:
-                    chosen_indices = np.random.choice(len(self.memory_bank), num_to_sample, replace=False, p=sample_weights)
-                except ValueError: # Fallback if weights are problematic
-                    chosen_indices = np.random.choice(len(self.memory_bank), num_to_sample, replace=False)
-            chosen_samples_tuples = [self.memory_bank[i] for i in chosen_indices]
-        else: # Default to uniform random
-            chosen_indices = np.random.choice(len(self.memory_bank), num_to_sample, replace=False)
-            chosen_samples_tuples = [self.memory_bank[i] for i in chosen_indices]
-
-        replay_inputs_cpu, replay_targets_cpu_list, replay_latents_cpu = [], [], []
-        
-        for sample_tuple in chosen_samples_tuples:
-            inp_cpu, target_cpu, latent_cpu, _hipa_signal_cpu, _task_key_cpu, metadata = sample_tuple
-            replay_inputs_cpu.append(inp_cpu)
-            replay_targets_cpu_list.append(target_cpu) # List of Tensors or Nones
-            replay_latents_cpu.append(latent_cpu)
-            
-            # Update access tracking for the chosen samples
-            metadata['access_count'] = metadata.get('access_count', 0) + 1
-            metadata['last_accessed'] = time.time()
-        
-        if not replay_inputs_cpu:
-            return None
-
-        final_replay_inputs = torch.stack(replay_inputs_cpu).to(device)
-        final_replay_latents = torch.stack(replay_latents_cpu).to(device)
-        
-        final_replay_targets: Optional[torch.Tensor] = None
-        # Process targets: stack if all are tensors and shapes match, else handle appropriately
-        if any(t is not None for t in replay_targets_cpu_list):
-            stackable_targets_gpu = [t.to(device) for t in replay_targets_cpu_list if t is not None]
-            if stackable_targets_gpu:
-                try:
-                    # Check if all stackable targets have the same shape
-                    first_shape = stackable_targets_gpu[0].shape
-                    if all(t.shape == first_shape for t in stackable_targets_gpu):
-                        final_replay_targets = torch.stack(stackable_targets_gpu)
-                    else:
-                        print("Warning: Replay targets have mismatching shapes among non-None items. Targets cannot be stacked for this batch.")
-                        # Decide behavior: return None for targets, or list of tensors, or error
-                        # For now, setting to None if unstackable. Loss fn needs to handle this.
-                        final_replay_targets = None
-                except Exception as e_stack_replay:
-                    print(f"Warning: Could not stack replay targets: {e_stack_replay}. Targets set to None for this batch.")
-                    final_replay_targets = None
-        # If all targets in replay_targets_cpu_list were None, final_replay_targets remains None.
-        
-        return final_replay_inputs, final_replay_targets, final_replay_latents
-
-    def end_of_task_segment_training(self, dataloader_for_fisher: torch.utils.data.DataLoader,
-                                     representative_latent_for_segment: torch.Tensor,
-                                     device: torch.device):
-        """
-        Call this after training on a segment of data characterized by a representative latent.
-        This replaces 'end_of_task_training'.
-        """
-        if not self.config.use_ewc:
-            return
-        print(f"Ending training segment for latent-derived key. Computing Fisher information.")
-        self._compute_fisher_information(dataloader_for_fisher, representative_latent_for_segment, device)
-        task_key = self._get_task_key_from_latent(representative_latent_for_segment)
-        print(f"Fisher information computed and optimal parameters stored for task key: {task_key}.")
 
     def compute_features(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -5240,71 +4544,6 @@ class EnhancedCTMDiffusion(nn.Module):
         else:
             losses['diffusion_loss'] = torch.tensor(0.0, device=byte_sequence.device)
 
-        # --- EWC Loss (Continual Learning) ---
-        ewc_loss = torch.tensor(0.0, device=byte_sequence.device)
-        if self.training and self.config.ewc_lambda > 0 and self.ewc_fisher_information and self.ewc_optimal_params:
-            # task_name is now available from the forward method's arguments.
-            # If task_name is None during this forward call, the skip logic for current task won't apply,
-            # and EWC will penalize based on all stored previous tasks. This might be acceptable if
-            # EWC loss is primarily for when task_name is explicitly known (e.g. during task-specific fine-tuning).
-            for prev_task_name_key, task_fisher_params_dict in self.ewc_fisher_information.items():
-                # The task_name parameter in forward() is the current task.
-                # prev_task_name_key is a task from the EWC memory.
-                if task_name is not None and prev_task_name_key == task_name and \
-                   not getattr(self.config, 'ewc_on_current_task_finetune', False):
-                    continue # Skip penalizing the current task unless specified in config
-
-                task_optimal_params_dict = self.ewc_optimal_params.get(prev_task_name_key)
-                if task_fisher_params_dict and task_optimal_params_dict:
-                    for param_name, param_instance in self.named_parameters():
-                        if param_instance.requires_grad:
-                            if param_name in task_optimal_params_dict and param_name in task_fisher_params_dict:
-                                optimal_param_val = task_optimal_params_dict[param_name]
-                                fisher_importance_val = task_fisher_params_dict[param_name]
-                                ewc_loss += (fisher_importance_val * (param_instance - optimal_param_val).pow(2)).sum()
-            ewc_loss *= (self.config.ewc_lambda / 2)
-        losses['ewc_loss'] = ewc_loss
-        
-        # --- Episodic Memory / Replay (Conceptual) ---
-        if self.training and hasattr(self, 'memory_bank'): # Removed len(self.memory_bank) > 0 check as defaultdict handles init
-            # In self-supervised mode, task_name is not explicitly passed to forward.
-            # Storing experiences with a default key. The third element in the tuple
-            # is a placeholder for what was previously the task_name.
-            default_memory_key = "_self_supervised_data_" # This string might be used in metadata
-
-            # Create a compatible experience tuple for the list-based memory_bank
-            # Placeholders are used as this block is conceptual and lacks full context for all tuple elements.
-            placeholder_inferred_latent = None
-            placeholder_hipa_signal = None
-            conceptual_metadata = {
-                'type': 'conceptual_self_supervised',
-                'original_key_info': default_memory_key, # Store the original string info in metadata
-                'timestamp': time.time(), # Consistent with add_to_memory_bank's metadata
-                'access_count': 0         # Consistent with add_to_memory_bank's metadata
-            }
-            experience_to_store = (
-                byte_sequence.detach().cpu(),
-                target_diffusion_output.detach().cpu() if target_diffusion_output is not None else None,
-                placeholder_inferred_latent,
-                placeholder_hipa_signal,
-                conceptual_metadata
-            )
-            self.memory_bank.append(experience_to_store) # Corrected to append to the list
-            
-            # Conceptual: Sample from memory bank and calculate replay loss
-            # replay_batch_size = self.config.get('replay_batch_size', batch_size)
-            # if self.memory_bank.can_sample(replay_batch_size):
-            #     replayed_data = self.memory_bank.sample(replay_batch_size, device=byte_sequence.device)
-            #     if replayed_data:
-            #         # replayed_data would be a dict like {"byte_sequence": ..., "task_name": ..., "target": ...}
-            #         # Need to call forward pass again for this replayed batch.
-            #         # This can get complex if tasks are heterogeneous.
-            #         # For simplicity, assume replayed loss is handled by a separate call or integrated carefully.
-            #         # replay_loss, _ = self.forward(replayed_data["byte_sequence"],
-            #         #                               replayed_data["task_name"],
-            #         #                               replayed_data["target"])
-            #         # losses['replay_loss'] = replay_loss * self.config.get('replay_loss_weight', 1.0)
-            pass # Placeholder for actual replay loss calculation
 
         total_loss = torch.tensor(0.0, device=byte_sequence.device)
         for loss_name, loss_val in losses.items():
@@ -5368,9 +4607,6 @@ class EnhancedCTMDiffusion(nn.Module):
         # If MCMC ran, its expectation is preferred, otherwise direct CTM output.
         final_ctm_representation = mcmc_expectation if mcmc_expectation is not None else theta_candidate_from_ctm
 
-        # --- Update Knowledge Store ---
-        if ctm_data and self.knowledge_store:
-            self._update_knowledge_store(ctm_data)
 
         # --- 3. Mode-Specific Outputs & Diffusion ---
         if mode == 'ctm_only':
@@ -5549,61 +4785,11 @@ class EnhancedCTMDiffusion(nn.Module):
         # Update the total loss in output_dict
         output_dict['total_loss'] = total_loss_combined
         
-        # EWC Loss integration
-        # The variable `inferred_task_latent` here refers to `current_inferred_latent` from the call to `_prepare_input_features`.
-        # The variable `hipa_control_signal` here refers to `current_hipa_signal` from the call to `_prepare_input_features`.
-        if self.training and self.config.use_ewc:
-            ewc_val = self.ewc_loss(current_inferred_task_latent=current_inferred_latent) # Uses current_inferred_latent
-            output_dict['ewc_loss'] = ewc_val
-            # output_dict['total_loss'] will be updated at the end to include this
-        else:
-            output_dict['ewc_loss'] = torch.tensor(0.0, device=device)
-        
-        # Memory Replay integration
-        if self.training and self.config.use_memory_replay:
-            task_key_for_memory = task_name # Use provided task_name if available
-            if task_key_for_memory is None and current_inferred_latent is not None:
-                 # Derive task key from current batch's inferred latent if task_name not given
-                 # Using a more robust hashing for the key
-                 rounded_latent_bytes = (torch.round(current_inferred_latent.detach().cpu() * 10000) / 10000).numpy().tobytes()
-                 task_key_for_memory = hashlib.sha256(rounded_latent_bytes).hexdigest()[:16]
-            elif task_key_for_memory is None: # Fallback if no task_name and no latent
-                 task_key_for_memory = "unknown_task_no_latent"
-
-            self.add_to_memory_bank(
-                input_bytes=byte_sequence,
-                target_diffusion_output=target_diffusion_output,
-                inferred_task_latent=current_inferred_latent, # Uses current_inferred_latent
-                hipa_control_signal=current_hipa_signal,     # Uses current_hipa_signal
-                task_key=task_key_for_memory,
-                metadata={'epoch': current_epoch, 'batch': current_batch, 'original_task_name_param': task_name}
-            )
-
-            if len(self.memory_bank) >= self.config.replay_start_threshold and batch_size > 0 :
-                replay_loss_val = self._calculate_replay_loss(
-                    current_batch_size=batch_size,
-                    device=device,
-                    current_inferred_task_latent=current_inferred_latent, # Pass current batch's latent as context
-                    current_hipa_signal=current_hipa_signal         # Pass current batch's HIPA as context
-                )
-                output_dict['replay_loss'] = replay_loss_val
-                # output_dict['total_loss'] will be updated at the end to include this
-            else:
-                output_dict['replay_loss'] = torch.tensor(0.0, device=device)
-        else:
-            output_dict['replay_loss'] = torch.tensor(0.0, device=device)
-
-        # Update the 'losses' dictionary (used for the first part of loss aggregation)
-        if 'ewc_loss' in output_dict: losses['ewc_loss'] = output_dict['ewc_loss']
-        if 'replay_loss' in output_dict: losses['replay_loss'] = output_dict['replay_loss']
-        
         # Re-aggregate total_loss in output_dict to include all components
         # Start with diffusion_loss which should be in output_dict from earlier processing
         current_total_loss = output_dict.get('diffusion_loss', torch.tensor(0.0, device=device))
         current_total_loss += output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device))
         current_total_loss += output_dict.get('mcmc_loss', torch.tensor(0.0, device=device))
-        current_total_loss += output_dict.get('ewc_loss', torch.tensor(0.0, device=device))
-        current_total_loss += self.config.replay_lambda * output_dict.get('replay_loss', torch.tensor(0.0, device=device))
         
         output_dict['total_loss'] = current_total_loss
 
@@ -5771,11 +4957,6 @@ class EnhancedCTMDiffusion(nn.Module):
         for al_val in additional_losses.values():
             if torch.is_tensor(al_val): total_loss += al_val.mean()
         
-        # EWC loss using the provided inferred_task_latent
-        if self.config.use_ewc:
-            ewc_val = self.ewc_loss(current_inferred_task_latent=inferred_task_latent)
-            additional_losses['ewc_loss'] = ewc_val
-            total_loss += ewc_val
 
         return total_loss, {
             'diffusion_loss': diffusion_loss,
@@ -6109,47 +5290,6 @@ class EnhancedCTMDiffusion(nn.Module):
         return benchmark_results
 
 
-    def _update_knowledge_store(self, ctm_data: Dict[str, torch.Tensor]):
-        """
-        Observes CTM internal states and populates the Neo4j knowledge store.
-        """
-        if not self.knowledge_store or not self.config.use_knowledge_store:
-            return
-
-        try:
-            if 'final_sync_out' in ctm_data:
-                sync_data = ctm_data['final_sync_out']
-                if sync_data.numel() > 0:
-                    avg_sync = sync_data.mean().item()
-                    
-                    sync_level_label = "high_sync" if avg_sync > 0.5 else "low_sync"
-
-                    # Create nodes and the base relationship in Neo4j
-                    # These calls are now idempotent Cypher queries.
-                    self.knowledge_store.get_or_add_thing("ctm_state")
-                    self.knowledge_store.get_or_add_thing("has_pattern")
-                    self.knowledge_store.get_or_add_thing(sync_level_label)
-                    
-                    base_relationship = self.knowledge_store.add_statement(
-                        "ctm_state", "has_pattern", sync_level_label
-                    )
-
-                    # Add a conditional relationship (clause) if sync is very high
-                    if avg_sync > 0.75 and base_relationship.element_id:
-                        # Use the new action module to record the outcome
-                        action_outcome_relationship = self.knowledge_store.add_action_outcome(
-                            action_label="take_action_A",
-                            outcome_label="reward",
-                            valence="positive"
-                        )
-
-                        # Link the base relationship to this action outcome conditionally
-                        if action_outcome_relationship.element_id:
-                            self.knowledge_store.add_clause(
-                                base_relationship, "if", action_outcome_relationship
-                            )
-        except Exception as e:
-            print(f"Warning: Failed to update knowledge store: {e}")
 
 
 # Configuration helpers

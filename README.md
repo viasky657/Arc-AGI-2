@@ -9,6 +9,40 @@ Workspace - CTM -
 
 Models Folder - ctm_Diffusion_NEWNEW_.py file
 
+An exmaple of a single train step for the Diffusion_NEWNEW file that may be inserted into the file:
+    def train_step(self, byte_sequence: torch.Tensor, target_diffusion_output: torch.Tensor,
+                   optimizer: torch.optim.Optimizer, target_mcmc_output: Optional[torch.Tensor] = None
+                   ) -> Dict[str, float]:
+        """
+        Performs a single training step, including forward pass, loss calculation, and backward pass.
+        """
+        self.train()
+        optimizer.zero_grad()
+
+        # Forward pass through the model
+        output_dict = self.forward(
+            byte_sequence=byte_sequence,
+            target_diffusion_output=target_diffusion_output,
+            mode='ctm_controlled_diffusion',
+            timestep=torch.randint(0, self.config.diffusion_steps, (byte_sequence.size(0),), device=byte_sequence.device),
+            target_mcmc_output=target_mcmc_output
+        )
+
+        total_loss = output_dict.get('total_loss')
+
+        if total_loss is not None and torch.is_tensor(total_loss):
+            # Backward pass and optimization
+            if self.config.mixed_precision:
+                self.backward_with_mixed_precision(total_loss, optimizer)
+                self.optimizer_step_with_mixed_precision(optimizer)
+            else:
+                total_loss.backward()
+                optimizer.step()
+
+        # Return loss values for logging
+        loss_metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in output_dict.items() if 'loss' in k}
+        return loss_metrics
+
 Contains the core Contineous Thought Model with the Contineous Thought Model's X Thought Vector variable (attention, nueral activations, synapse pattern, spatial timing of nueral activations, etc.) being fed into the Integrated Diffusion model to control its generation and output.
 Contains the Integrated Diffusion components that use the variable X to generate any task output simultaneously with spatial and time understanding with optional convolutional layers included (text, audio, model aniimation, etc.)
 Contains the internal MCMC layers components which refine the CTM and Diffusion output with a higher quality learning signal and teach it to reason better.
