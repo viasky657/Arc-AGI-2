@@ -181,6 +181,13 @@ class UKS:
         result = tx.run(query, action_label=action_label, outcome_label=outcome_label, weight=weight)
         return result.single()
 
+    def add_principle_alignment(self, action_label: str, principle_label: str, weight: float = 0.5):
+        """
+        Log that an action aligns with a principle.
+        This is a helper method that calls add_action_outcome.
+        """
+        return self.add_action_outcome(action_label, f"Follows_{principle_label}", valence="positive", weight=weight)
+
     def find_outcomes_for_state(self, state_label: str) -> list[dict]:
         """
         Queries the graph to find actions and outcomes conditionally linked to a given state.
