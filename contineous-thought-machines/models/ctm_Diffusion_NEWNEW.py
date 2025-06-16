@@ -27,7 +27,7 @@ import threading
 from typing import TYPE_CHECKING # For type hinting TaskAnalyzer
 
 if TYPE_CHECKING:
-    from .utils import TaskAnalyzer # Placeholder: Actual import path for TaskAnalyzer might differ
+    from .utils import TaskAnalyzer 
 import random
 import copy # For JEPA target encoder deepcopy
 from concurrent.futures import ThreadPoolExecutor
