@@ -17,6 +17,10 @@ accelerate==1.7.0
 xformers==0.0.30
 
 
+# Machine Learning Utilities
+scikit-learn==1.5.0
+
+
 # Hugging Face Transformers and Datasets
 transformers==4.52.4
 datasets==2.14.5
@@ -27,3 +31,6 @@ nvidia-tensorrt==99.0.0
 
 # Database drivers
 neo4j==5.20.0
+
+# External APIs
+openrouter-api==0.1.0
