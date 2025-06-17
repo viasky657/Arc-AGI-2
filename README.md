@@ -83,3 +83,4 @@ The ctm model takes in the input through a binary encoder and then turns the bin
 New Nueral Synapse System Options inspired by Biology and Nuerology
 | Method | Correlation with Targets | Diversity Score | Computational Overhead | 
 | Random | 0.12 ± 0.03 | 0.85 ± 0.05 | 1x (baseline) | (Legacy Baseline) | Hebbian | 0.34 ± 0.06 | 0.78 ± 0.04 | 1.2x | | Plasticity | 0.28 ± 0.05 | 0.82 ± 0.03 | 1.1x | | Competitive | 0.31 ± 0.04 | 0.71 ± 0.06 | 1.3x | | Homeostatic | 0.26 ± 0.04 | 0.88 ± 0.02 | 1.2x | | Evolutionary | 0.33 ± 0.07 | 0.75 ± 0.05 | 1.4x | | Multi-objective | 0.36 ± 0.05 | 0.80 ± 0.03 | 1.5x |
+

@@ -8,6 +8,7 @@ It includes mechanisms for:
 - An interaction loop for training a student model with a teacher agent.
 """
 
+import os
 # Assume these classes are defined elsewhere and imported.
 # from .knowledge_store import UniversalKnowledgeStore as UKS
 # from .student_model import StudentModel
@@ -27,12 +28,14 @@ class PrinciplesAndEmpathyTrainer:
         """
         Adds a set of moral/social principles to the knowledge graph.
         """
-        principles = [
-            "BeKind",
-            "RespectAutonomy",
-            "DoNotHarm",
-            "BeRespectful"
-        ]
+        # Correctly locate the principles.txt file relative to the current script.
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        principles_path = os.path.join(dir_path, 'Principles', 'principles.txt')
+
+        with open(principles_path, 'r') as f:
+            # Read lines, strip whitespace, and filter out empty lines.
+            principles = [line.strip() for line in f if line.strip()]
+        
         for p_label in principles:
             # Using MERGE to avoid duplicates
             self.uks.graph.run("MERGE (p:Thing:Principle {label: $label})", label=p_label)
