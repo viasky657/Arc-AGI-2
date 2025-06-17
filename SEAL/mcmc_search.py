@@ -162,18 +162,26 @@ class JudgedNeuralSurrogate(SurrogateValueFunction):
         self.internal_surrogate = NeuralSurrogate()
         self.error_history = []
         self.call_judge_prob = 1.0  # Start by always calling the judge
+        self.judge_disabled = False
+        self.consecutive_high_scores = 0
+        self.high_score_threshold = 0.8
+        self.consecutive_count_for_disable = 5
 
     def predict(self, state: str) -> float:
         """
         Dynamically decides whether to use the internal model or call the
         expensive external judge.
         """
+        if self.judge_disabled:
+            return self.internal_surrogate.predict(state)
+
         if random.random() < self.call_judge_prob:
             # Make the expensive call to the external judge
             true_score = self.judge.evaluate(state)
             # Use this opportunity to train our internal model
             self.internal_surrogate.update(state, true_score)
             self._update_judge_probability()
+            self._check_for_judge_removal(true_score)
             return true_score
         else:
             # Use the cheap internal model's prediction
@@ -192,6 +200,20 @@ class JudgedNeuralSurrogate(SurrogateValueFunction):
         # Update the internal model
         self.internal_surrogate.update(state, true_reward)
         self._update_judge_probability()
+        self._check_for_judge_removal(true_reward)
+
+    def _check_for_judge_removal(self, true_score: float):
+        if self.judge_disabled:
+            return
+
+        if true_score >= self.high_score_threshold:
+            self.consecutive_high_scores += 1
+        else:
+            self.consecutive_high_scores = 0
+        
+        if self.consecutive_high_scores >= self.consecutive_count_for_disable:
+            self.judge_disabled = True
+            print("\n--- External Judge Disabled: Model has achieved consistent high performance. ---\n")
 
     def _update_judge_probability(self):
         """
