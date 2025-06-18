@@ -47,7 +47,7 @@ class FocalLoss(nn.Module):
 @dataclass
 class MCMCConfig:
     """Configuration for MCMC sampling parameters."""
-    num_chains: int = 20
+    num_chains: int = 3000
     chain_length: int = 8000
     burn_in: int = 200
     temperature_schedule: str = "adaptive"  # "geometric", "adaptive"
