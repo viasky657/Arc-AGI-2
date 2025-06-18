@@ -18,6 +18,13 @@ project_root = '/workspaces/Arc-AGI-2'
 # Define the path to the 'contineous-thought-machines' directory
 module_path = os.path.join(project_root, 'contineous-thought-machines')
 
+# A relative path for the evaluation data.
+evaluation_relative_path = "contineous-thought-machines/data/evaluation"
+# Get the absolute path for the evaluation data
+data_path = os.path.abspath(evaluation_relative_path)
+print(f"The relative evaluation path is: '{evaluation_relative_path}'")
+print(f"The absolute evaluation path is: '{data_path}'")
+
 if module_path not in sys.path:
     sys.path.append(module_path)
     print(f"Added to sys.path: {module_path}")
@@ -58,8 +65,8 @@ ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
 MAX_SEQUENCE_LENGTH = 8192
 PADDING_BYTE_VALUE = 0
 NUM_ARC_SYMBOLS = 10 # 0-9
-LEARNING_RATE = 1e-4
 ARC_OUTPUT_HEAD_DIM = ARC_INPUT_FLAT_DIM * NUM_ARC_SYMBOLS
+LEARNING_RATE = 1e-4
 
 # --- Your Provided Setup Code ---
 
@@ -78,45 +85,6 @@ def serialize_and_pad_grid(grid, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_
     if padding_len < 0:
         return byte_sequence[:max_len]
     return byte_sequence + bytes([pad_value] * padding_len)
-
-class NewCustomARCGridDataset(Dataset):
-    def __init__(self, data_dir, max_grid_size=MAX_GRID_SIZE, padding_value=PADDING_VALUE):
-        self.data_dir = data_dir
-        self.task_files = []
-        for root, _, files in os.walk(data_dir):
-            for file in files:
-                if file.endswith(".json"):
-                    self.task_files.append(os.path.join(root, file))
-        self.max_grid_size = max_grid_size
-        self.padding_value = padding_value
-        self.tasks = [json.load(open(f)) for f in self.task_files]
-        print(f"Loaded {len(self.tasks)} tasks from {data_dir} (recursively).")
-
-    def __len__(self):
-        return len(self.tasks)
-
-    def __getitem__(self, idx):
-        task_data = self.tasks[idx]
-        processed_task = {'train': [], 'test': [], 'id': os.path.basename(self.task_files[idx])}
-        for pair_type in ['train', 'test']:
-            for item in task_data.get(pair_type, []):
-                input_grid = item['input']
-                output_grid = item['output']
-                original_input_dims = (len(input_grid), len(input_grid[0]) if input_grid else 0)
-                original_output_dims = (len(output_grid), len(output_grid[0]) if output_grid else 0)
-                padded_input = pad_grid(input_grid, self.max_grid_size, self.padding_value)
-                padded_output = pad_grid(output_grid, self.max_grid_size, self.padding_value)
-                processed_task[pair_type].append({
-                    'input': torch.from_numpy(padded_input).long(),
-                    'output': torch.from_numpy(padded_output).long(),
-                    'original_input_dims': original_input_dims,
-                    'original_output_dims': original_output_dims
-                })
-        return processed_task
-
-def collate_fn_new_custom_arc_eval(batch_of_tasks):
-    # This simplified collate is for evaluation (batch size=1)
-    return batch_of_tasks[0]
 
 # Define EnhancedCTMConfig for ARC with EnhancedCTMDiffusion
 # Assuming EnhancedCTMConfig is a defined class and MAX_SEQUENCE_LENGTH is a defined variable
@@ -466,7 +434,7 @@ config_arc_diffusion = EnhancedCTMConfig(
     memory_threshold_high=0.85,
     memory_threshold_low=0.6,
     
-    # Smart Data Sampling Parameters
+    # Smart Data Sampling Parametersa
     enable_smart_sampling=True,
     sample_importance_weight=0.6,
     sample_diversity_weight=0.4,
@@ -516,12 +484,14 @@ if 'EnhancedCTMDiffusion' in globals() and EnhancedCTMDiffusion is not None:
     print(f"✓ ARC Output Head initialized (input_dim: {arc_output_head_input_dim}, output_dim: {ARC_OUTPUT_HEAD_DIM}).")
 
     # Handle external MCMC integration if enabled
-    if ENABLE_CTM_MCMC_INTEGRATION_FOR_ARC and enhanced_ctm_mcmc:
+    if 'enhanced_ctm_mcmc' in globals() and ENABLE_CTM_MCMC_INTEGRATION_FOR_ARC and enhanced_ctm_mcmc:
         # Ensure the external MCMC module's input_dim matches the new CTM's output
         if enhanced_ctm_mcmc.thought_network[0].in_features != config_arc_diffusion.output_dims[0]:
             print(f"Re-initializing external enhanced_ctm_mcmc for new input_dim {config_arc_diffusion.output_dims[0]}")
+            # This part of the code assumes 'EnhancedCTMFenchelYoungIntegration' and other related variables are defined.
+            # If not, this will raise an error, which is expected behavior if setup is wrong.
             enhanced_ctm_mcmc = EnhancedCTMFenchelYoungIntegration(
-                input_dim=config_arc_diffusion.output_dims[0], # Use output dim of CTM core
+                input_dim=config_arc_diffusion.output_dims[0],
                 output_space=arc_grid_output_space,
                 mcmc_config=MCMC_CONFIG_ARC,
                 use_large_neighborhood_search=True,
@@ -530,43 +500,42 @@ if 'EnhancedCTMDiffusion' in globals() and EnhancedCTMDiffusion is not None:
             )
         ctm_mcmc_integration_arc = enhanced_ctm_mcmc.to(device) if enhanced_ctm_mcmc else None
         print(f"✓ External MCMC Integration for ARC is {'enabled' if ctm_mcmc_integration_arc else 'FAILED to enable'}.")
-    
-    if ACCELERATE_AVAILABLE:
-        accelerator_arc = Accelerator()
-        models_to_prepare = [ctm_model_arc] # Start with the main model
-        if arc_output_head: models_to_prepare.append(arc_output_head)
-        if 'ctm_mcmc_integration_arc' in locals() and ctm_mcmc_integration_arc:
-             models_to_prepare.append(ctm_mcmc_integration_arc)
-        
-        # Prepare models for evaluation, optimizer is not needed.
-        prepared_models_tuple = accelerator_arc.prepare(*models_to_prepare)
-        
-        ctm_model_arc = prepared_models_tuple[0]
-        model_idx = 1
-        if arc_output_head:
-            arc_output_head = prepared_models_tuple[model_idx]
-            model_idx +=1
-        if 'ctm_mcmc_integration_arc' in locals() and ctm_mcmc_integration_arc:
-            ctm_mcmc_integration_arc = prepared_models_tuple[model_idx]
-        print("✓ ARC models (EnhancedCTMDiffusion) prepared with Accelerate.")
-else:
-    print("⚠️ EnhancedCTMDiffusion model or its config for ARC-AGI-2 could not be initialized. Check imports.")
+    else:
+        ctm_mcmc_integration_arc = None
 
-# --- Model and Dataloader Initialization ---
-print("--- Initializing Models for Evaluation ---")
-ctm_model_arc = None
-arc_output_head = None
-if EnhancedCTMDiffusion:
-    ctm_model_arc = EnhancedCTMDiffusion(config=config_arc_diffusion)
-    arc_output_head = nn.Linear(config_arc_diffusion.output_dims[0], ARC_INPUT_FLAT_DIM * NUM_ARC_SYMBOLS)
-    print("✓ Real models instantiated.")
-    # Move models to the correct device immediately after instantiation
-    ctm_model_arc.to(device)
-    arc_output_head.to(device)
+    arc_trainable_params = list(ctm_model_arc.parameters())
+    if arc_output_head:
+        arc_trainable_params.extend(list(arc_output_head.parameters()))
+    if ctm_mcmc_integration_arc:
+        arc_trainable_params.extend(list(ctm_mcmc_integration_arc.parameters()))
+
+    optimizer_arc = optim.AdamW([p for p in arc_trainable_params if p.requires_grad], lr=LEARNING_RATE, weight_decay=1e-4)
+
+    if ACCELERATE_AVAILABLE:
+        print(" -> Preparing components with Hugging Face Accelerate...")
+        accelerator_arc = Accelerator()
+        components_to_prepare = [ctm_model_arc, optimizer_arc]
+        if arc_output_head:
+            components_to_prepare.insert(1, arc_output_head)
+        if ctm_mcmc_integration_arc:
+            components_to_prepare.insert(2, ctm_mcmc_integration_arc)
+        
+        prepared_components = accelerator_arc.prepare(*components_to_prepare)
+        
+        # Unpack the prepared components carefully
+        ctm_model_arc = prepared_components[0]
+        next_idx = 1
+        if arc_output_head:
+            arc_output_head = prepared_components[next_idx]
+            next_idx += 1
+        if ctm_mcmc_integration_arc:
+            ctm_mcmc_integration_arc = prepared_components[next_idx]
+            next_idx += 1
+        optimizer_arc = prepared_components[next_idx]
+
+        print("✓ ARC models and optimizer prepared with Accelerate.")
 else:
-    print("FATAL: Cannot proceed without EnhancedCTMDiffusion class. The script cannot continue.")
-    # Using raise instead of exit() to avoid killing the kernel
-    raise ImportError("FATAL: Cannot proceed without EnhancedCTMDiffusion class.")
+    print("⚠️ Hugging Face Accelerate not available. Running on a single device.")
 
 def find_directory(start_path, dir_name):
     """Recursively finds a directory by name."""
@@ -577,28 +546,110 @@ def find_directory(start_path, dir_name):
             return found_path
     return None
 
+def find_file_directory(start_path, filename):
+    """Recursively finds a file and returns its directory."""
+    for root, _, files in os.walk(start_path):
+        if filename in files:
+            found_dir = os.path.abspath(root)
+            print(f"Found '{filename}' in directory: {found_dir}")
+            return found_dir
+    print(f"Warning: File '{filename}' not found starting from '{start_path}'.")
+    
 print("\n--- Searching for evaluation and checkpoint directories ---")
 # Path to ARC evaluation tasks
-ARC_EVAL_DIR_SEARCHED = find_directory(".", "evaluation")
 # Path to CTM checkpoints
 CHECKPOINT_DIR_ARC_SEARCHED = find_directory(".", "ctm_arc_agi_2_enhanced_diffusion")
 
-ARC_EVAL_DIR = ARC_EVAL_DIR_SEARCHED if ARC_EVAL_DIR_SEARCHED else "contineous-thought-machines/data/evaluation"
+# --- Search for the specific evaluation file to determine the data directory ---
+evaluation_filename = "16b78196.json"
+dynamic_eval_dir = find_file_directory(".", evaluation_filename)
+
+if dynamic_eval_dir:
+    print(f"-> Evaluation directory dynamically set to: '{dynamic_eval_dir}'")
+    ARC_EVAL_DIR = dynamic_eval_dir
+else:
+    print(f"-> Specific evaluation file '{evaluation_filename}' not found. Falling back to default path.")
+    evaluation_relative_path = "contineous-thought-machines/data/evaluation"
+    ARC_EVAL_DIR = os.path.abspath(evaluation_relative_path)
 CHECKPOINT_DIR_ARC = CHECKPOINT_DIR_ARC_SEARCHED if CHECKPOINT_DIR_ARC_SEARCHED else os.path.join("checkpoints", "ctm_arc_agi_2_enhanced_diffusion")
 
-if not ARC_EVAL_DIR_SEARCHED:
-    print(f"-> Evaluation directory not found dynamically, using fallback: '{ARC_EVAL_DIR}'")
 if not CHECKPOINT_DIR_ARC_SEARCHED:
     print(f"-> Checkpoint directory not found dynamically, using fallback: '{CHECKPOINT_DIR_ARC}'")
 
 NUM_EPOCHS_ARC = 20
 
-if os.path.exists(ARC_EVAL_DIR):
-    arc_eval_dataset = NewCustomARCGridDataset(ARC_EVAL_DIR)
-    arc_eval_loader = DataLoader(arc_eval_dataset, batch_size=1, collate_fn=collate_fn_new_custom_arc_eval)
+
+
+class NewCustomARCGridDataset(Dataset):
+    def __init__(self, data_path, max_grid_size=MAX_GRID_SIZE, padding_value=PADDING_VALUE):
+        self.data_path = data_path
+        self.task_files = []
+        if os.path.isfile(data_path):
+            if data_path.endswith(".json"):
+                self.task_files.append(data_path)
+        elif os.path.isdir(data_path):
+            for root, _, files in os.walk(data_path):
+                for file in files:
+                    if file.endswith(".json"):
+                        self.task_files.append(os.path.join(root, file))
+        else:
+            print(f"Error: Provided data path does not exist or is not a file/directory: {data_path}")
+            self.tasks = []
+            return
+
+        if not self.task_files:
+            print(f"Warning: No .json files found at path: {data_path}")
+            self.tasks = []
+            return
+        
+        self.max_grid_size = max_grid_size
+        self.padding_value = padding_value
+        self.tasks = [json.load(open(f)) for f in self.task_files]
+        print(f"Loaded {len(self.tasks)} tasks from {data_path}.")
+
+    def __len__(self):
+        return len(self.tasks)
+
+    def __getitem__(self, idx):
+        task_data = self.tasks[idx]
+        processed_task = {'train': [], 'test': [], 'id': os.path.basename(self.task_files[idx])}
+        for pair_type in ['train', 'test']:
+            for item in task_data.get(pair_type, []):
+                input_grid = item['input']
+                output_grid = item['output']
+                original_input_dims = (len(input_grid), len(input_grid[0]) if input_grid else 0)
+                original_output_dims = (len(output_grid), len(output_grid[0]) if output_grid else 0)
+                padded_input = pad_grid(input_grid, self.max_grid_size, self.padding_value)
+                padded_output = pad_grid(output_grid, self.max_grid_size, self.padding_value)
+                processed_task[pair_type].append({
+                    'input': torch.from_numpy(padded_input).long(),
+                    'output': torch.from_numpy(padded_output).long(),
+                    'original_input_dims': original_input_dims,
+                    'original_output_dims': original_output_dims
+                })
+        return processed_task
+
+# --- Safetensors loading fix ---
+# The load_file_safely function has been removed.
+# Direct use of 'load_file' from safetensors.torch is now used in the main evaluation loop.
+
+# --- Dataloader Initialization for Evaluation ---
+print("\n--- Initializing Evaluation Dataloader ---")
+arc_eval_loader = None
+if 'ARC_EVAL_DIR' in globals() and os.path.exists(ARC_EVAL_DIR):
+    print(f"  > Using NewCustomARCGridDataset for evaluation from path: {ARC_EVAL_DIR}")
+    arc_eval_dataset = NewCustomARCGridDataset(
+        data_path=ARC_EVAL_DIR,
+        max_grid_size=MAX_GRID_SIZE,
+        padding_value=PADDING_VALUE
+    )
+    if len(arc_eval_dataset) > 0:
+        arc_eval_loader = DataLoader(arc_eval_dataset, batch_size=1, shuffle=False)
+        print(f"✓ Evaluation DataLoader initialized with {len(arc_eval_dataset)} tasks.")
+    else:
+        print("⚠️ Evaluation dataset is empty. Skipping evaluation.")
 else:
-    print(f"⚠️  Evaluation directory not found at '{ARC_EVAL_DIR}'. Using empty dataloader.")
-    arc_eval_loader = []
+    print(f"⚠️ Evaluation directory not found or not specified (ARC_EVAL_DIR='{globals().get('ARC_EVAL_DIR', 'Not Set')}'). Cannot create DataLoader.")
 
 # --- Main Evaluation Logic ---
 print("\n" + "="*60)
@@ -616,9 +667,9 @@ else:
         # Load CTM Model
         if os.path.exists(ctm_checkpoint_path_eval):
             print(f"  > Loading CTM checkpoint from {ctm_checkpoint_path_eval}...")
-            # Load state_dict to CPU first, then load into the correctly instantiated model
+            # Load state_dict using the safetensors library directly, as per user feedback
             state_dict_ctm = load_file(ctm_checkpoint_path_eval, device="cpu")
-            ctm_model_arc.load_state_dict(state_dict_ctm, strict=False) # Use strict=False to be more robust
+            ctm_model_arc.load_state_dict(state_dict_ctm, strict=False)
             print(f"✓ Loaded CTM checkpoint from epoch {latest_epoch}.")
         else:
             print(f"⚠️ CTM Checkpoint not found at {ctm_checkpoint_path_eval}.")
@@ -660,7 +711,7 @@ else:
                     original_dims = test_pair['original_output_dims']
 
                     test_input_solved = False
-                    for trial in range(3):
+                    for trial in range(2):
                         current_batch_size_eval = input_bytes_eval.size(0)
                         eval_timestep = torch.zeros(current_batch_size_eval, device=input_bytes_eval.device).long()
 
