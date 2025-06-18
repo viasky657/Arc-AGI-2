@@ -1,11 +1,219 @@
-# ## ARC-AGI-2 Evaluation 
+import sys
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import glob
+import json
 import traceback
-from safetensors.torch import load_file
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# Setup module paths based on user-provided successful import logic
+print("--- Setting up module paths ---")
+# Get the absolute path to the project root
+project_root = '/workspaces/Arc-AGI-2'
+# Define the path to the 'contineous-thought-machines' directory
+module_path = os.path.join(project_root, 'contineous-thought-machines')
+
+if module_path not in sys.path:
+    sys.path.append(module_path)
+    print(f"Added to sys.path: {module_path}")
+
+try:
+    from safetensors.torch import load_file
+except ImportError:
+    print("Warning: safetensors not found. Loading .safetensors will fail.")
+    def load_file(path, device="cpu"):
+        raise ImportError(f"safetensors is not installed, cannot load {path}")
+
+import importlib.util
+
+# --- Statically Importing EnhancedCTMDiffusion model ---
+print("\n--- Statically importing EnhancedCTMDiffusion model ---")
+EnhancedCTMDiffusion = None
+try:
+    from models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion
+    print(" -> Successfully imported EnhancedCTMDiffusion from models package.")
+except ImportError as e_direct:
+    print(f"FATAL: Import from models package failed. Last error: {e_direct}")
+    EnhancedCTMDiffusion = None # Ensure it's None on failure
+
+try:
+    from accelerate import Accelerator
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    print("Warning: Hugging Face Accelerate not found. Will run on a single device.")
+    ACCELERATE_AVAILABLE = False
+    Accelerator = None
+
+# --- Constants and Configuration ---
+# These are gathered from your setup script to make this file runnable
+device = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_GRID_SIZE = (30, 30)
+PADDING_VALUE = -1 # A common padding value for ARC
+ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
+MAX_SEQUENCE_LENGTH = 8192
+PADDING_BYTE_VALUE = 0
+NUM_ARC_SYMBOLS = 10 # 0-9
+LEARNING_RATE = 1e-4
+
+# --- Your Provided Setup Code ---
+
+# ## Data Handling ##
+def pad_grid(grid_list, max_dims, pad_value):
+    grid_np = np.array(grid_list, dtype=np.int32)
+    padded_grid = np.full(max_dims, pad_value, dtype=np.int32)
+    h, w = grid_np.shape
+    padded_grid[:h, :w] = grid_np
+    return padded_grid
+
+def serialize_and_pad_grid(grid, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE):
+    flat_array = np.array(grid, dtype=np.uint8).flatten()
+    byte_sequence = flat_array.tobytes()
+    padding_len = max_len - len(byte_sequence)
+    if padding_len < 0:
+        return byte_sequence[:max_len]
+    return byte_sequence + bytes([pad_value] * padding_len)
+
+class NewCustomARCGridDataset(Dataset):
+    def __init__(self, data_dir, max_grid_size=MAX_GRID_SIZE, padding_value=PADDING_VALUE):
+        self.data_dir = data_dir
+        self.task_files = []
+        for root, _, files in os.walk(data_dir):
+            for file in files:
+                if file.endswith(".json"):
+                    self.task_files.append(os.path.join(root, file))
+        self.max_grid_size = max_grid_size
+        self.padding_value = padding_value
+        self.tasks = [json.load(open(f)) for f in self.task_files]
+        print(f"Loaded {len(self.tasks)} tasks from {data_dir} (recursively).")
+
+    def __len__(self):
+        return len(self.tasks)
+
+    def __getitem__(self, idx):
+        task_data = self.tasks[idx]
+        processed_task = {'train': [], 'test': [], 'id': os.path.basename(self.task_files[idx])}
+        for pair_type in ['train', 'test']:
+            for item in task_data.get(pair_type, []):
+                input_grid = item['input']
+                output_grid = item['output']
+                original_input_dims = (len(input_grid), len(input_grid[0]) if input_grid else 0)
+                original_output_dims = (len(output_grid), len(output_grid[0]) if output_grid else 0)
+                padded_input = pad_grid(input_grid, self.max_grid_size, self.padding_value)
+                padded_output = pad_grid(output_grid, self.max_grid_size, self.padding_value)
+                processed_task[pair_type].append({
+                    'input': torch.from_numpy(padded_input).long(),
+                    'output': torch.from_numpy(padded_output).long(),
+                    'original_input_dims': original_input_dims,
+                    'original_output_dims': original_output_dims
+                })
+        return processed_task
+
+def collate_fn_new_custom_arc_eval(batch_of_tasks):
+    # This simplified collate is for evaluation (batch size=1)
+    return batch_of_tasks[0]
+
+# --- Model Configuration ---
+@dataclass
+class EnhancedCTMConfig:
+    d_model: int = 512
+    n_heads: int = 8
+    n_layers: int = 24
+    max_sequence_length: int = 8192
+    dropout: float = 0.1
+    patch_embedding_dim: int = 256
+    patch_encoder_cnn_channels: int = 64
+    use_dynamic_entropy_patcher: bool = True
+    entropy_patcher_threshold_type: str = "global"
+    entropy_patcher_global_threshold: float = 0.75
+    entropy_patcher_min_patch_size: int = 4
+    entropy_patcher_max_patch_size: int = 128
+    entropy_model_byte_vocab_size: int = 256
+    entropy_model_embedding_dim: int = 64
+    entropy_model_hidden_dim: int = 128
+    entropy_model_num_layers: int = 1
+    entropy_model_dropout: float = 0.1
+    entropy_model_loss_weight: float = 0.1
+    ctm_iterations: int = 5
+    ctm_d_model: int = 512
+    ctm_input_dim: int = 256
+    ctm_heads: int = 8
+    ctm_out_dims: int = 512
+    ctm_neuron_select_type: str = 'bio_multi_objective'
+    attention_type: str = "subquadratic"
+    positional_embedding_type: Optional[str] = 'multi-learnable-fourier'
+    reshape_patch_sequence_to_grid: bool = True
+    patch_grid_width: Optional[int] = 16
+    enable_pipeline_parallelism: bool = False # Simplified for eval script
+    num_outputs: int = 1
+    output_dims: List[int] = field(default_factory=lambda: [512])
+    vocab_size: Optional[int] = None
+    # Add other fields from your config here if they cause `__post_init__` errors
+    def __post_init__(self):
+        if len(self.output_dims) != self.num_outputs:
+            raise ValueError("output_dims length must match num_outputs")
+
+config_arc_diffusion = EnhancedCTMConfig()
+
+# --- Model and Dataloader Initialization ---
+print("--- Initializing Models for Evaluation ---")
+ctm_model_arc = None
+arc_output_head = None
+if EnhancedCTMDiffusion:
+    ctm_model_arc = EnhancedCTMDiffusion(config=config_arc_diffusion)
+    arc_output_head = nn.Linear(config_arc_diffusion.output_dims[0], ARC_INPUT_FLAT_DIM * NUM_ARC_SYMBOLS)
+    print("✓ Real models instantiated.")
+    # Move models to the correct device immediately after instantiation
+    ctm_model_arc.to(device)
+    arc_output_head.to(device)
+else:
+    print("FATAL: Cannot proceed without EnhancedCTMDiffusion class. The script cannot continue.")
+    # Using raise instead of exit() to avoid killing the kernel
+    raise ImportError("FATAL: Cannot proceed without EnhancedCTMDiffusion class.")
+
+def find_directory(start_path, dir_name):
+    """Recursively finds a directory by name."""
+    for root, dirs, _ in os.walk(start_path):
+        if dir_name in dirs:
+            found_path = os.path.join(root, dir_name)
+            print(f"Found '{dir_name}' directory at: {found_path}")
+            return found_path
+    return None
+
+print("\n--- Searching for evaluation and checkpoint directories ---")
+# Path to ARC evaluation tasks
+ARC_EVAL_DIR_SEARCHED = find_directory(".", "evaluation")
+# Path to CTM checkpoints
+CHECKPOINT_DIR_ARC_SEARCHED = find_directory(".", "ctm_arc_agi_2_enhanced_diffusion")
+
+ARC_EVAL_DIR = ARC_EVAL_DIR_SEARCHED if ARC_EVAL_DIR_SEARCHED else "contineous-thought-machines/data/evaluation"
+CHECKPOINT_DIR_ARC = CHECKPOINT_DIR_ARC_SEARCHED if CHECKPOINT_DIR_ARC_SEARCHED else os.path.join("checkpoints", "ctm_arc_agi_2_enhanced_diffusion")
+
+if not ARC_EVAL_DIR_SEARCHED:
+    print(f"-> Evaluation directory not found dynamically, using fallback: '{ARC_EVAL_DIR}'")
+if not CHECKPOINT_DIR_ARC_SEARCHED:
+    print(f"-> Checkpoint directory not found dynamically, using fallback: '{CHECKPOINT_DIR_ARC}'")
+
+NUM_EPOCHS_ARC = 20
+
+if os.path.exists(ARC_EVAL_DIR):
+    arc_eval_dataset = NewCustomARCGridDataset(ARC_EVAL_DIR)
+    arc_eval_loader = DataLoader(arc_eval_dataset, batch_size=1, collate_fn=collate_fn_new_custom_arc_eval)
+else:
+    print(f"⚠️  Evaluation directory not found at '{ARC_EVAL_DIR}'. Using empty dataloader.")
+    arc_eval_loader = []
+
+# --- Main Evaluation Logic ---
 print("\n" + "="*60)
-print(f"🔬 STARTING ARC-AGI-2 Evaluation")
+print(f"🔬 STARTING ARC-AGI-2 Evaluation on device '{device}'")
 print("="*60 + "\n")
-if not all([ctm_model_arc is not None, arc_output_head is not None, arc_eval_loader is not None]):
-    print("⚠️ Skipping ARC-AGI-2 evaluation due to missing components.")
+
+if not all([ctm_model_arc, arc_output_head, arc_eval_loader]):
+     print("⚠️ Skipping evaluation due to missing components.")
 else:
     latest_epoch = NUM_EPOCHS_ARC
     ctm_checkpoint_path_eval = os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{latest_epoch}.safetensors")
@@ -15,44 +223,33 @@ else:
         # Load CTM Model
         if os.path.exists(ctm_checkpoint_path_eval):
             print(f"  > Loading CTM checkpoint from {ctm_checkpoint_path_eval}...")
-            unwrapped_ctm_model = accelerator_arc.unwrap_model(ctm_model_arc) if accelerator_arc else ctm_model_arc
-            
-            # Load the state dict from the safetensors file
-            state_dict_ctm = load_file(ctm_checkpoint_path_eval, device=device if not accelerator_arc else accelerator_arc.device)
-            
-            # Load the state dict into the model
-            unwrapped_ctm_model.load_state_dict(state_dict_ctm)
-            
-            print(f"✓ Loaded CTM checkpoint from epoch {latest_epoch} using safetensors and deepspeed strategy.")
+            # Load state_dict to CPU first, then load into the correctly instantiated model
+            state_dict_ctm = load_file(ctm_checkpoint_path_eval, device="cpu")
+            ctm_model_arc.load_state_dict(state_dict_ctm, strict=False) # Use strict=False to be more robust
+            print(f"✓ Loaded CTM checkpoint from epoch {latest_epoch}.")
         else:
-            print(f"⚠️ CTM Checkpoint not found at {ctm_checkpoint_path_eval}. Evaluating with current model state.")
+            print(f"⚠️ CTM Checkpoint not found at {ctm_checkpoint_path_eval}.")
 
         # Load ARC Output Head Model
         if os.path.exists(head_checkpoint_path_eval):
             print(f"  > Loading ARC Output Head checkpoint from {head_checkpoint_path_eval}...")
-            unwrapped_head_model = accelerator_arc.unwrap_model(arc_output_head) if accelerator_arc else arc_output_head
-            
-            # Load the state dict from the safetensors file
-            state_dict_head = load_file(head_checkpoint_path_eval, device=device if not accelerator_arc else accelerator_arc.device)
-            
-            # Load the state dict into the model
-            unwrapped_head_model.load_state_dict(state_dict_head)
-            
-            print(f"✓ Loaded ARC Output Head checkpoint from epoch {latest_epoch} using safetensors.")
+            state_dict_head = load_file(head_checkpoint_path_eval, device="cpu")
+            arc_output_head.load_state_dict(state_dict_head, strict=False)
+            print(f"✓ Loaded ARC Output Head checkpoint from epoch {latest_epoch}.")
         else:
-            print(f"⚠️ ARC Output Head Checkpoint not found at {head_checkpoint_path_eval}. Evaluating with current model state.")
+            print(f"⚠️ ARC Output Head Checkpoint not found at {head_checkpoint_path_eval}.")
 
         ctm_model_arc.eval()
         arc_output_head.eval()
-        if ctm_mcmc_integration_arc: ctm_mcmc_integration_arc.eval()
+        
         total_tasks = 0
         solved_tasks = 0
+        
         with torch.inference_mode():
             for task_idx, task_batch in enumerate(arc_eval_loader):
                 if not task_batch: continue
                 
-                current_task_data = task_batch # Dataloader batch_size=1, so task_batch is the task dict
-                    
+                current_task_data = task_batch
                 total_tasks += 1
                 task_solved_overall = True
 
@@ -62,57 +259,47 @@ else:
                     continue
 
                 for test_pair_idx, test_pair in enumerate(current_task_data['test']):
-                    # Input for evaluation is a single grid, needs to be converted to byte sequence
-                    input_grid_np_eval = test_pair['input'].numpy() # Get numpy array from tensor
+                    input_grid_np_eval = test_pair['input'].cpu().numpy()
                     input_bytes_eval_single = serialize_and_pad_grid(input_grid_np_eval, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE)
-                    input_bytes_eval = torch.tensor(list(input_bytes_eval_single), dtype=torch.uint8).unsqueeze(0).to(device if not accelerator_arc else accelerator_arc.device)
+                    input_bytes_eval = torch.from_numpy(input_bytes_eval_single).to(torch.uint8).unsqueeze(0).to(device)
 
                     target_grid_np = test_pair['output'].cpu().numpy()
                     original_dims = test_pair['original_output_dims']
 
                     test_input_solved = False
-                    for trial in range(3): # ARC rules allow 3 trials
-                        # Forward pass with EnhancedCTMDiffusion using CTM-controlled diffusion for generation
-                        # Assuming timestep 0 is appropriate for one-step or final-step generation
-                        current_batch_size_eval = input_bytes_eval.size(0) # Should be 1 for evaluation
+                    for trial in range(3):
+                        current_batch_size_eval = input_bytes_eval.size(0)
                         eval_timestep = torch.zeros(current_batch_size_eval, device=input_bytes_eval.device).long()
 
+                        # This call assumes ctm_model_arc is on the correct device already
                         eval_model_output_dict = ctm_model_arc(
                             byte_sequence=input_bytes_eval,
-                            mode='ctm_controlled_diffusion', # Use CTM-controlled diffusion
-                            target_diffusion_output=None,   # No target during generation
+                            mode='ctm_controlled_diffusion',
+                            target_diffusion_output=None,
                             timestep=eval_timestep,
                             task_name="ARC_AGI_2_EVAL_DIFFUSION"
                         )
                         
-                        # ASSUMPTION: The generated output is a byte sequence under the key 'diffusion_output_pred'
-                        # The shape is expected to be (batch_size, MAX_SEQUENCE_LENGTH)
-                        predicted_byte_sequence = eval_model_output_dict.get('diffusion_output_pred') 
+                        predicted_byte_sequence = eval_model_output_dict.get('diffusion_output_pred')
                         
                         if predicted_byte_sequence is None:
-                            print("Warning: Key 'diffusion_output_pred' not found in model output. Trying 'generated_output'.")
-                            predicted_byte_sequence = eval_model_output_dict.get('generated_output') # Common alternative
+                            print("Warning: Key 'diffusion_output_pred' not found. Trying 'generated_output'.")
+                            predicted_byte_sequence = eval_model_output_dict.get('generated_output')
                         
                         if predicted_byte_sequence is None:
                             print("Warning: Generated output key not found. Using zeros as prediction.")
-                            # Fallback: create a zero tensor of the expected grid size if generation fails to be found
                             preds_grid = np.zeros(MAX_GRID_SIZE, dtype=int)
                         else:
-                            # Ensure the sequence has the correct batch dimension (should be 1)
                             if predicted_byte_sequence.ndim == 1 and current_batch_size_eval == 1:
                                 predicted_byte_sequence = predicted_byte_sequence.unsqueeze(0)
 
-                            # Extract the part of the sequence corresponding to the flattened grid
-                            # ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
                             if predicted_byte_sequence.shape[1] >= ARC_INPUT_FLAT_DIM:
-                                preds_flat_bytes = predicted_byte_sequence[0, :ARC_INPUT_FLAT_DIM] # Get first item in batch, first ARC_INPUT_FLAT_DIM bytes
-                                # Convert byte values (0-9 for ARC symbols) to long tensor and reshape
+                                preds_flat_bytes = predicted_byte_sequence[0, :ARC_INPUT_FLAT_DIM]
                                 preds_grid = preds_flat_bytes.view(MAX_GRID_SIZE).long().cpu().numpy()
                             else:
-                                print(f"Warning: Generated byte sequence too short ({predicted_byte_sequence.shape[1]} vs {ARC_INPUT_FLAT_DIM}). Using zeros.")
+                                print(f"Warning: Generated byte sequence too short. Using zeros.")
                                 preds_grid = np.zeros(MAX_GRID_SIZE, dtype=int)
                         
-                        # Unpad to original dimensions
                         h, w = original_dims
                         final_pred = preds_grid[:h, :w]
                         final_target = target_grid_np[:h, :w]
@@ -140,167 +327,10 @@ else:
         else:
             print("\nARC-AGI-2 Evaluation: No tasks were evaluated.")
             
+    except FileNotFoundError as e:
+        print(f"❌ Checkpoint file not found: {e}. Please ensure paths are correct.")   
     except Exception as e:
         print(f"❌ Error during ARC-AGI-2 evaluation: {e}")
         traceback.print_exc()
         
     print("\n🔬 ARC-AGI-2 Evaluation Phase Completed.")
-
-#Load the most recent checkpoint-saved model from here and prepare it for evaluation: # --- ARC-AGI-2 Training Loop ---
-print("\n" + "="*60)
-print(f"🚀 STARTING PHASE 4: ARC-AGI-2 Training")
-print(f"   Epochs: {NUM_EPOCHS_ARC}, Batch Size: {ARC_BATCH_SIZE}, Task ID: {ARC_TASK_ID}")
-print(f"   Device: {device if not accelerator_arc else accelerator_arc.device}")
-print("="*60 + "\n")
-if not all([ctm_model_arc, arc_output_head, optimizer_arc, arc_train_loader, arc_criterion]):
-    print("⚠️ Skipping ARC-AGI-2 training due to missing components.")
-else:
-    for epoch in range(NUM_EPOCHS_ARC):
-        ctm_model_arc.train()
-        arc_output_head.train()
-        if ctm_mcmc_integration_arc: ctm_mcmc_integration_arc.train()
-        
-        total_arc_loss = 0
-        processed_batches = 0
-        
-        for batch_idx, batch_data in enumerate(arc_train_loader):
-            if not batch_data or batch_data['input_byte_sequences'].numel() == 0:
-                print(f"Skipping empty batch {batch_idx}")
-                continue
-            
-            # Get data from the updated collate_fn
-            input_bytes = batch_data['input_byte_sequences'].to(device if not accelerator_arc else accelerator_arc.device)
-            target_bytes_for_diffusion = batch_data['target_byte_sequences_for_diffusion'].to(device if not accelerator_arc else accelerator_arc.device)
-            original_target_grids_for_ce = batch_data['original_target_grids_for_ce_loss'].to(device if not accelerator_arc else accelerator_arc.device)
-
-            current_batch_size = input_bytes.size(0)
-
-            optimizer_arc.zero_grad()
-
-            with autocast(enabled=USE_MIXED_PRECISION, dtype=autocast_dtype) if not accelerator_arc else accelerator_arc.autocast():
-                # Forward pass through EnhancedCTMDiffusion
-                # The model internally handles patching, CTM core, diffusion (if target provided), and entropy aux loss.
-                model_output_dict = ctm_model_arc(
-                    byte_sequence=input_bytes,
-                    target_diffusion_output=target_bytes_for_diffusion, # Provide target for diffusion loss component
-                    mode='ctm_controlled_diffusion', # Ensure diffusion part is active for loss calculation
-                    timestep=torch.randint(0, config_arc_diffusion.diffusion_steps, (current_batch_size,), device=input_bytes.device).long(), # Random timesteps for diffusion training
-                    target_mcmc_output=None, # Internal MCMC is disabled in config_arc_diffusion
-                    task_name="ARC_AGI_2", # Optional task name
-                    current_epoch=epoch # Pass current epoch
-                )
-
-                # Loss from EnhancedCTMDiffusion (includes entropy aux loss, diffusion loss, etc.)
-                enhanced_ctm_loss = model_output_dict.get('total_loss', torch.tensor(0.0, device=input_bytes.device))
-                loss = enhanced_ctm_loss
-
-                # Get CTM core output for the external ARC head
-                ctm_core_output_data = model_output_dict.get('ctm_core_data')
-                ctm_backbone_output = None
-                if ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
-                    ctm_backbone_output = ctm_core_output_data['final_sync_out']
-                elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data: # Fallback key
-                    ctm_backbone_output = ctm_core_output_data['ctm_latent_representation']
-                else:
-                    print("Warning: CTM core output ('final_sync_out' or 'ctm_latent_representation') not found. Using zeros for ARC head input.")
-                    ctm_backbone_output = torch.zeros(current_batch_size, config_arc_diffusion.ctm_out_dims, device=input_bytes.device)
-                
-                # External ARC Output Head for CrossEntropy loss on original grid prediction
-                if arc_output_head and ctm_backbone_output is not None:
-                    if ctm_backbone_output.ndim > 2 and ctm_backbone_output.shape[1] > 0:
-                         ctm_features_for_head = ctm_backbone_output.mean(dim=1)
-                    else:
-                         ctm_features_for_head = ctm_backbone_output
-                    
-                    predicted_logits = arc_output_head(ctm_features_for_head)
-                    predicted_logits_reshaped = predicted_logits.view(current_batch_size * ARC_INPUT_FLAT_DIM, NUM_ARC_SYMBOLS)
-                    target_grids_reshaped = original_target_grids_for_ce.view(current_batch_size * ARC_INPUT_FLAT_DIM)
-                    ce_loss = arc_criterion(predicted_logits_reshaped, target_grids_reshaped)
-                    loss += ce_loss # Add CE loss to the total loss
-
-                # External MCMC Integration (if enabled)
-                if ctm_mcmc_integration_arc and ctm_backbone_output is not None:
-                    target_grids_for_mcmc = (original_target_grids_for_ce > 0).float()
-                    mcmc_input_features = ctm_backbone_output.detach()
-                    if mcmc_input_features.ndim > 2 and mcmc_input_features.shape[1] > 0:
-                        mcmc_input_features = mcmc_input_features.mean(dim=1)
-
-                    mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(
-                        x=mcmc_input_features,
-                        target_y=target_grids_for_mcmc 
-                    )
-                    loss += mcmc_loss_val
-
-            if scaler: # Mixed precision (manual, without Accelerate)
-                scaler.scale(loss).backward()
-                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    scaler.unscale_(optimizer_arc)
-                    torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                    scaler.step(optimizer_arc)
-                    scaler.update()
-                    optimizer_arc.zero_grad()
-            elif accelerator_arc: # Using Hugging Face Accelerate
-                 accelerator_arc.backward(loss)
-                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    optimizer_arc.step()
-                    optimizer_arc.zero_grad()
-            else: # Standard training
-                loss.backward()
-                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                    optimizer_arc.step()
-                    optimizer_arc.zero_grad()
-
-            total_arc_loss += loss.item()
-            processed_batches += 1
-
-            if (batch_idx + 1) % 50 == 0:
-                print(f"  Epoch [{epoch+1}/{NUM_EPOCHS_ARC}], Batch [{batch_idx+1}/{len(arc_train_loader)}], Loss: {loss.item():.4f}")
-        
-        avg_epoch_loss = total_arc_loss / processed_batches if processed_batches > 0 else 0
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS_ARC}] completed. Average Loss: {avg_epoch_loss:.4f}")
-        
-        from safetensors.torch import save_file
-        import os
-        import torch.distributed as dist
-        
-        # === DEBUG + RANK CHECK ===
-        def get_rank_debug():
-            if dist.is_available() and dist.is_initialized():
-                rank = dist.get_rank()
-                world_size = dist.get_world_size()
-            else:
-                rank = 0
-                world_size = 1
-            
-            print(f"[DEBUG] Rank {rank} out of {world_size} total ranks")
-            return rank, world_size
-        
-        rank, world_size = get_rank_debug()
-        
-        # === SAVE ONLY ON RANK 0 ===
-        if rank == 0 and CHECKPOINT_DIR_ARC:
-            model_to_save_ctm = accelerator_arc.unwrap_model(ctm_model_arc) if accelerator_arc else ctm_model_arc
-            model_to_save_head = accelerator_arc.unwrap_model(arc_output_head) if accelerator_arc else arc_output_head
-            
-            # Check if DeepSpeed is used and the model is wrapped
-            if hasattr(model_to_save_ctm, 'zero_optimization') and hasattr(model_to_save_ctm, 'module'):
-                print("✓ Using DeepSpeed consolidated state_dict for CTM model")
-                ctm_state_dict = model_to_save_ctm._zero3_consolidated_16bit_state_dict()
-            else:
-                ctm_state_dict = model_to_save_ctm.state_dict()
-
-            if hasattr(model_to_save_head, 'zero_optimization') and hasattr(model_to_save_head, 'module'):
-                print("✓ Using DeepSpeed consolidated state_dict for ARC head")
-                head_state_dict = model_to_save_head._zero3_consolidated_16bit_state_dict()
-            else:
-                head_state_dict = model_to_save_head.state_dict()
-
-            # Save model weights with safetensors
-            save_file(ctm_state_dict, os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{epoch+1}.safetensors"))
-            save_file(head_state_dict, os.path.join(CHECKPOINT_DIR_ARC, f"arc_output_head_epoch_{epoch+1}.safetensors"))
-
-            # Save optimizer (use torch.save, not supported by safetensors)
-            torch.save(optimizer_arc.state_dict(), os.path.join(CHECKPOINT_DIR_ARC, f"optimizer_arc_epoch_{epoch+1}.pt"))
-
-            print(f"✓ Checkpoint saved for epoch {epoch+1} on rank {rank} to {CHECKPOINT_DIR_ARC}")
