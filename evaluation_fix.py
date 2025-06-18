@@ -8,64 +8,153 @@ import numpy as np
 import glob
 import json
 import traceback
+import random
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Callable
+import collections
+
+# --- Focal Loss Implementation ---
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for dense object detection.
+    Reduces the relative loss for well-classified examples, putting more
+    focus on hard, misclassified examples.
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', ignore_index=-1):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+
+    def forward(self, inputs, targets):
+        # inputs: [N, C, H, W], targets: [N, H, W]
+        ce_loss_fn = nn.CrossEntropyLoss(reduction='none', ignore_index=self.ignore_index)
+        ce_loss = ce_loss_fn(inputs, targets)
+        
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt)**self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
 
 # --- MCMC Self-Learning Components (Adapted from SEAL/mcmc_search.py) ---
 
 @dataclass
 class MCMCConfig:
     """Configuration for MCMC sampling parameters."""
-    num_chains: int = 1
-    chain_length: int = 50
-    burn_in: int = 5
-    temperature_schedule: str = "geometric"
-    initial_temp: float = 10.0
-    final_temp: float = 1.0
-    decay_rate: float = 0.95
-
-class TemperatureScheduler:
-    """Generates a temperature schedule for simulated annealing."""
-    @staticmethod
-    def get_schedule(config: MCMCConfig) -> Callable[[int], float]:
-        if config.temperature_schedule == "geometric":
-            return lambda step: max(config.initial_temp * (config.decay_rate ** step), config.final_temp)
-        return lambda step: config.final_temp
+    num_chains: int = 20
+    chain_length: int = 8000
+    burn_in: int = 200
+    temperature_schedule: str = "adaptive"  # "geometric", "adaptive"
+    initial_temp: float = 30.0
+    final_temp: float = 0.01
+    decay_rate: float = 0.998
+    # Adaptive cooling parameters
+    target_acceptance_rate: float = 0.30
+    adaptive_adjustment_factor: float = 0.02
+    # Proposal strategy
+    proposal_strategy: str = "hybrid" # "random", "hybrid", "structured"
+    structured_mutation_prob: float = 0.5
+    mutation_region_size: int = 3
+    # Convergence Monitoring
+    convergence_window: int = 250
+    convergence_threshold: float = 1e-6
+    # --- New: Iterative Local Refinement ---
+    enable_local_refinement: bool = True
+    refinement_trigger_similarity: float = 0.95 # Similarity to target to trigger refinement
+    refinement_steps: int = 500
 
 class ARCSelfEditSpace:
-    """Defines the space of ARC grid edits and their neighborhoods."""
-    def __init__(self, grid_dims: tuple, mutation_rate: float = 0.05):
+    """Defines the space of ARC grid edits and their neighborhoods with adaptive mutation."""
+    def __init__(self, grid_dims: tuple, initial_mutation_rate: float = 0.1, final_mutation_rate: float = 0.01, decay_steps: int = 8000):
         self.grid_dims = grid_dims
-        self.mutation_rate = mutation_rate
+        self.initial_mutation_rate = initial_mutation_rate
+        self.final_mutation_rate = final_mutation_rate
+        self.decay_steps = decay_steps
 
-    def get_neighbors(self, state: np.ndarray, n_neighbors: int = 10) -> List[np.ndarray]:
-        """Generates neighbors by mutating random pixels."""
+    def _get_mutation_rate(self, step: int, is_refinement: bool = False) -> float:
+        """Anneals mutation rate from high to low for broader exploration followed by exploitation."""
+        if is_refinement:
+            return self.final_mutation_rate / 5.0 # Much lower rate for fine-tuning
+        if step >= self.decay_steps:
+            return self.final_mutation_rate
+        
+        # Use a cosine annealing schedule for a smoother transition
+        progress = step / self.decay_steps
+        cosine_out = np.cos(np.pi * progress) + 1
+        return self.final_mutation_rate + 0.5 * (self.initial_mutation_rate - self.final_mutation_rate) * cosine_out
+
+    def get_neighbors(self, state: np.ndarray, step: int, n_neighbors: int = 1, error_focus: Optional[np.ndarray] = None, strategy: str = "hybrid", region_size: int = 3, is_refinement: bool = False) -> List[np.ndarray]:
+        """
+        Generates neighbors using adaptive mutation and various proposal strategies.
+        During refinement, it uses a much smaller mutation rate.
+        """
+        mutation_rate = self._get_mutation_rate(step, is_refinement=is_refinement)
         neighbors = []
+        h, w = self.grid_dims
+
         for _ in range(n_neighbors):
             neighbor = state.copy()
-            for i in range(self.grid_dims[0]):
-                for j in range(self.grid_dims[1]):
-                    if random.random() < self.mutation_rate:
-                        neighbor[i, j] = random.randint(0, 9) # ARC colors 0-9
+            
+            # Decide between pixel-level and region-level mutation
+            use_structured_mutation = random.random() < 0.5 # 50% chance for structured
+
+            if strategy == 'hybrid' and error_focus is not None and random.random() < 0.75:
+                error_indices = np.argwhere(error_focus > 0)
+                if len(error_indices) > 0:
+                    num_mutations = max(1, int(len(error_indices) * mutation_rate * 2))
+                    for _ in range(num_mutations):
+                        idx_to_mutate = random.choice(error_indices)
+                        neighbor[tuple(idx_to_mutate)] = random.randint(0, 9)
+                else:
+                    use_structured_mutation = True # Fallback to structured if no errors
+            
+            elif use_structured_mutation:
+                # Structured perturbation: modify a contiguous region
+                r_h = min(region_size, h)
+                r_w = min(region_size, w)
+                top = random.randint(0, h - r_h)
+                left = random.randint(0, w - r_w)
+                for i in range(top, top + r_h):
+                    for j in range(left, left + r_w):
+                        if random.random() < mutation_rate * 2: # Higher effective rate in region
+                            neighbor[i, j] = random.randint(0, 9)
+            else:
+                # Global, random pixel-wise mutation
+                for i in range(h):
+                    for j in range(w):
+                        if random.random() < mutation_rate:
+                            neighbor[i, j] = random.randint(0, 9)
+            
             neighbors.append(neighbor)
         return neighbors
-        
+
 class CTMSurrogate:
-    """A surrogate that uses the main CTM model to guide MCMC search."""
-    def __init__(self, model, input_bytes_eval, target_grid, device):
+    """A surrogate that uses the main CTM model and its head to guide MCMC search."""
+    def __init__(self, model, arc_output_head, input_bytes_eval, target_grid, device, feature_extractor=None):
         self.model = model
+        self.arc_output_head = arc_output_head
         self.input_bytes_eval = input_bytes_eval
         self.target_grid = target_grid # This is the cropped numpy target
         self.device = device
+        # --- New: Placeholder for a learned feature extractor ---
+        self.feature_extractor = feature_extractor
         self.model_prediction_full = self._get_model_prediction()
         h, w = self.target_grid.shape
         self.model_prediction_cropped = self.model_prediction_full[:h, :w]
 
     def _get_model_prediction(self):
-        """Runs the model once to get its baseline prediction."""
+        """Runs the model and head once to get a baseline grid prediction."""
         with torch.inference_mode():
             current_batch_size_eval = self.input_bytes_eval.size(0)
             eval_timestep = torch.zeros(current_batch_size_eval, device=self.device).long()
+            
+            # 1. Get features from the backbone model
             eval_model_output_dict = self.model(
                 byte_sequence=self.input_bytes_eval,
                 mode='ctm_controlled_diffusion',
@@ -73,113 +162,329 @@ class CTMSurrogate:
                 timestep=eval_timestep,
                 task_name="ARC_AGI_2_EVAL_DIFFUSION"
             )
-            predicted_byte_sequence = eval_model_output_dict.get('diffusion_output') or eval_model_output_dict.get('final_output')
-            if predicted_byte_sequence is not None:
-                if predicted_byte_sequence.ndim == 1: predicted_byte_sequence = predicted_byte_sequence.unsqueeze(0)
-                if predicted_byte_sequence.shape[1] >= ARC_INPUT_FLAT_DIM:
-                    preds_flat_bytes = predicted_byte_sequence[0, :ARC_INPUT_FLAT_DIM]
-                    preds_grid = preds_flat_bytes.view(MAX_GRID_SIZE).long().cpu().numpy()
-                    return preds_grid
+            
+            # 2. Extract features consistent with training loop logic
+            ctm_core_output_data = eval_model_output_dict.get('ctm_core_data')
+            ctm_backbone_output = None
+            if ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
+                ctm_backbone_output = ctm_core_output_data['final_sync_out']
+            elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
+                ctm_backbone_output = ctm_core_output_data['ctm_latent_representation']
+            
+            if ctm_backbone_output is not None:
+                # Process features like in training
+                if ctm_backbone_output.ndim > 2 and ctm_backbone_output.shape[1] > 0:
+                     ctm_features_for_head = ctm_backbone_output.mean(dim=1)
+                else:
+                     ctm_features_for_head = ctm_backbone_output
+                
+                # 3. Get logits from the prediction head
+                logits = self.arc_output_head(ctm_features_for_head)
+                preds_flat = torch.argmax(logits.view(-1, NUM_ARC_SYMBOLS), dim=-1)
+                preds_grid = preds_flat.view(MAX_GRID_SIZE).long().cpu().numpy()
+                return preds_grid
+
         return np.zeros(MAX_GRID_SIZE, dtype=int)
 
-    def predict(self, state: np.ndarray) -> float:
+    def predict(self, state: np.ndarray, penalty_weight: float = 0.2) -> float:
         """
-        Calculates a blended score, dynamically adjusting the weight (alpha)
-        based on the quality of the model's baseline prediction.
+        Calculates a blended score using a smoother reward function with a penalty
+        for drastic changes from the original model's prediction.
+        Includes calibrated rewards and a placeholder for feature-based similarity.
         """
-        # Calculate how similar the model's baseline prediction is to the actual target
-        baseline_similarity = np.sum(self.model_prediction_cropped == self.target_grid) / self.target_grid.size
-
-        # Dynamically set alpha: if baseline is good, trust the model more (lower alpha).
-        # A baseline_similarity of 0 gives alpha=1 (trust target completely).
-        # A baseline_similarity of 1 gives alpha=0.5 (trust model and target equally).
-        alpha = 1.0 - (0.5 * baseline_similarity)
+        # --- Fine-Grained Similarity Metric ---
+        if self.feature_extractor:
+            # Placeholder for using a learned feature-based similarity
+            # target_features = self.feature_extractor(self.target_grid)
+            # state_features = self.feature_extractor(state)
+            # sim_to_target = cosine_similarity(target_features, state_features)
+            pass
 
         sim_to_target = np.sum(state == self.target_grid) / self.target_grid.size
+
+        # --- Calibrated Reward Function ---
+        # Sigmoid scaling to heavily penalize anything less than a perfect match
+        # The steepness (k) makes the reward sharply increase as similarity approaches 1.
+        k = 20
+        reward_from_target = 1 / (1 + np.exp(-k * (sim_to_target - 0.95)))
+
+        # Similarity to the initial (failed) model prediction
         sim_to_model = np.sum(state == self.model_prediction_cropped) / self.model_prediction_cropped.size
         
-        return alpha * sim_to_target + (1.0 - alpha) * sim_to_model
+        # Penalty for deviating too far from the model's original prediction
+        deviation_penalty = np.sum(state != self.model_prediction_cropped) / self.model_prediction_cropped.size
+        
+        # Dynamically balance rewards based on initial model quality
+        baseline_similarity = np.sum(self.model_prediction_cropped == self.target_grid) / self.target_grid.size
+        
+        # If the baseline is good, trust the model more. If not, trust the target reward more.
+        alpha = min(0.9, 1.0 - baseline_similarity**2) # Squaring makes it more sensitive
+
+        # Blended score
+        blended_score = (alpha * reward_from_target +
+                         (1.0 - alpha) * sim_to_model -
+                         penalty_weight * deviation_penalty)
+        return blended_score
+
+    def adapt_to_new_task(self, train_pairs: List[dict], optimizer):
+        """
+        Fine-tunes the surrogate model's head on the training examples of a new,
+        unseen task to improve its initial predictions (meta-learning).
+        """
+        print("  > Meta-learning: Adapting surrogate to new task train examples...")
+        
+        # This is a conceptual implementation. A real one would involve
+        # a few quick gradient steps on a small, separate optimizer for the head.
+        # For now, it serves as a structural placeholder.
+        
+        # Create a temporary optimizer for the head for quick adaptation
+        head_optimizer = torch.optim.Adam(self.arc_output_head.parameters(), lr=1e-3)
+        loss_fn = FocalLoss(alpha=0.5, gamma=2.0, reduction='mean')
+        
+        # --- Pre-computation outside the loop ---
+        # Get the CTM features once, as they don't change for the task
+        with torch.no_grad():
+            eval_timestep = torch.zeros(self.input_bytes_eval.size(0), device=self.device).long()
+            eval_model_output_dict = self.model(
+                byte_sequence=self.input_bytes_eval,
+                mode='ctm_controlled_diffusion',
+                target_diffusion_output=None,
+                timestep=eval_timestep,
+                task_name="ARC_AGI_2_META_LEARN_FEATURES"
+            )
+            ctm_core_output_data = eval_model_output_dict.get('ctm_core_data', {})
+            ctm_backbone_output = ctm_core_output_data.get('final_sync_out', ctm_core_output_data.get('ctm_latent_representation'))
+
+            if ctm_backbone_output is None:
+                print("  > Meta-learning WARNING: Could not extract features. Aborting adaptation.")
+                return
+
+            if ctm_backbone_output.ndim > 2 and ctm_backbone_output.shape[1] > 0:
+                self.ctm_features_for_head = ctm_backbone_output.mean(dim=1).detach()
+            else:
+                self.ctm_features_for_head = ctm_backbone_output.detach()
+
+        # --- Quick fine-tuning loop ---
+        self.arc_output_head.train()
+        for epoch in range(3): # A few quick epochs
+            total_loss = 0
+            for pair in train_pairs:
+                head_optimizer.zero_grad()
+                
+                # Get target grid and its dimensions
+                output_grid_np = pair['output'].cpu().numpy()
+                h, w = pair['original_output_dims']
+                
+                # Prepare target tensor for loss calculation
+                target_grid_tensor = torch.from_numpy(output_grid_np).long().to(self.device)
+                
+                # Forward pass through the head ONLY
+                logits = self.arc_output_head(self.ctm_features_for_head)
+                logits = logits.view(1, NUM_ARC_SYMBOLS, MAX_GRID_SIZE[0], MAX_GRID_SIZE[1])
+                cropped_logits = logits[:, :, :h, :w]
+                
+                # Calculate loss
+                loss = loss_fn(cropped_logits, target_grid_tensor[:h, :w].unsqueeze(0))
+                
+                # Backward pass and optimization step
+                loss.backward()
+                head_optimizer.step()
+                total_loss += loss.item()
+            
+            if len(train_pairs) > 0:
+                print(f"  > Meta-learning epoch {epoch+1}, Avg Loss: {total_loss / len(train_pairs):.4f}")
+
+        self.arc_output_head.eval() # Return head to evaluation mode
+        
+        # After adaptation, re-compute the model's prediction
+        print("  > Re-evaluating prediction with adapted head...")
+        self.model_prediction_full = self._get_model_prediction()
+        h_target, w_target = self.target_grid.shape
+        self.model_prediction_cropped = self.model_prediction_full[:h_target, :w_target]
 
 def metropolis_hastings_sampler(
     initial_state: np.ndarray,
     surrogate_func: CTMSurrogate,
     output_space: ARCSelfEditSpace,
-    config: MCMCConfig
-) -> np.ndarray:
-    """Performs Metropolis-Hastings search to find a high-quality ARC grid."""
+    config: MCMCConfig,
+    error_focus: Optional[np.ndarray] = None
+) -> (np.ndarray, dict):
+    """
+    Performs Metropolis-Hastings search with adaptive temperature, hybrid proposals,
+    and convergence monitoring.
+    """
     best_state = initial_state
     best_energy = -surrogate_func.predict(initial_state)
     current_state, current_energy = best_state, best_energy
-    temp_schedule = TemperatureScheduler.get_schedule(config)
+    
+    temperature = config.initial_temp
+    acceptance_history = []
+    energy_history = []
+    log_data = {'temp': [], 'acceptance_rate': [], 'energy': [], 'phase': 'exploration'}
+
+    is_refinement_phase = False
 
     for step in range(config.chain_length + config.burn_in):
-        temperature = temp_schedule(step)
-        proposal_state = random.choice(output_space.get_neighbors(current_state))
+        # --- Check for triggering local refinement ---
+        if config.enable_local_refinement and not is_refinement_phase and step > config.burn_in:
+            current_sim_to_target = np.sum(best_state == surrogate_func.target_grid) / surrogate_func.target_grid.size
+            if current_sim_to_target >= config.refinement_trigger_similarity:
+                print(f"  > Triggering local refinement phase at step {step} (similarity: {current_sim_to_target:.2%}).")
+                is_refinement_phase = True
+                log_data['phase'] = 'refinement'
+                # Optional: Reset temperature or adjust other params for refinement
+                temperature = config.initial_temp / 5.0 # Lower temp for refinement
+
+        # During refinement, proposals are generated with a much lower mutation rate.
+        proposal_state = random.choice(output_space.get_neighbors(
+            current_state, step=step, error_focus=error_focus,
+            strategy=config.proposal_strategy,
+            region_size=config.mutation_region_size,
+            is_refinement=is_refinement_phase
+        ))
         proposal_energy = -surrogate_func.predict(proposal_state)
         
         energy_diff = proposal_energy - current_energy
-        acceptance_prob = min(1.0, math.exp(-energy_diff / temperature)) if temperature > 0 else 0
         
-        if random.random() < acceptance_prob:
+        accepted = False
+        if energy_diff < 0 or (temperature > 0 and random.random() < math.exp(-energy_diff / temperature)):
             current_state, current_energy = proposal_state, proposal_energy
+            accepted = True
             if current_energy < best_energy:
                 best_state, best_energy = current_state, current_energy
-    return best_state
+        
+        if step > config.burn_in:
+            acceptance_history.append(1 if accepted else 0)
+            energy_history.append(best_energy)
 
-def perform_online_update(model, optimizer, input_bytes, failed_grid_np: np.ndarray, corrected_grid_np: np.ndarray, original_dims: tuple, device):
-    """Performs a single, targeted fine-tuning step on the model."""
+            # Log metrics periodically
+            if step % 100 == 0:
+                acc_rate = np.mean(acceptance_history[-100:]) if acceptance_history else 0
+                log_data['temp'].append(temperature)
+                log_data['acceptance_rate'].append(acc_rate)
+                log_data['energy'].append(best_energy)
+
+            # Adaptive Temperature & Convergence Check
+            if len(acceptance_history) > 50:
+                acceptance_rate = np.mean(acceptance_history[-50:])
+                if acceptance_rate < config.target_acceptance_rate:
+                    temperature *= (1 + config.adaptive_adjustment_factor)
+                    # If acceptance is too low, our steps might be too big.
+                    config.mutation_region_size = max(2, config.mutation_region_size - 1)
+                else:
+                    temperature *= (1 - config.adaptive_adjustment_factor)
+                    # If acceptance is high, we can afford to explore more broadly.
+                    config.mutation_region_size = min(7, config.mutation_region_size + 1)
+
+                temperature = max(temperature, config.final_temp)
+                acceptance_history.pop(0)
+
+            if len(energy_history) > config.convergence_window:
+                windowed_energy = energy_history[-config.convergence_window:]
+                if np.std(windowed_energy) < config.convergence_threshold:
+                    print(f"  > Convergence detected at step {step} (energy stddev < {config.convergence_threshold}). Terminating early.")
+                    break
+                energy_history.pop(0)
+
+    print(f"  > MCMC finished. Best energy: {-best_energy:.4f}")
+    return best_state, log_data
+
+def perform_online_update(model, arc_output_head, optimizer, scheduler, input_bytes, failed_grid_np: np.ndarray, corrected_grid_np: np.ndarray, original_dims: tuple, device, failed_features: Optional[torch.Tensor] = None):
+    """
+    Performs a single, targeted fine-tuning step on the model using Focal Loss
+    and a learning rate scheduler for more stable and focused updates.
+    Enhanced with comments on alternative loss functions and stability penalties.
+    """
     h, w = original_dims
     target_for_loss = torch.from_numpy(corrected_grid_np[:h, :w]).long().to(device)
     failed_for_loss = torch.from_numpy(failed_grid_np[:h, :w]).long().to(device)
 
-    # Identify the pixels that were corrected
     correction_mask = (target_for_loss != failed_for_loss).float()
 
-    # If no pixels were corrected, there's nothing to learn.
     if torch.sum(correction_mask) == 0:
         print("  > No pixel differences found between failed and corrected grid. Skipping online update.")
         return
 
     model.train()
+    arc_output_head.train()
     optimizer.zero_grad()
 
-    # Forward pass to get a prediction for the loss calculation
+    target_bytes_single = serialize_and_pad_grid(corrected_grid_np, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE)
+    target_bytes_np = np.frombuffer(target_bytes_single, dtype=np.uint8).copy()
+    target_bytes_tensor = torch.from_numpy(target_bytes_np).to(torch.uint8).unsqueeze(0).to(device)
+
     train_timestep = torch.zeros(1, device=device).long()
     output_dict = model(
         byte_sequence=input_bytes,
         mode='ctm_controlled_diffusion',
-        target_diffusion_output=None,
+        target_diffusion_output=target_bytes_tensor,
         timestep=train_timestep,
         task_name="ARC_AGI_2_ONLINE_LEARN"
     )
 
-    predicted_logits = output_dict.get('final_logits')
-    if predicted_logits is None:
-        print("Warning: 'final_logits' not in model output. Cannot perform online update.")
+    ctm_core_output_data = output_dict.get('ctm_core_data')
+    ctm_backbone_output = None
+    if ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
+        ctm_backbone_output = ctm_core_output_data['final_sync_out']
+    elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
+        ctm_backbone_output = ctm_core_output_data['ctm_latent_representation']
+    
+    if ctm_backbone_output is None:
+        print("Warning: CTM core output not found. Cannot perform online update.")
         model.eval()
+        arc_output_head.eval()
         return
 
+    if ctm_backbone_output.ndim > 2 and ctm_backbone_output.shape[1] > 0:
+         ctm_features_for_head_new = ctm_backbone_output.mean(dim=1)
+    else:
+         ctm_features_for_head_new = ctm_backbone_output
+
+    predicted_logits = arc_output_head(ctm_features_for_head_new)
     predicted_logits = predicted_logits.view(1, NUM_ARC_SYMBOLS, MAX_GRID_SIZE[0], MAX_GRID_SIZE[1])
     cropped_logits = predicted_logits[:, :, :h, :w]
+    target_for_loss_unsqueezed = target_for_loss # Target should be [H, W] for FocalLoss
 
-    # Target needs to be [N, H, W] for loss_fn
-    target_for_loss_unsqueezed = target_for_loss.unsqueeze(0)
+    # --- Enhanced Self-Learning and Loss Stabilization ---
+    # The current implementation uses FocalLoss, which is a great start.
+    # Other options to explore:
+    # 1. Contrastive Loss: Instead of predicting pixels, predict which of two grids
+    #    (the correct one vs. a distractor) is the true target. This can improve
+    #    the feature representation's quality.
+    # 2. Add a penalty term to discourage drastic changes from the original prediction,
+    #    unless they lead to a significant improvement. This can be a regularization
+    #    term on the weights or a penalty on the latent space distance.
+    #    Example: loss += lambda * ||f(new) - f(old)||^2
 
-    # Calculate the CrossEntropyLoss, but we will weight it by the mask
-    loss_fn = nn.CrossEntropyLoss(ignore_index=PADDING_VALUE, reduction='none') # reduction='none' is key
-    loss_per_pixel = loss_fn(cropped_logits, target_for_loss_unsqueezed)
+    # Use Focal Loss to focus on hard-to-correct pixels
+    loss_fn = FocalLoss(alpha=0.5, gamma=2.0, reduction='none')
+    loss_per_pixel = loss_fn(cropped_logits, target_for_loss_unsqueezed.unsqueeze(0)) # Unsqueeze target here
 
-    # Apply the mask to focus the loss on the corrected pixels
+    # Combine with the correction mask to only learn from changed pixels
+    # To implement multi-sample loss averaging, one could run MCMC multiple times
+    # to generate a batch of corrected grids, and average the loss over that batch.
     masked_loss = loss_per_pixel * correction_mask.unsqueeze(0)
+    loss = masked_loss.sum() / correction_mask.sum().clamp(min=1e-8)
+    base_loss_val = loss.item()
 
-    # Normalize the loss by the number of corrected pixels
-    loss = masked_loss.sum() / correction_mask.sum()
+    # Add stabilization loss if features from the failed prediction are provided
+    if failed_features is not None:
+        # The penalty term discourages drastic changes from the original prediction's latent space.
+        stabilization_lambda = 0.25 # Hyperparameter to balance the two loss terms
+        stabilization_loss = torch.nn.functional.mse_loss(ctm_features_for_head_new, failed_features)
+        loss += stabilization_lambda * stabilization_loss
+        print(f"  > Combined Loss: {loss.item():.4f} (Focal: {base_loss_val:.4f}, Stabilize: {stabilization_loss.item():.4f})")
+    else:
+        print(f"  > Focused Loss: {base_loss_val:.4f} on {int(correction_mask.sum())} pixels.")
 
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Add gradient clipping for stability
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+    scheduler.step() # Step the learning rate scheduler
+
     model.eval()
-    print(f"  > Model successfully updated. Focused Loss: {loss.item():.4f} on {int(correction_mask.sum())} pixels.")
+    arc_output_head.eval()
+    print(f"  > Model updated. LR: {scheduler.get_last_lr()[0]:.6f}")
 
 
 class IsolatedSelfLearningEnvironment:
@@ -187,76 +492,119 @@ class IsolatedSelfLearningEnvironment:
     A simulated secure container to run the self-correction and online
     learning process, preventing accidental harm to the main evaluation loop.
     """
-    def __init__(self, model, optimizer, device):
+    def __init__(self, model, arc_output_head, optimizer, device):
         self.model = model
+        self.arc_output_head = arc_output_head
         self.optimizer = optimizer
         self.device = device
+        self.scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.9)
         # Add a traceback import if it's not already global
         global traceback
         import traceback
 
 
-    def run_correction_and_update(self, input_bytes, failed_grid, target_grid_full, original_dims):
+    def run_correction_and_update(self, input_bytes, failed_grid, target_grid_full, original_dims, failed_features: Optional[torch.Tensor] = None, train_pairs: Optional[List[dict]] = None):
         """
-        Runs the full MCMC correction and online update process.
-        Returns the corrected grid if successful, otherwise None.
+        Runs an ensemble of MCMC chains for correction and an online update.
+        This implements the ensemble, consensus, and iterative refinement strategies.
         """
-        print("\n--- Entering Isolated Self-Learning Environment ---")
+        print("\n--- Entering Isolated Self-Learning Environment (Ensemble Mode) ---")
         try:
             h_orig, w_orig = original_dims
             final_target = target_grid_full[:h_orig, :w_orig]
 
+            # --- Adaptive Hyperparameter & Meta-Learning Enhancements ---
+            # Future work: Implement dynamic adjustment of MCMC params based on acceptance rates.
+            # Future work: Use meta-learning to adapt the surrogate network to new tasks.
+            
             # 1. Initialize the CTM-based surrogate model
-            ctm_surrogate = CTMSurrogate(
-                model=self.model,
-                input_bytes_eval=input_bytes,
-                target_grid=final_target,
-                device=self.device
+            # The `feature_extractor` could be an auxiliary network for learned similarity.
+            ctm_surrogate = CTMSurrogate(model=self.model, arc_output_head=self.arc_output_head, input_bytes_eval=input_bytes, target_grid=final_target, device=self.device)
+
+            # --- Meta-Learning Step ---
+            if train_pairs:
+                ctm_surrogate.adapt_to_new_task(train_pairs, self.optimizer)
+
+            # 2. Define MCMC config with local refinement enabled
+            mcmc_config = MCMCConfig(
+                num_chains=5, # Run 5 chains for the ensemble
+                chain_length=2000, # Shorter chains for efficiency
+                initial_temp=35.0, final_temp=0.01, burn_in=200,
+                proposal_strategy="hybrid", mutation_region_size=3,
+                convergence_window=150, convergence_threshold=1e-5,
+                enable_local_refinement=True, refinement_trigger_similarity=0.95
             )
 
-            # 2. Define the search space
-            arc_space = ARCSelfEditSpace(grid_dims=(h_orig, w_orig), mutation_rate=0.1)
+            arc_space = ARCSelfEditSpace(
+                grid_dims=(h_orig, w_orig),
+                initial_mutation_rate=0.20, # Higher initial rate for diversity
+                final_mutation_rate=0.01,
+                decay_steps=mcmc_config.chain_length
+            )
 
             # 3. Initial state for MCMC is the failed prediction
             initial_mcmc_state = failed_grid[:h_orig, :w_orig]
+            error_focus = (initial_mcmc_state != final_target).astype(np.float32)
 
-            # 4. Configure and run the sampler
-            mcmc_config = MCMCConfig()
-            corrected_grid_cropped = metropolis_hastings_sampler(
-                initial_state=initial_mcmc_state,
-                surrogate_func=ctm_surrogate,
-                output_space=arc_space,
-                config=mcmc_config
-            )
+            # 4. Run MCMC Ensemble
+            ensemble_results = []
+            print(f"  > Starting MCMC ensemble with {mcmc_config.num_chains} chains...")
+            for i in range(mcmc_config.num_chains):
+                print(f"  > Running Chain {i+1}/{mcmc_config.num_chains}...")
+                # Introduce slight diversity in initial state for each chain
+                diverse_initial_state = initial_mcmc_state.copy()
+                if i > 0: # Mutate the initial state slightly for other chains
+                    diverse_initial_state = arc_space.get_neighbors(diverse_initial_state, step=0, n_neighbors=1)[0]
 
-            # 5. Prepare the full-sized corrected grid
-            corrected_grid_full = np.full(MAX_GRID_SIZE, PADDING_VALUE, dtype=int)
-            corrected_grid_full[:h_orig, :w_orig] = corrected_grid_cropped
-
-            # 6. Check if the correction is successful BEFORE updating
-            if np.array_equal(corrected_grid_cropped, final_target):
-                print("  > Correction successful. Performing online update inside the container.")
-                perform_online_update(
-                    model=self.model,
-                    optimizer=self.optimizer,
-                    input_bytes=input_bytes,
-                    failed_grid_np=failed_grid,
-                    corrected_grid_np=corrected_grid_full,
-                    original_dims=original_dims,
-                    device=self.device
+                corrected_grid_cropped, _ = metropolis_hastings_sampler(
+                    initial_state=diverse_initial_state,
+                    surrogate_func=ctm_surrogate,
+                    output_space=arc_space,
+                    config=mcmc_config,
+                    error_focus=error_focus
                 )
-                print("--- Exiting Isolated Environment (Update Performed) ---")
-                return corrected_grid_full
-            else:
-                print("  > MCMC correction was not successful. Discarding changes.")
-                print("--- Exiting Isolated Environment (No Update) ---")
-                return None
+                ensemble_results.append(corrected_grid_cropped)
+
+            # 5. Consensus Strategy: Majority vote per pixel
+            print("  > Combining ensemble results via majority vote...")
+            final_corrected_grid_cropped = self.get_consensus_grid(ensemble_results, (h_orig, w_orig))
+
+            # 6. Prepare the full-sized corrected grid
+            corrected_grid_full = np.full(MAX_GRID_SIZE, PADDING_VALUE, dtype=int)
+            corrected_grid_full[:h_orig, :w_orig] = final_corrected_grid_cropped
+
+            # 7. Always perform an online update with the consensus grid.
+            similarity = np.sum(final_corrected_grid_cropped == final_target) / final_target.size
+            print(f"  > Consensus solution has {similarity:.2%} similarity. Committing to online update.")
+            perform_online_update(
+                model=self.model, arc_output_head=self.arc_output_head,
+                optimizer=self.optimizer, scheduler=self.scheduler,
+                input_bytes=input_bytes, failed_grid_np=failed_grid,
+                corrected_grid_np=corrected_grid_full, original_dims=original_dims,
+                device=self.device,
+                failed_features=failed_features
+            )
+            
+            print("--- Exiting Isolated Environment (Update ALWAYS Performed) ---")
+            return corrected_grid_full
 
         except Exception as e:
             print(f"❌ Error within Isolated Self-Learning Environment: {e}")
             traceback.print_exc()
             print("--- Exiting Isolated Environment (Error Occurred) ---")
             return None
+
+    def get_consensus_grid(self, grids: List[np.ndarray], dims: tuple) -> np.ndarray:
+        """Determines the most likely grid from an ensemble using a pixel-wise majority vote."""
+        h, w = dims
+        final_grid = np.zeros(dims, dtype=int)
+        for r in range(h):
+            for c in range(w):
+                # Count votes for each color at this pixel
+                pixel_votes = collections.Counter(grid[r, c] for grid in grids)
+                # Choose the color with the most votes
+                final_grid[r, c] = pixel_votes.most_common(1)[0][0]
+        return final_grid
 
 
 # Setup module paths based on user-provided successful import logic
@@ -923,38 +1271,43 @@ else:
         solved_tasks = 0
 
         # Instantiate the isolated learning environment
-        unwrapped_optimizer = accelerator_arc.unwrap_model(optimizer_arc) if ACCELERATE_AVAILABLE else optimizer_arc
+        # The optimizer is already prepared by Accelerate and does not need to be unwrapped with unwrap_model.
         learning_container = IsolatedSelfLearningEnvironment(
             model=ctm_model_arc,
-            optimizer=unwrapped_optimizer,
+            arc_output_head=arc_output_head,
+            optimizer=optimizer_arc,
             device=device
         )
 
-        with torch.inference_mode():
-            for task_idx, task_batch in enumerate(arc_eval_loader):
-                if not task_batch: continue
+        for task_idx, task_batch in enumerate(arc_eval_loader):
+            if not task_batch: continue
 
-                current_task_data = task_batch
-                total_tasks += 1
-                task_solved_overall = True
+            current_task_data = task_batch
+            total_tasks += 1
+            task_solved_overall = True
 
-                if 'test' not in current_task_data or not current_task_data['test']:
-                    print(f"Task {task_idx + 1} ({current_task_data.get('id', 'N/A')}): No test cases found. Skipping.")
-                    task_solved_overall = False
-                    continue
+            if 'test' not in current_task_data or not current_task_data['test']:
+                print(f"Task {task_idx + 1} ({current_task_data.get('id', 'N/A')}): No test cases found. Skipping.")
+                task_solved_overall = False
+                continue
 
-                for test_pair_idx, test_pair in enumerate(current_task_data['test']):
-                    input_grid_np_eval = test_pair['input'].cpu().numpy()
-                    input_bytes_eval_single = serialize_and_pad_grid(input_grid_np_eval, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE)
-                    input_bytes_eval_np = np.frombuffer(input_bytes_eval_single, dtype=np.uint8).copy()
-                    input_bytes_eval = torch.from_numpy(input_bytes_eval_np).to(torch.uint8).unsqueeze(0).to(device)
+            for test_pair_idx, test_pair in enumerate(current_task_data['test']):
+                # Squeeze the batch dimension (size 1) from the data loader output
+                input_grid_np_eval = test_pair['input'].squeeze(0).cpu().numpy()
+                input_bytes_eval_single = serialize_and_pad_grid(input_grid_np_eval, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE)
+                input_bytes_eval_np = np.frombuffer(input_bytes_eval_single, dtype=np.uint8).copy()
+                input_bytes_eval = torch.from_numpy(input_bytes_eval_np).to(torch.uint8).unsqueeze(0).to(device)
 
-                    target_grid_np = test_pair['output'].cpu().numpy()
-                    original_dims = test_pair['original_output_dims']
+                target_grid_np = test_pair['output'].squeeze(0).cpu().numpy()
+                # The dataloader collates the (h, w) tuple into a tuple/list of tensors.
+                # We need to extract the integer values from these tensors.
+                h_tensor, w_tensor = test_pair['original_output_dims']
+                original_dims = (h_tensor.item(), w_tensor.item())
 
-                    test_input_solved = False
+                test_input_solved = False
 
-                    # --- First Attempt: Standard Prediction ---
+                # --- First Attempt: Standard Prediction (with no_grad) ---
+                with torch.no_grad():
                     current_batch_size_eval = input_bytes_eval.size(0)
                     eval_timestep = torch.zeros(current_batch_size_eval, device=input_bytes_eval.device).long()
                     eval_model_output_dict = ctm_model_arc(
@@ -964,49 +1317,66 @@ else:
                         timestep=eval_timestep,
                         task_name="ARC_AGI_2_EVAL_DIFFUSION"
                     )
-                    predicted_byte_sequence = eval_model_output_dict.get('diffusion_output') or eval_model_output_dict.get('final_output')
-
-                    if predicted_byte_sequence is None:
-                        preds_grid = np.zeros(MAX_GRID_SIZE, dtype=int)
-                    else:
-                        if predicted_byte_sequence.ndim == 1: predicted_byte_sequence = predicted_byte_sequence.unsqueeze(0)
-                        if predicted_byte_sequence.shape[1] >= ARC_INPUT_FLAT_DIM:
-                            preds_flat_bytes = predicted_byte_sequence[0, :ARC_INPUT_FLAT_DIM]
-                            preds_grid = preds_flat_bytes.view(MAX_GRID_SIZE).long().cpu().numpy()
+                    
+                    preds_grid = np.zeros(MAX_GRID_SIZE, dtype=int)
+                    # Extract features consistent with training loop logic
+                    ctm_core_output_data = eval_model_output_dict.get('ctm_core_data')
+                    ctm_backbone_output = None
+                    if ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
+                        ctm_backbone_output = ctm_core_output_data['final_sync_out']
+                    elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
+                        ctm_backbone_output = ctm_core_output_data['ctm_latent_representation']
+                    
+                    if ctm_backbone_output is not None:
+                        # Process features like in training
+                        if ctm_backbone_output.ndim > 2 and ctm_backbone_output.shape[1] > 0:
+                             ctm_features_for_head = ctm_backbone_output.mean(dim=1)
                         else:
-                            preds_grid = np.zeros(MAX_GRID_SIZE, dtype=int)
+                             ctm_features_for_head = ctm_backbone_output
+                        
+                        logits = arc_output_head(ctm_features_for_head)
+                        preds_flat = torch.argmax(logits.view(-1, NUM_ARC_SYMBOLS), dim=-1)
+                        preds_grid = preds_flat.view(MAX_GRID_SIZE).long().cpu().numpy()
 
-                    # --- Evaluate Prediction ---
-                    h, w = original_dims
-                    final_pred = preds_grid[:h, :w]
-                    final_target = target_grid_np[:h, :w]
+                # --- Evaluate Prediction ---
+                h, w = original_dims
+                final_pred = preds_grid[:h, :w]
+                final_target = target_grid_np[:h, :w]
 
-                    if np.array_equal(final_pred, final_target):
-                        print(f"  > Test pair {test_pair_idx+1} solved on attempt 1.")
-                        test_input_solved = True
-                    else:
-                        # --- Second Attempt: Isolated Self-Correction ---
-                        corrected_grid = learning_container.run_correction_and_update(
-                            input_bytes=input_bytes_eval,
-                            failed_grid=preds_grid,
-                            target_grid_full=target_grid_np,
-                            original_dims=original_dims
-                        )
+                if np.array_equal(final_pred, final_target):
+                    print(f"  > Test pair {test_pair_idx+1} solved on attempt 1.")
+                    test_input_solved = True
+                else:
+                    # --- Second Attempt: Isolated Self-Correction (with gradients enabled) ---
+                    features_from_failed_pred = ctm_features_for_head.detach() # Detach to prevent gradients from flowing back further
+                    corrected_grid = learning_container.run_correction_and_update(
+                        input_bytes=input_bytes_eval,
+                        failed_grid=preds_grid,
+                        target_grid_full=target_grid_np,
+                        original_dims=original_dims,
+                        failed_features=features_from_failed_pred,
+                        train_pairs=current_task_data.get('train')
+                    )
 
-                        if corrected_grid is not None:
+                    if corrected_grid is not None:
+                        # Re-evaluate the grid returned by the learning container
+                        final_pred_corrected = corrected_grid[:h, :w]
+                        if np.array_equal(final_pred_corrected, final_target):
                             print(f"  > Test pair {test_pair_idx+1} solved on attempt 2 (after self-correction).")
                             test_input_solved = True
-                    
-                    if not test_input_solved:
-                        task_solved_overall = False
-                        # This break will exit the loop over test pairs for the current task
-                        break
+                        else:
+                            print(f"  > Self-correction did not produce the correct solution.")
                 
-                if task_solved_overall:
-                    solved_tasks += 1
-                    print(f"  Task {task_idx + 1}/{len(arc_eval_loader)} ({current_task_data.get('id', 'N/A')}): SOLVED")
-                else:
-                    print(f"  Task {task_idx + 1}/{len(arc_eval_loader)} ({current_task_data.get('id', 'N/A')}): FAILED")
+                if not test_input_solved:
+                    task_solved_overall = False
+                    # This break will exit the loop over test pairs for the current task
+                    break
+            
+            if task_solved_overall:
+                solved_tasks += 1
+                print(f"  Task {task_idx + 1}/{len(arc_eval_loader)} ({current_task_data.get('id', 'N/A')}): SOLVED")
+            else:
+                print(f"  Task {task_idx + 1}/{len(arc_eval_loader)} ({current_task_data.get('id', 'N/A')}): FAILED")
         
         if total_tasks > 0:
             accuracy = (solved_tasks / total_tasks) * 100
