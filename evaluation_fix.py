@@ -30,6 +30,8 @@ class FocalLoss(nn.Module):
 
     def forward(self, inputs, targets):
         # inputs: [N, C, H, W], targets: [N, H, W]
+        if targets.dim() == 4 and targets.shape[1] == 1:
+            targets = targets.squeeze(1)
         ce_loss_fn = nn.CrossEntropyLoss(reduction='none', ignore_index=self.ignore_index)
         ce_loss = ce_loss_fn(inputs, targets)
         
