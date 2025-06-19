@@ -4267,7 +4267,7 @@ class EnhancedCTMDiffusion(nn.Module):
         encoded_features = self.input_encoder(raw_features) # Output: (batch, num_patches_or_seq, ctm_input_dim)
 
         # Apply positional embedding if configured
-        if self.positional_embedding is not None:
+        if self.positional_embedding is not None and encoded_features.shape[1] > 0:
             if self.config.reshape_patch_sequence_to_grid and \
                isinstance(self.positional_embedding, (LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding)):
                 

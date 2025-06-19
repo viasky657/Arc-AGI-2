@@ -125,6 +125,12 @@ def collate_fn_new_custom_arc(batch_of_tasks):
     final_target_byte_sequences_for_diffusion = torch.stack(target_byte_sequences_for_diffusion_list)
     final_original_target_grids_for_ce_loss = torch.stack(original_target_grids_for_ce_loss_list)
     
+    # --- Fix for potential negative padding values ---
+    # The CrossEntropyLoss criterion expects class indices to be non-negative.
+    # If the padding value used in the dataset is negative, it can cause a CUDA 'device-side assert' error.
+    # We defensively clamp the lower bound of the target tensor to 0.
+    final_original_target_grids_for_ce_loss.clamp_(min=0)
+    
     return {
         'input_byte_sequences': final_input_byte_sequences,
         'target_byte_sequences_for_diffusion': final_target_byte_sequences_for_diffusion,
@@ -205,14 +211,9 @@ else:
                     current_epoch=epoch
                 )
 
-                # --- NEW: Incorporate Predictive Coding Loss ---
-                ctm_core_data = model_output_dict.get('ctm_core_data')
-                predictive_coding_loss = torch.tensor(0.0, device=input_bytes.device)
-                if ctm_core_data and 'predictive_coding_loss' in ctm_core_data:
-                    predictive_coding_loss = ctm_core_data['predictive_coding_loss']
-
-                enhanced_ctm_loss = model_output_dict.get('total_loss', torch.tensor(0.0, device=input_bytes.device))
-                loss = enhanced_ctm_loss + (predictive_coding_loss * PC_LOSS_WEIGHT)
+                # The 'total_loss' from the model output already includes the predictive coding loss,
+                # so we use it directly. This resolves the NameError for PC_LOSS_WEIGHT.
+                loss = model_output_dict.get('total_loss', torch.tensor(0.0, device=input_bytes.device))
 
                 # Get CTM core output for the external ARC head
                 ctm_backbone_output = None
