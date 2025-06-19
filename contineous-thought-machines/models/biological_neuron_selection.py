@@ -169,19 +169,25 @@ class BiologicalNeuronSelector:
         else:
             # Unsupervised Hebbian: co-activation patterns
             # Update correlation matrix with exponential moving average
-            current_corr = torch.corrcoef(activations.T)
-            current_corr = torch.nan_to_num(current_corr, 0.0)
-            
-            if self.correlation_matrix is None:
-                self.correlation_matrix = current_corr
+            if batch_size > 1:
+                current_corr = torch.corrcoef(activations.T)
+                current_corr = torch.nan_to_num(current_corr, 0.0)
+                
+                if self.correlation_matrix is None:
+                    self.correlation_matrix = current_corr
+                else:
+                    self.correlation_matrix = (self.config.decay_rate * self.correlation_matrix +
+                                             (1 - self.config.decay_rate) * current_corr)
+
+            if self.correlation_matrix is not None:
+                # Select neurons with high average correlation (excluding self-correlation)
+                mask = ~torch.eye(num_neurons, dtype=torch.bool, device=device)
+                avg_correlations = torch.sum(torch.abs(self.correlation_matrix) * mask, dim=1) / (num_neurons - 1)
+                hebbian_scores = avg_correlations
             else:
-                self.correlation_matrix = (self.config.decay_rate * self.correlation_matrix + 
-                                         (1 - self.config.decay_rate) * current_corr)
-            
-            # Select neurons with high average correlation (excluding self-correlation)
-            mask = ~torch.eye(num_neurons, dtype=torch.bool, device=device)
-            avg_correlations = torch.sum(torch.abs(self.correlation_matrix) * mask, dim=1) / (num_neurons - 1)
-            hebbian_scores = avg_correlations
+                # Fallback for batch_size <= 1 and no existing correlation matrix:
+                # Use activation magnitude as a proxy for importance.
+                hebbian_scores = torch.mean(torch.abs(activations), dim=0)
         
         # Store activation history for future use
         self.activation_history.append(activations.detach().cpu())

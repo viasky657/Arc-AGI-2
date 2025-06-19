@@ -217,8 +217,8 @@ else:
 
                 # Get CTM core output for the external ARC head
                 ctm_backbone_output = None
-                if ctm_core_data and 'final_sync_out' in ctm_core_data:
-                    ctm_backbone_output = ctm_core_data['final_sync_out']
+                if model_output_dict and 'final_sync_out' in model_output_dict:
+                    ctm_backbone_output = model_output_dict['final_sync_out']
                 else:
                     print("Warning: CTM core output ('final_sync_out') not found. Using zeros for ARC head input.")
                     ctm_backbone_output = torch.zeros(current_batch_size, config_arc_diffusion.ctm_out_dims, device=input_bytes.device)
