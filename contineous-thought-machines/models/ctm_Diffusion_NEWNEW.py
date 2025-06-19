@@ -573,6 +573,7 @@ from .mcmc_interpretability_solver import (
     BlackBoxSolver # MCMCInterpretabilityHook, ReasoningChain, ThoughtStep # Not directly used in CTM class
 )
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
+from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
 # Import original CTM modules to preserve exact behavior
 # try:
 from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
@@ -2220,6 +2221,35 @@ class OriginalCTMCore(nn.Module):
         # --- Assertions ---
         self.verify_args() # verify_args will use self.d_model, self.n_synch_out etc.
         
+        # --- Predictive Coding Parameters ---
+        self.use_predictive_coding = getattr(config, 'ctm_use_predictive_coding', True)
+        self.pc_num_layers = getattr(config, 'ctm_pc_num_layers', 4)
+        if self.use_predictive_coding:
+            assert self.d_model % self.pc_num_layers == 0, "d_model must be divisible by pc_num_layers"
+            pc_layer_size = self.d_model // self.pc_num_layers
+            self.prediction_nets = nn.ModuleList(
+                [nn.Linear(pc_layer_size, pc_layer_size) for _ in range(self.pc_num_layers - 1)]
+            )
+
+        # --- Activity-Dependent Plasticity Parameters ---
+        self.use_activity_plasticity = getattr(config, 'ctm_use_activity_plasticity', True)
+        self.plasticity_learning_rate = getattr(config, 'ctm_plasticity_learning_rate', 1e-4)
+        if self.use_activity_plasticity:
+            self.plastic_synapses = nn.Linear(self.d_model, self.d_model, bias=False)
+            nn.init.zeros_(self.plastic_synapses.weight) # Start with no plastic influence
+        
+        self.register_buffer('last_state_trace', torch.zeros((1, self.d_model, self.memory_length)), persistent=False)
+
+        self.biological_selector = None
+        if self.neuron_select_type.startswith('bio_'):
+            try:
+                # Create a config for the selector
+                bio_config = BiologicalSelectionConfig(selection_type=self.neuron_select_type.replace('bio_', ''))
+                self.biological_selector = BiologicalNeuronSelector(config=bio_config)
+            except ImportError:
+                print("Warning: biological_neuron_selection.py not found. Cannot use biological selector for plasticity.")
+                self.biological_selector = None
+
         # --- Input Processing / Attention ---
         # q_proj projects synchronisation_action (related to CTM's d_model) to ctm_input_dim for attention query
         self.q_proj = nn.LazyLinear(self.d_input) if heads > 0 else None # This q_proj is for CTM's internal query generation
@@ -2606,6 +2636,12 @@ class OriginalCTMCore(nn.Module):
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input) # state shape: (B, d_model)
+            
+            # --- Apply Activity-Dependent Plasticity ---
+            if self.use_activity_plasticity:
+                plastic_adjustment = self.plastic_synapses(activated_state)
+                state = state + plastic_adjustment
+
             # The 'state_trace' is the history of incoming pre-activations
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1) # (B, d_model, memory_length)
 
@@ -2637,7 +2673,119 @@ class OriginalCTMCore(nn.Module):
         if track:
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
         return predictions, certainties, synchronisation_out
-    
+
+    def compute_predictive_coding_loss(self, activated_state: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the predictive coding loss based on hierarchical layers
+        within the CTM's activated state.
+        Higher layers predict the state of lower layers.
+        """
+        if not self.use_predictive_coding:
+            return torch.tensor(0.0, device=activated_state.device)
+
+        # Split the activated state into hierarchical layers
+        # layers are ordered from low to high, e.g., layers[0] is the lowest
+        try:
+            layers = torch.chunk(activated_state, self.pc_num_layers, dim=1)
+        except RuntimeError as e:
+            # This can happen if activated_state cannot be split into pc_num_layers
+            print(f"Warning: Could not compute predictive coding loss. Activated state shape {activated_state.shape} could not be chunked into {self.pc_num_layers} layers. Error: {e}")
+            return torch.tensor(0.0, device=activated_state.device)
+        
+        total_pc_loss = 0.0
+        
+        # Higher layers predict lower layers
+        for i in range(self.pc_num_layers - 1):
+            higher_layer_idx = i + 1
+            lower_layer_idx = i
+            
+            # Prediction from higher to lower layer
+            # self.prediction_nets[i] predicts layer i from layer i+1
+            predicted_lower_layer = self.prediction_nets[i](layers[higher_layer_idx])
+            
+            # Calculate prediction error (local loss)
+            # We detach the target to prevent gradients from flowing back from the target,
+            # ensuring the higher layer is trained to predict the lower, not the other way around.
+            local_loss = F.mse_loss(predicted_lower_layer, layers[lower_layer_idx].detach())
+            total_pc_loss += local_loss
+            
+        return total_pc_loss
+
+    def apply_activity_plasticity(self, global_loss: torch.Tensor):
+        """
+        Updates the plastic synapse weights based on a Hebbian rule modulated by global success.
+        This method is now tied to the neuron selection mechanism, applying plasticity only
+        to the connections between neurons selected for action and output synchronization.
+        """
+        if not self.use_activity_plasticity or not self.training:
+            return
+
+        with torch.no_grad():
+            learning_signal = -global_loss.detach()
+            
+            state_trace = self.last_state_trace
+            if state_trace is None or state_trace.numel() == 0:
+                print("Warning: last_state_trace not available for plasticity update. Skipping.")
+                return
+
+            # Get the indices of all unique neurons involved in synchronization
+            eligible_indices = torch.unique(torch.cat([
+                self.action_neuron_indices_left, self.action_neuron_indices_right,
+                self.out_neuron_indices_left, self.out_neuron_indices_right
+            ]))
+
+            # Extract the state traces for only these eligible neurons
+            eligible_traces = state_trace[:, eligible_indices, :]
+            
+            # Get biological modulation scores
+            modulation_scores = torch.ones(len(eligible_indices), device=state_trace.device)
+            if self.biological_selector is not None and self.neuron_select_type.startswith('bio_'):
+                selector_activations = eligible_traces.mean(dim=-1)
+                
+                _, metadata = self.biological_selector.select_neurons(
+                    activations=selector_activations.mean(dim=0).unsqueeze(0),
+                    top_k=len(eligible_indices),
+                    layer_name="plasticity_update"
+                )
+
+                sel_type = self.neuron_select_type.replace('bio_', '')
+                score_key_map = {
+                    'hebbian': 'hebbian_scores', 'plasticity': 'plasticity_scores',
+                    'competitive': 'competition_scores', 'homeostatic': 'homeostatic_scores',
+                    'evolutionary': 'fitness_scores', 'stdp': 'stdp_scores',
+                    'criticality': 'criticality_scores', 'multi_objective': 'combined_scores',
+                }
+                score_key = score_key_map.get(sel_type)
+                if score_key and score_key in metadata:
+                    scores = metadata[score_key].detach()
+                    scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+                    modulation_scores = scores
+
+            # Compute Hebbian trace for the subset of eligible neurons
+            st_batch_mean = eligible_traces.mean(dim=0)
+            st_centered = st_batch_mean - st_batch_mean.mean(dim=1, keepdim=True)
+            cov_matrix = torch.matmul(st_centered, st_centered.T) / (st_centered.shape[1] - 1)
+            stds = torch.std(st_batch_mean, dim=1, keepdim=True)
+            stds[stds == 0] = 1e-8
+            
+            local_hebbian_trace = cov_matrix / (torch.matmul(stds, stds.T))
+            local_hebbian_trace = torch.nan_to_num(local_hebbian_trace)
+            
+            # Modulate Hebbian trace with biological scores
+            modulation_matrix = torch.outer(modulation_scores, modulation_scores)
+            modulated_hebbian_trace = local_hebbian_trace * modulation_matrix
+
+            # Create a sparse weight update tensor
+            delta_W = torch.zeros_like(self.plastic_synapses.weight)
+            update_values = self.plasticity_learning_rate * modulated_hebbian_trace * learning_signal
+            
+            # Assign the updates to the correct positions in the main weight matrix
+            row_indices, col_indices = torch.meshgrid(eligible_indices, eligible_indices, indexing='ij')
+            delta_W[row_indices, col_indices] = update_values
+
+            # Apply the sparse update
+            self.plastic_synapses.weight.add_(delta_W)
+
     def forward_with_full_tracking(self, kv_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Enhanced forward pass that returns ALL CTM internal states for diffusion control.
@@ -2645,11 +2793,12 @@ class OriginalCTMCore(nn.Module):
         Returns:
             Dict containing:
             - predictions: (B, out_dims, iterations)
-            - certainties: (B, 2, iterations)  
+            - certainties: (B, 2, iterations)
             - sync_out_history: List of sync outputs per iteration
             - sync_action_history: List of sync actions per iteration
             - activated_states: List of activated states per iteration
             - state_traces: List of state traces per iteration
+            - predictive_coding_loss: Accumulated predictive coding loss
         """
         B = kv_features.size(0)
         device = kv_features.device
@@ -2660,7 +2809,8 @@ class OriginalCTMCore(nn.Module):
             'sync_action_history': [],
             'activated_states': [],
             'state_traces': [],
-            'attention_weights': []
+            'attention_weights': [],
+            'pc_losses': []
         }
         
         # Initialize recurrent state
@@ -2724,6 +2874,11 @@ class OriginalCTMCore(nn.Module):
 
             # Apply synapses
             state = self.synapses(pre_synapse_input)
+
+            # --- Apply Activity-Dependent Plasticity ---
+            if self.use_activity_plasticity:
+                plastic_adjustment = self.plastic_synapses(activated_state)
+                state = state + plastic_adjustment
             
             # Update state trace
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
@@ -2731,9 +2886,12 @@ class OriginalCTMCore(nn.Module):
             
             # Apply neuron-level models
             activated_state = self.trace_processor(state_trace)
-
-
             tracking_data['activated_states'].append(activated_state.clone())
+
+            # --- Predictive Coding Loss ---
+            if self.use_predictive_coding:
+                pc_loss = self.compute_predictive_coding_loss(activated_state)
+                tracking_data['pc_losses'].append(pc_loss)
             
             # Calculate synchronisation for output predictions
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
@@ -2748,10 +2906,14 @@ class OriginalCTMCore(nn.Module):
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
         
+        # Store final state trace for plasticity update
+        self.last_state_trace = state_trace.detach()
+
         return {
             'predictions': predictions,
             'certainties': certainties,
             'final_sync_out': synchronisation_out,
+            'predictive_coding_loss': torch.stack(tracking_data['pc_losses']).mean() if tracking_data['pc_losses'] else torch.tensor(0.0, device=device),
             **tracking_data
         }
 
@@ -4668,6 +4830,14 @@ class EnhancedCTMDiffusion(nn.Module):
                 guidance_data_for_diffusion['final_sync_out'] = final_ctm_representation
             else:
                 guidance_data_for_diffusion['mcmc_refined_guidance_signal'] = final_ctm_representation
+            
+            # --- Activity Plasticity Update Step ---
+            # This is where you would call the plasticity update.
+            # The training loop needs to be modified to do this.
+            # For now, I am adding a placeholder call here to show where it would go.
+            # In a real scenario, this would be handled by the trainer.
+            if self.training and 'total_loss' in locals() and self.config.use_activity_plasticity:
+                 self.ctm_core.apply_activity_plasticity(locals()['total_loss'])
 
             effective_timestep = timestep
             if hasattr(self.config, 'adaptive_scheduling') and self.config.adaptive_scheduling and hasattr(self.diffusion, 'get_adaptive_timesteps'):
@@ -4791,6 +4961,12 @@ class EnhancedCTMDiffusion(nn.Module):
         current_total_loss += output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device))
         current_total_loss += output_dict.get('mcmc_loss', torch.tensor(0.0, device=device))
         
+        # Add predictive coding loss to total loss
+        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'predictive_coding_loss' in output_dict['ctm_core_data']:
+            pc_loss = output_dict['ctm_core_data']['predictive_coding_loss']
+            output_dict['predictive_coding_loss'] = pc_loss
+            current_total_loss += pc_loss * getattr(self.config, 'ctm_pc_loss_weight', 0.1)
+
         output_dict['total_loss'] = current_total_loss
 
         # Convert final_output to bytes if it's audio from diffusion modes
