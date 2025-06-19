@@ -1939,6 +1939,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     gradient_checkpointing: bool = True
     sparse_attention: bool = True  # Now implemented with BinarySparseAttention
     adaptive_depth: bool = False   # Defaulting to False, can be enabled if implemented
+    use_activity_plasticity: bool = True # To enable/disable plasticity updates; Needs to be set to TRUE
     
     # Sparse Attention Parameters
     sparse_attention_ratio: float = 0.1  # Keep only 10% of attention connections
@@ -2232,7 +2233,7 @@ class OriginalCTMCore(nn.Module):
             )
 
         # --- Activity-Dependent Plasticity Parameters ---
-        self.use_activity_plasticity = getattr(config, 'ctm_use_activity_plasticity', True)
+        self.use_activity_plasticity = getattr(config, 'use_activity_plasticity', True)
         self.plasticity_learning_rate = getattr(config, 'ctm_plasticity_learning_rate', 1e-4)
         if self.use_activity_plasticity:
             self.plastic_synapses = nn.Linear(self.d_model, self.d_model, bias=False)
@@ -4836,7 +4837,7 @@ class EnhancedCTMDiffusion(nn.Module):
             # The training loop needs to be modified to do this.
             # For now, I am adding a placeholder call here to show where it would go.
             # In a real scenario, this would be handled by the trainer.
-            if self.training and 'total_loss' in locals() and self.config.use_activity_plasticity:
+            if self.training and 'total_loss' in locals() and self.ctm_core.use_activity_plasticity:
                  self.ctm_core.apply_activity_plasticity(locals()['total_loss'])
 
             effective_timestep = timestep
