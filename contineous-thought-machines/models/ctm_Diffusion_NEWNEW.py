@@ -4663,17 +4663,22 @@ class EnhancedCTMDiffusion(nn.Module):
         # --- Diffusion Model Logic ---
         numeric_target_diffusion_output = None
         if target_diffusion_output is not None:
-            # Assuming target_diffusion_output from training script is now bytes (uint8)
-            # Convert to numeric (float32) for diffusion processing
-            # Check if it's already numeric (e.g. if called internally with non-byte target)
+            # --- Corrected ARC Grid Data Processing for Diffusion ---
+            # The input `target_diffusion_output` is a byte tensor (uint8) representing ARC grids (symbols 0-10).
+            # It needs to be converted to a float tensor and normalized for the diffusion model.
+            # The previous method `batched_bytes_to_numeric_tensor` was incorrect as it reinterpreted
+            # memory, which is only valid if the bytes were originally serialized from floats.
+
             if target_diffusion_output.dtype == torch.uint8:
-                try:
-                    item_size_for_numeric = self.config.audio_output_item_size
-                    numeric_target_diffusion_output = batched_bytes_to_numeric_tensor(target_diffusion_output, item_size=item_size_for_numeric, target_dtype=np.float32)
-                except ValueError as e:
-                    print(f"Warning: Error converting byte target_diffusion_output to numeric: {e}. Using as is, which might be incorrect.")
-                    numeric_target_diffusion_output = target_diffusion_output # Fallback, though likely problematic
-            else: # Already numeric
+                # 1. Convert the byte tensor to float.
+                float_target = target_diffusion_output.float()
+                
+                # 2. Normalize the values. ARC symbols are 0-9, padding is 10.
+                # Normalizing to the standard [-1, 1] range.
+                # Max value is 10. (val / 5.0) - 1.0 maps [0, 10] to [-1, 1].
+                normalized_target = (float_target / 5.0) - 1.0
+                numeric_target_diffusion_output = normalized_target
+            else: # Already numeric (e.g., during sampling)
                 numeric_target_diffusion_output = target_diffusion_output
 
             if kv_features_for_ctm.size(1) != numeric_target_diffusion_output.size(1) and hasattr(self.diffusion, 'unet') and numeric_target_diffusion_output.ndim > 1:
