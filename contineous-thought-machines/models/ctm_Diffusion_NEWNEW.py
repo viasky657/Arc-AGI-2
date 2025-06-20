@@ -2732,6 +2732,8 @@ class OriginalCTMCore(nn.Module):
             # This provides a more specific, biologically-inspired update rule for these synapses,
             # which is modulated by the overall success (global_loss).
             learning_signal = -global_loss.detach()
+            # --- DEBUGGING: Log the learning signal to monitor for volatility ---
+            print(f"[Plasticity] Learning Signal (from neg-loss): {learning_signal.item():.4f}")
             state_trace = self.last_state_trace
 
             if state_trace is not None and state_trace.numel() > 0 and hasattr(self, 'plastic_synapses'):
@@ -2766,7 +2768,7 @@ class OriginalCTMCore(nn.Module):
                 cov_matrix = torch.matmul(st_centered, st_centered.T) / (st_centered.shape[1] - 1)
                 stds = torch.std(st_batch_mean, dim=1, keepdim=True)
                 stds[stds == 0] = 1e-8
-                local_hebbian_trace = cov_matrix / torch.matmul(stds, stds.T)
+                local_hebbian_trace = cov_matrix / (torch.matmul(stds, stds.T) + 1e-9)
                 local_hebbian_trace = torch.nan_to_num(local_hebbian_trace)
                 
                 modulation_matrix = torch.outer(modulation_scores, modulation_scores)
