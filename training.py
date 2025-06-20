@@ -6,6 +6,11 @@ from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Dataset
 import glob
 import json
+
+CUDA_LAUNCH_BLOCKING=1 #Diagnose cuda errors. 
+# --- FIX: Define NUM_ARC_SYMBOLS globally for DataLoader workers ---
+# The standard ARC task has 10 symbols (0-9).
+NUM_ARC_SYMBOLS = 10
 import numpy as np
 
 print("\n" + "="*60)
@@ -125,11 +130,11 @@ def collate_fn_new_custom_arc(batch_of_tasks):
     final_target_byte_sequences_for_diffusion = torch.stack(target_byte_sequences_for_diffusion_list)
     final_original_target_grids_for_ce_loss = torch.stack(original_target_grids_for_ce_loss_list)
     
-    # --- Fix for potential negative padding values ---
-    # The CrossEntropyLoss criterion expects class indices to be non-negative.
-    # If the padding value used in the dataset is negative, it can cause a CUDA 'device-side assert' error.
-    # We defensively clamp the lower bound of the target tensor to 0.
-    final_original_target_grids_for_ce_loss.clamp_(min=0)
+    # --- Fix for potential out-of-bounds padding values ---
+    # The CrossEntropyLoss criterion expects class indices to be in [0, C-1].
+    # If the padding value is negative or >= C, it can cause a CUDA 'device-side assert' error.
+    # We defensively clamp the target tensor to the valid range [0, NUM_ARC_SYMBOLS - 1].
+    final_original_target_grids_for_ce_loss.clamp_(min=0, max=NUM_ARC_SYMBOLS - 1)
     
     return {
         'input_byte_sequences': final_input_byte_sequences,
@@ -217,10 +222,14 @@ else:
 
                 # Get CTM core output for the external ARC head
                 ctm_backbone_output = None
-                if model_output_dict and 'final_sync_out' in model_output_dict:
+                if model_output_dict and 'predictions' in model_output_dict:
+                    # Use the prediction from the last CTM iteration, which has the correct dimension (512)
+                    ctm_backbone_output = model_output_dict['predictions'][:, :, -1]
+                elif model_output_dict and 'final_sync_out' in model_output_dict:
+                    # Fallback to final_sync_out if predictions are not available
                     ctm_backbone_output = model_output_dict['final_sync_out']
                 else:
-                    print("Warning: CTM core output ('final_sync_out') not found. Using zeros for ARC head input.")
+                    print("Warning: CTM core output ('predictions' or 'final_sync_out') not found. Using zeros for ARC head input.")
                     ctm_backbone_output = torch.zeros(current_batch_size, config_arc_diffusion.ctm_out_dims, device=input_bytes.device)
                 
                 # External ARC Output Head for CrossEntropy loss

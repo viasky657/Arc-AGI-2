@@ -4981,6 +4981,10 @@ class EnhancedCTMDiffusion(nn.Module):
                 except Exception as e:
                     print(f"Warning: Could not convert final_output to bytes in forward method: {e}")
                     # Keep numeric output if conversion fails
+        
+        # --- FIX: Elevate ctm_core_data to top-level dictionary ---
+        if output_dict.get('ctm_core_data'):
+            output_dict.update(output_dict['ctm_core_data'])
 
         return output_dict
     
