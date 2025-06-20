@@ -3538,7 +3538,8 @@ class CTMControlledDiffusionProcessor(nn.Module):
     def add_noise(self, x_start: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         """Add noise to clean data according to diffusion schedule"""
         # Get alpha_bar for the given timesteps
-        alpha_bar = self.alpha_bars[timesteps.to(self.alpha_bars.device)]
+        timesteps = torch.clamp(timesteps, 0, len(self.alpha_bars) - 1).to(self.alpha_bars.device)
+        alpha_bar = self.alpha_bars[timesteps]
         
         # Reshape alpha_bar to match x_start dimensions
         while len(alpha_bar.shape) < len(x_start.shape):
@@ -3647,7 +3648,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
             
             # Compute cosine similarity
             hist_state = self.state_history[(self.history_pointer - i - 1) % self.state_history.size(0)]
-            similarities = torch.cosine_similarity(current_state, hist_state.unsqueeze(0).expand_as(current_state), dim=-1)
+            similarities = torch.cosine_similarity(current_state, hist_state.unsqueeze(0).expand(current_state.shape), dim=-1)
             
             # Check if similarity exceeds threshold
             loop_detected = (similarities > similarity_threshold).float()
