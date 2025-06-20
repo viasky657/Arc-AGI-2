@@ -4983,8 +4983,15 @@ class EnhancedCTMDiffusion(nn.Module):
                     # Keep numeric output if conversion fails
         
         # --- FIX: Elevate ctm_core_data to top-level dictionary ---
-        if output_dict.get('ctm_core_data'):
-            output_dict.update(output_dict['ctm_core_data'])
+        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data']:
+            # The training script relies on 'predictions' and 'final_sync_out' being in the top-level dictionary.
+            # This ensures they are present, preventing the fallback to zeros.
+            ctm_data = output_dict['ctm_core_data']
+            if 'predictions' in ctm_data:
+                output_dict['predictions'] = ctm_data['predictions']
+            if 'final_sync_out' in ctm_data:
+                output_dict['final_sync_out'] = ctm_data['final_sync_out']
+        # --- End of FIX ---
 
         return output_dict
     
