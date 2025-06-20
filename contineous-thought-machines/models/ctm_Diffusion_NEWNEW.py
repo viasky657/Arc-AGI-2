@@ -2765,11 +2765,21 @@ class OriginalCTMCore(nn.Module):
 
                 st_batch_mean = eligible_traces.mean(dim=0)
                 st_centered = st_batch_mean - st_batch_mean.mean(dim=1, keepdim=True)
-                cov_matrix = torch.matmul(st_centered, st_centered.T) / (st_centered.shape[1] - 1)
-                stds = torch.std(st_batch_mean, dim=1, keepdim=True)
-                stds[stds == 0] = 1e-8
-                local_hebbian_trace = cov_matrix / (torch.matmul(stds, stds.T) + 1e-9)
-                local_hebbian_trace = torch.nan_to_num(local_hebbian_trace)
+                
+                # More stable correlation calculation
+                stds = torch.std(st_centered, dim=1, keepdim=True)
+                stds.clamp_min_(1e-6) # Prevent division by zero or very small numbers
+                st_normalized = st_centered / stds
+                
+                memory_len = st_normalized.shape[1]
+                # Divisor is memory_len - 1 for sample correlation
+                divisor = memory_len - 1 if memory_len > 1 else 1
+                
+                local_hebbian_trace = torch.matmul(st_normalized, st_normalized.T) / divisor
+                
+                # Final clamping and handling of any residual NaNs/Infs
+                local_hebbian_trace = torch.nan_to_num(local_hebbian_trace, nan=0.0)
+                local_hebbian_trace = torch.clamp(local_hebbian_trace, -1.0, 1.0)
                 
                 modulation_matrix = torch.outer(modulation_scores, modulation_scores)
                 modulated_hebbian_trace = local_hebbian_trace * modulation_matrix
