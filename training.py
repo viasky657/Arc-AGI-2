@@ -239,6 +239,7 @@ else:
                     else:
                          ctm_features_for_head = ctm_backbone_output
                     
+                    ctm_features_for_head = torch.tanh(ctm_features_for_head)
                     predicted_logits = arc_output_head(ctm_features_for_head)
                     predicted_logits_reshaped = predicted_logits.view(current_batch_size * ARC_INPUT_FLAT_DIM, NUM_ARC_SYMBOLS)
                     target_grids_reshaped = original_target_grids_for_ce.view(current_batch_size * ARC_INPUT_FLAT_DIM)
@@ -262,7 +263,7 @@ else:
                     torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
                     # --- NEW: Apply Activity-Dependent Plasticity ---
                     unwrapped_model = ctm_model_arc
-                    unwrapped_model.ctm_core.apply_activity_plasticity(loss, parent_model=unwrapped_model)
+                    unwrapped_model.ctm_core.apply_activity_plasticity(loss)
                     # The CTM core's gradients are zeroed inside the plasticity rule.
                     # We still need to step the optimizer for other parameters (e.g., arc_output_head).
                     scaler.step(optimizer_arc)
@@ -273,7 +274,7 @@ else:
                  if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     # --- NEW: Apply Activity-Dependent Plasticity ---
                     unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
-                    unwrapped_model.ctm_core.apply_activity_plasticity(loss, parent_model=unwrapped_model)
+                    unwrapped_model.ctm_core.apply_activity_plasticity(loss)
                     # The CTM core's gradients are zeroed inside the plasticity rule.
                     # We still need to step the optimizer for other parameters (e.g., arc_output_head).
                     optimizer_arc.step()
@@ -283,7 +284,7 @@ else:
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
                     # --- NEW: Apply Activity-Dependent Plasticity ---
-                    ctm_model_arc.ctm_core.apply_activity_plasticity(loss, parent_model=ctm_model_arc)
+                    ctm_model_arc.ctm_core.apply_activity_plasticity(loss)
                     # The CTM core's gradients are zeroed inside the plasticity rule.
                     # We still need to step the optimizer for other parameters (e.g., arc_output_head).
                     optimizer_arc.step()
