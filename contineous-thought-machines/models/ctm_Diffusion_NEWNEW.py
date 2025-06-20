@@ -2731,7 +2731,7 @@ class OriginalCTMCore(nn.Module):
             # 2. Local Hebbian Plasticity for 'plastic_synapses'
             # This provides a more specific, biologically-inspired update rule for these synapses,
             # which is modulated by the overall success (global_loss).
-            learning_signal = torch.tanh(-global_loss.detach())
+            learning_signal = torch.clamp(-global_loss.detach(), -1.0, 1.0)
             
             if torch.isnan(learning_signal) or torch.isinf(learning_signal):
                 print(f"[Plasticity Warning] Learning signal is NaN or Inf. Skipping Hebbian update for this step.")
@@ -4731,14 +4731,16 @@ class EnhancedCTMDiffusion(nn.Module):
                     diffusion_loss = torch.tensor(0.0, device=byte_sequence.device, requires_grad=True) # Ensure it has a grad_fn
                 elif hasattr(self.training_noise_scheduler, 'config') and hasattr(self.training_noise_scheduler.config, 'prediction_type'):
                     if self.training_noise_scheduler.config.prediction_type == "epsilon":
-                        diffusion_loss = F.mse_loss(predicted_noise_or_x0, noise)
+                        # Halve and zero-center the loss to make a positive learning signal more attainable.
+                        diffusion_loss = (F.mse_loss(predicted_noise_or_x0, noise) / 2.1) - 1.0
                     elif self.training_noise_scheduler.config.prediction_type == "sample":
-                        diffusion_loss = F.mse_loss(predicted_noise_or_x0, numeric_target_diffusion_output)
+                        # Also apply to the sample prediction type.
+                        diffusion_loss = (F.mse_loss(predicted_noise_or_x0, clean_target_for_unet) / 2.1) - 1.0
                     else:
                         print(f"Unsupported diffusion prediction type in training_noise_scheduler: {self.training_noise_scheduler.config.prediction_type}")
                         diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
                 else: # Default to epsilon prediction if config not available
-                    diffusion_loss = F.mse_loss(predicted_noise_or_x0, noise)
+                    diffusion_loss = (F.mse_loss(predicted_noise_or_x0, noise) / 2.0) - 1.0
             else:
                 # This case should ideally not be reached if training_noise_scheduler is always initialized
                 print("CRITICAL WARNING: EnhancedCTMDiffusion.training_noise_scheduler not defined. Using zero diffusion loss.")

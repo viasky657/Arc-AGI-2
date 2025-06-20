@@ -218,34 +218,36 @@ else:
 
                 # The 'total_loss' from the model output already includes the predictive coding loss,
                 # so we use it directly. This resolves the NameError for PC_LOSS_WEIGHT.
-                loss = model_output_dict.get('total_loss', torch.tensor(0.0, device=input_bytes.device))
+                diffusion_loss = model_output_dict.get('diffusion_loss', torch.tensor(0.0, device=input_bytes.device))
 
-                # Get CTM core output for the external ARC head
+                # Initialize total loss for the optimizer with the diffusion loss
+                total_loss = diffusion_loss
+                
+                # --- Get CTM core output for auxiliary heads ---
                 ctm_backbone_output = None
                 if model_output_dict and 'predictions' in model_output_dict:
-                    # Use the prediction from the last CTM iteration, which has the correct dimension (512)
                     ctm_backbone_output = model_output_dict['predictions'][:, :, -1]
                 elif model_output_dict and 'final_sync_out' in model_output_dict:
-                    # Fallback to final_sync_out if predictions are not available
                     ctm_backbone_output = model_output_dict['final_sync_out']
                 else:
-                    print("Warning: CTM core output ('predictions' or 'final_sync_out') not found. Using zeros for ARC head input.")
+                    print("Warning: CTM core output not found. Using zeros for auxiliary head inputs.")
                     ctm_backbone_output = torch.zeros(current_batch_size, config_arc_diffusion.ctm_out_dims, device=input_bytes.device)
                 
-                # External ARC Output Head for CrossEntropy loss
+                # --- Calculate and add auxiliary losses to the total_loss for the optimizer ---
+                ce_loss = torch.tensor(0.0, device=input_bytes.device)
                 if arc_output_head and ctm_backbone_output is not None:
                     if ctm_backbone_output.ndim > 2:
-                         ctm_features_for_head = ctm_backbone_output.mean(dim=1)
+                        ctm_features_for_head = ctm_backbone_output.mean(dim=1)
                     else:
-                         ctm_features_for_head = ctm_backbone_output
+                        ctm_features_for_head = ctm_backbone_output
                     
-                    predicted_logits = arc_output_head(ctm_features_for_head)
+                    predicted_logits = arc_output_head(torch.tanh(ctm_features_for_head))
                     predicted_logits_reshaped = predicted_logits.view(current_batch_size * ARC_INPUT_FLAT_DIM, NUM_ARC_SYMBOLS)
                     target_grids_reshaped = original_target_grids_for_ce.view(current_batch_size * ARC_INPUT_FLAT_DIM)
                     ce_loss = arc_criterion(predicted_logits_reshaped, target_grids_reshaped)
-                    loss += ce_loss
+                    total_loss = total_loss + ce_loss
 
-                # External MCMC Integration
+                mcmc_loss_val = torch.tensor(0.0, device=input_bytes.device)
                 if ctm_mcmc_integration_arc and ctm_backbone_output is not None:
                     target_grids_for_mcmc = (original_target_grids_for_ce > 0).float()
                     mcmc_input_features = ctm_backbone_output.detach()
@@ -253,33 +255,44 @@ else:
                         mcmc_input_features = mcmc_input_features.mean(dim=1)
 
                     mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=target_grids_for_mcmc)
-                    loss += mcmc_loss_val
+                    total_loss = total_loss + mcmc_loss_val
+
+            # --- NaN Check and Loss Debugging ---
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"[NaN or Inf Loss Detected] at Epoch {epoch+1}, Batch {batch_idx+1}. Skipping backward pass.")
+                print(f"  - Diffusion Loss: {diffusion_loss.item() if not torch.isnan(diffusion_loss) else 'NaN'}")
+                print(f"  - CE Loss: {ce_loss.item() if not torch.isnan(ce_loss) else 'NaN'}")
+                print(f"  - MCMC Loss: {mcmc_loss_val.item() if not torch.isnan(mcmc_loss_val) else 'NaN'}")
+                continue # Skip to the next batch
+
+            # --- DEBUGGING: Print all loss components ---
+            print(f"[Losses] Diff: {diffusion_loss.item():.4f}, CE: {ce_loss.item():.4f}, MCMC: {mcmc_loss_val.item():.4f}, Total: {total_loss.item():.4f}")
 
             if scaler:
-                scaler.scale(loss).backward()
+                scaler.scale(total_loss).backward()
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     scaler.unscale_(optimizer_arc)
                     torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                    # --- NEW: Apply Activity-Dependent Plasticity ---
+                    # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
                     unwrapped_model = ctm_model_arc
-                    unwrapped_model.ctm_core.apply_activity_plasticity(loss)
+                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss)
                     scaler.step(optimizer_arc)
                     scaler.update()
-                    optimizer_arc.zero_grad()
+                    optimizer_arc.zero_grad(set_to_none=True)
             elif accelerator_arc:
-                 accelerator_arc.backward(loss)
+                 accelerator_arc.backward(total_loss)
                  if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    # --- NEW: Apply Activity-Dependent Plasticity ---
+                    # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
                     unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
-                    unwrapped_model.ctm_core.apply_activity_plasticity(loss)
+                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss)
                     optimizer_arc.step()
                     optimizer_arc.zero_grad()
             else:
-                loss.backward()
+                total_loss.backward()
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                    # --- NEW: Apply Activity-Dependent Plasticity ---
-                    ctm_model_arc.ctm_core.apply_activity_plasticity(loss)
+                    # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
+                    ctm_model_arc.ctm_core.apply_activity_plasticity(diffusion_loss)
                     optimizer_arc.step()
                     optimizer_arc.zero_grad()
             
