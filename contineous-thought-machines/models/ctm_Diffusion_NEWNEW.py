@@ -2712,80 +2712,80 @@ class OriginalCTMCore(nn.Module):
             
         return total_pc_loss
 
-    def apply_activity_plasticity(self, global_loss: torch.Tensor):
+    def apply_activity_plasticity(self, global_loss: torch.Tensor, learning_rate_gradient: float = 1e-4):
         """
-        Updates the plastic synapse weights based on a Hebbian rule modulated by global success.
-        This method is now tied to the neuron selection mechanism, applying plasticity only
-        to the connections between neurons selected for action and output synchronization.
+        Updates all weights within the CTM core using a combination of global gradient plasticity
+        and local Hebbian updates. This method acts as the sole optimizer for the CTM core,
+        bypassing the standard torch optimizer to prevent inplace modification errors.
         """
         if not self.use_activity_plasticity or not self.training:
             return
 
         with torch.no_grad():
+            # 1. Global Gradient Plasticity: Update all parameters using their gradients
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    # Apply gradient-based update directly to the data tensor
+                    param.data.add_(param.grad, alpha=-learning_rate_gradient)
+            
+            # 2. Local Hebbian Plasticity for 'plastic_synapses'
+            # This provides a more specific, biologically-inspired update rule for these synapses,
+            # which is modulated by the overall success (global_loss).
             learning_signal = -global_loss.detach()
-            
             state_trace = self.last_state_trace
-            if state_trace is None or state_trace.numel() == 0:
-                print("Warning: last_state_trace not available for plasticity update. Skipping.")
-                return
 
-            # Get the indices of all unique neurons involved in synchronization
-            eligible_indices = torch.unique(torch.cat([
-                self.action_neuron_indices_left, self.action_neuron_indices_right,
-                self.out_neuron_indices_left, self.out_neuron_indices_right
-            ]))
-
-            # Extract the state traces for only these eligible neurons
-            eligible_traces = state_trace[:, eligible_indices, :]
-            
-            # Get biological modulation scores
-            modulation_scores = torch.ones(len(eligible_indices), device=state_trace.device)
-            if self.biological_selector is not None and self.neuron_select_type.startswith('bio_'):
-                selector_activations = eligible_traces.mean(dim=-1)
+            if state_trace is not None and state_trace.numel() > 0 and hasattr(self, 'plastic_synapses'):
+                # The existing Hebbian logic is sound, we just ensure it operates on .data
+                eligible_indices = torch.unique(torch.cat([
+                    self.action_neuron_indices_left, self.action_neuron_indices_right,
+                    self.out_neuron_indices_left, self.out_neuron_indices_right
+                ]))
+                eligible_traces = state_trace[:, eligible_indices, :]
                 
-                _, metadata = self.biological_selector.select_neurons(
-                    activations=selector_activations.mean(dim=0).unsqueeze(0),
-                    top_k=len(eligible_indices),
-                    layer_name="plasticity_update"
-                )
+                modulation_scores = torch.ones(len(eligible_indices), device=state_trace.device)
+                if self.biological_selector is not None and self.neuron_select_type.startswith('bio_'):
+                    selector_activations = eligible_traces.mean(dim=-1)
+                    _, metadata = self.biological_selector.select_neurons(
+                        activations=selector_activations.mean(dim=0).unsqueeze(0),
+                        top_k=len(eligible_indices), layer_name="plasticity_update"
+                    )
+                    sel_type = self.neuron_select_type.replace('bio_', '')
+                    score_key_map = {
+                        'hebbian': 'hebbian_scores', 'plasticity': 'plasticity_scores', 'competitive': 'competition_scores',
+                        'homeostatic': 'homeostatic_scores', 'evolutionary': 'fitness_scores', 'stdp': 'stdp_scores',
+                        'criticality': 'criticality_scores', 'multi_objective': 'combined_scores',
+                    }
+                    score_key = score_key_map.get(sel_type)
+                    if score_key and score_key in metadata:
+                        scores = metadata[score_key].detach()
+                        scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+                        modulation_scores = scores
 
-                sel_type = self.neuron_select_type.replace('bio_', '')
-                score_key_map = {
-                    'hebbian': 'hebbian_scores', 'plasticity': 'plasticity_scores',
-                    'competitive': 'competition_scores', 'homeostatic': 'homeostatic_scores',
-                    'evolutionary': 'fitness_scores', 'stdp': 'stdp_scores',
-                    'criticality': 'criticality_scores', 'multi_objective': 'combined_scores',
-                }
-                score_key = score_key_map.get(sel_type)
-                if score_key and score_key in metadata:
-                    scores = metadata[score_key].detach()
-                    scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
-                    modulation_scores = scores
+                st_batch_mean = eligible_traces.mean(dim=0)
+                st_centered = st_batch_mean - st_batch_mean.mean(dim=1, keepdim=True)
+                cov_matrix = torch.matmul(st_centered, st_centered.T) / (st_centered.shape[1] - 1)
+                stds = torch.std(st_batch_mean, dim=1, keepdim=True)
+                stds[stds == 0] = 1e-8
+                local_hebbian_trace = cov_matrix / torch.matmul(stds, stds.T)
+                local_hebbian_trace = torch.nan_to_num(local_hebbian_trace)
+                
+                modulation_matrix = torch.outer(modulation_scores, modulation_scores)
+                modulated_hebbian_trace = local_hebbian_trace * modulation_matrix
 
-            # Compute Hebbian trace for the subset of eligible neurons
-            st_batch_mean = eligible_traces.mean(dim=0)
-            st_centered = st_batch_mean - st_batch_mean.mean(dim=1, keepdim=True)
-            cov_matrix = torch.matmul(st_centered, st_centered.T) / (st_centered.shape[1] - 1)
-            stds = torch.std(st_batch_mean, dim=1, keepdim=True)
-            stds[stds == 0] = 1e-8
-            
-            local_hebbian_trace = cov_matrix / (torch.matmul(stds, stds.T))
-            local_hebbian_trace = torch.nan_to_num(local_hebbian_trace)
-            
-            # Modulate Hebbian trace with biological scores
-            modulation_matrix = torch.outer(modulation_scores, modulation_scores)
-            modulated_hebbian_trace = local_hebbian_trace * modulation_matrix
+                delta_W = torch.zeros_like(self.plastic_synapses.weight)
+                update_values = self.plasticity_learning_rate * modulated_hebbian_trace * learning_signal
+                
+                row_indices, col_indices = torch.meshgrid(eligible_indices, eligible_indices, indexing='ij')
+                delta_W[row_indices, col_indices] = update_values
 
-            # Create a sparse weight update tensor
-            delta_W = torch.zeros_like(self.plastic_synapses.weight)
-            update_values = self.plasticity_learning_rate * modulated_hebbian_trace * learning_signal
-            
-            # Assign the updates to the correct positions in the main weight matrix
-            row_indices, col_indices = torch.meshgrid(eligible_indices, eligible_indices, indexing='ij')
-            delta_W[row_indices, col_indices] = update_values
+                # Apply the Hebbian update directly to the data tensor
+                self.plastic_synapses.weight.data.add_(delta_W)
 
-            # Apply the sparse update
-            self.plastic_synapses.weight.add_(delta_W)
+            # 3. CRITICAL STEP: Zero out gradients for the CTM core after use.
+            # This prevents the external optimizer from trying to apply updates again,
+            # which would cause the inplace modification error.
+            for param in self.parameters():
+                param.grad = None
 
     def forward_with_full_tracking(self, kv_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
