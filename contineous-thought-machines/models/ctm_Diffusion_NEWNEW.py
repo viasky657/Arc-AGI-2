@@ -4687,10 +4687,24 @@ class EnhancedCTMDiffusion(nn.Module):
             # Use EnhancedCTMDiffusion's own training_noise_scheduler for the noising process
             if hasattr(self, 'training_noise_scheduler'):
                 t = torch.randint(0, self.training_noise_scheduler.config.num_train_timesteps, (batch_size,), device=byte_sequence.device).long()
-                # Generate noise based on the numeric target's shape and type
-                noise = torch.randn_like(numeric_target_diffusion_output)
+
+                # --- FIX: Resize target to match UNet input dimension ---
+                current_len = numeric_target_diffusion_output.shape[-1]
+                target_unet_len = self.config.unet_input_feature_dim
+                
+                if current_len < target_unet_len:
+                    padding = torch.zeros(batch_size, target_unet_len - current_len, device=device, dtype=numeric_target_diffusion_output.dtype)
+                    clean_target_for_unet = torch.cat([numeric_target_diffusion_output, padding], dim=-1)
+                elif current_len > target_unet_len:
+                    clean_target_for_unet = numeric_target_diffusion_output[:, :target_unet_len]
+                else:
+                    clean_target_for_unet = numeric_target_diffusion_output
+                # clean_target_for_unet is now (B, config.unet_input_feature_dim)
+                
+                # Generate noise based on the correctly-sized target's shape and type
+                noise = torch.randn_like(clean_target_for_unet)
                 # Use a distinct variable name for the noisy input passed to the diffusion processor
-                noisy_input_for_diffusion_processor = self.training_noise_scheduler.add_noise(numeric_target_diffusion_output, noise, t)
+                noisy_input_for_diffusion_processor = self.training_noise_scheduler.add_noise(clean_target_for_unet, noise, t)
                 
                 # CTMControlledDiffusionProcessor.forward (self.diffusion) is the model that predicts noise (or x0)
                 # It needs the noisy input, timestep, and CTM conditioning data.

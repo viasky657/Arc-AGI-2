@@ -239,7 +239,6 @@ else:
                     else:
                          ctm_features_for_head = ctm_backbone_output
                     
-                    ctm_features_for_head = torch.tanh(ctm_features_for_head)
                     predicted_logits = arc_output_head(ctm_features_for_head)
                     predicted_logits_reshaped = predicted_logits.view(current_batch_size * ARC_INPUT_FLAT_DIM, NUM_ARC_SYMBOLS)
                     target_grids_reshaped = original_target_grids_for_ce.view(current_batch_size * ARC_INPUT_FLAT_DIM)
@@ -256,13 +255,6 @@ else:
                     mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=target_grids_for_mcmc)
                     loss += mcmc_loss_val
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"[NaN or Inf Loss Detected] at Epoch {epoch+1}, Batch {batch_idx+1}. Skipping backward pass for this batch.")
-                print(f"  - Diffusion Loss: {model_output_dict.get('diffusion_loss', 'N/A')}")
-                print(f"  - CE Loss: {ce_loss.item() if 'ce_loss' in locals() else 'N/A'}")
-                print(f"  - CTM Internal Loss: {model_output_dict.get('ctm_internal_loss', 'N/A')}")
-                continue # Skip to the next batch
-
             if scaler:
                 scaler.scale(loss).backward()
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
@@ -271,19 +263,15 @@ else:
                     # --- NEW: Apply Activity-Dependent Plasticity ---
                     unwrapped_model = ctm_model_arc
                     unwrapped_model.ctm_core.apply_activity_plasticity(loss)
-                    # The CTM core's gradients are zeroed inside the plasticity rule.
-                    # We still need to step the optimizer for other parameters (e.g., arc_output_head).
                     scaler.step(optimizer_arc)
                     scaler.update()
-                    optimizer_arc.zero_grad(set_to_none=True) # Use set_to_none for efficiency
+                    optimizer_arc.zero_grad()
             elif accelerator_arc:
                  accelerator_arc.backward(loss)
                  if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     # --- NEW: Apply Activity-Dependent Plasticity ---
                     unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
                     unwrapped_model.ctm_core.apply_activity_plasticity(loss)
-                    # The CTM core's gradients are zeroed inside the plasticity rule.
-                    # We still need to step the optimizer for other parameters (e.g., arc_output_head).
                     optimizer_arc.step()
                     optimizer_arc.zero_grad()
             else:
@@ -292,8 +280,6 @@ else:
                     torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
                     # --- NEW: Apply Activity-Dependent Plasticity ---
                     ctm_model_arc.ctm_core.apply_activity_plasticity(loss)
-                    # The CTM core's gradients are zeroed inside the plasticity rule.
-                    # We still need to step the optimizer for other parameters (e.g., arc_output_head).
                     optimizer_arc.step()
                     optimizer_arc.zero_grad()
             
