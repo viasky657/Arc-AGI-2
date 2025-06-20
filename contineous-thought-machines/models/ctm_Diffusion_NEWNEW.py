@@ -2731,7 +2731,12 @@ class OriginalCTMCore(nn.Module):
             # 2. Local Hebbian Plasticity for 'plastic_synapses'
             # This provides a more specific, biologically-inspired update rule for these synapses,
             # which is modulated by the overall success (global_loss).
-            learning_signal = -global_loss.detach()
+            learning_signal = torch.tanh(-global_loss.detach())
+            
+            if torch.isnan(learning_signal) or torch.isinf(learning_signal):
+                print(f"[Plasticity Warning] Learning signal is NaN or Inf. Skipping Hebbian update for this step.")
+                return
+
             # --- DEBUGGING: Log the learning signal to monitor for volatility ---
             print(f"[Plasticity] Learning Signal (from neg-loss): {learning_signal.item():.4f}")
             state_trace = self.last_state_trace
