@@ -256,8 +256,8 @@ else:
                     mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=target_grids_for_mcmc)
                     loss += mcmc_loss_val
 
-            if torch.isnan(loss):
-                print(f"[NaN Loss Detected] at Epoch {epoch+1}, Batch {batch_idx+1}. Skipping backward pass for this batch.")
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[NaN or Inf Loss Detected] at Epoch {epoch+1}, Batch {batch_idx+1}. Skipping backward pass for this batch.")
                 print(f"  - Diffusion Loss: {model_output_dict.get('diffusion_loss', 'N/A')}")
                 print(f"  - CE Loss: {ce_loss.item() if 'ce_loss' in locals() else 'N/A'}")
                 print(f"  - CTM Internal Loss: {model_output_dict.get('ctm_internal_loss', 'N/A')}")

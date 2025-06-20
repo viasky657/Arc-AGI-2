@@ -4707,7 +4707,10 @@ class EnhancedCTMDiffusion(nn.Module):
                     predicted_noise_or_x0 = prediction_output_tuple
 
                 # Determine loss based on the training_noise_scheduler's prediction type
-                if hasattr(self.training_noise_scheduler, 'config') and hasattr(self.training_noise_scheduler.config, 'prediction_type'):
+                if not torch.isfinite(predicted_noise_or_x0).all():
+                    print(f"[Stability Guard] NaN or Inf detected in diffusion model output. Setting diffusion loss to 0 for this batch.")
+                    diffusion_loss = torch.tensor(0.0, device=byte_sequence.device, requires_grad=True) # Ensure it has a grad_fn
+                elif hasattr(self.training_noise_scheduler, 'config') and hasattr(self.training_noise_scheduler.config, 'prediction_type'):
                     if self.training_noise_scheduler.config.prediction_type == "epsilon":
                         diffusion_loss = F.mse_loss(predicted_noise_or_x0, noise)
                     elif self.training_noise_scheduler.config.prediction_type == "sample":
