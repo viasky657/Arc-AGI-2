@@ -3876,6 +3876,12 @@ class EnhancedCTMDiffusion(nn.Module):
         self.device_container = nn.Parameter(torch.empty(0)) # Helper to get device
 
         self.knowledge_store = None
+
+        # --- Global Plasticity Loss Parameters ---
+        self.use_global_plasticity_loss = getattr(config, 'use_global_plasticity_loss', True)
+        self.global_plasticity_loss_weight = getattr(config, 'global_plasticity_loss_weight', 0.05)
+        self.local_neuron_selector_loss_weight = getattr(config, 'local_neuron_selector_loss_weight', 0.1)
+        self.target_hebbian_pattern = getattr(config, 'target_hebbian_pattern', 0.0)
  
         # Placeholder for TaskAnalyzer instantiation.
         # Ensure TaskAnalyzer is imported (e.g., from .utils import TaskAnalyzer)
@@ -5069,19 +5075,19 @@ class EnhancedCTMDiffusion(nn.Module):
             output_dict['ctm_internal_loss'] = output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device)) + pc_loss
 
         # --- Global Plasticity Loss ---
-        if self.config.use_global_plasticity_loss and 'ctm_core_data' in output_dict and output_dict['ctm_core_data']:
+        if self.use_global_plasticity_loss and 'ctm_core_data' in output_dict and output_dict['ctm_core_data']:
             local_hebbian_signal = output_dict['ctm_core_data'].get('local_hebbian_signal')
             if local_hebbian_signal is not None:
                 aggregated_hebbian_signal = torch.mean(local_hebbian_signal)
-                target_pattern = torch.tensor(self.config.target_hebbian_pattern, device=aggregated_hebbian_signal.device, dtype=aggregated_hebbian_signal.dtype)
+                target_pattern = torch.tensor(self.target_hebbian_pattern, device=aggregated_hebbian_signal.device, dtype=aggregated_hebbian_signal.dtype)
                 global_plasticity_loss = F.mse_loss(aggregated_hebbian_signal, target_pattern)
-                output_dict['global_plasticity_loss'] = global_plasticity_loss * self.config.global_plasticity_loss_weight
+                output_dict['global_plasticity_loss'] = global_plasticity_loss * self.global_plasticity_loss_weight
                 current_total_loss += output_dict['global_plasticity_loss']
 
         # --- Local Neuron Selector Loss ---
         if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and output_dict['ctm_core_data'].get('local_neuron_selector_loss') is not None:
             local_selector_loss = output_dict['ctm_core_data']['local_neuron_selector_loss']
-            output_dict['local_neuron_selector_loss'] = local_selector_loss * self.config.local_neuron_selector_loss_weight
+            output_dict['local_neuron_selector_loss'] = local_selector_loss * self.local_neuron_selector_loss_weight
             current_total_loss += output_dict['local_neuron_selector_loss']
 
         output_dict['total_loss'] = current_total_loss
