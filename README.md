@@ -176,3 +176,10 @@ Coordination via Meta-Learning:
  • This meta-level coordination can help the entire system “work together better” by ensuring that local plasticity updates contribute beneficially to the overall network performance.
 
 Implementing these enhancements will allow the system to capitalize on both local and global Hebbian signals, thereby promoting a more plasticity‐like training loss that encourages harmonious and adaptive learning across the entire mode.
+
+#This is the new learning term for the Local Hebian Variable to make it Dynamic and scale with any other learning signals dynamically so it does not have to be adjusted for every new learning task. It will automatically adjust itself to new tasks: 
+
+Dynamic scaling of the local Hebbian loss (λ₃ = base_weight / (mean(|local_hebbian_signal|) + ε)) has been added to the training loop:
+
+Captured the original selector weight at training.py:189.
+After MCMC normalization, compute abs_hebbian_mean, dyn_lambda, and apply dynamic_hebbian_loss at training.py:288–training.py:290.
