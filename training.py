@@ -180,7 +180,7 @@ def get_rank_debug():
     return rank, world_size
 
 # --- MCMC Plasticity Loss Normalization Factor ---
-MCMC_LOSS_GAMMA = 0.001  # reduced to further dampen MCMC influence
+MCMC_LOSS_GAMMA = 0.00001  # reduced to further dampen MCMC influence (Has to be very small since the Hebian and global plasticity loss is very small.)
 
 if not all([ctm_model_arc, arc_output_head, optimizer_arc, arc_train_loader, arc_criterion]):
     print("⚠️ Skipping ARC-AGI-2 training due to missing components.")
@@ -284,7 +284,7 @@ else:
                     
                     # Per goal instructions, create a normalized MCMC loss for the plasticity update
                     # ‣ clamp to ≥0 before taking log, to guarantee the argument to log1p is non-negative
-                    mcmc_for_plasticity = torch.relu(mcmc_loss_val.detach())
+                    mcmc_for_plasticity = torch.relu(mcmc_loss_val.detach()) 
                     norm_mcmc_loss_for_plasticity = MCMC_LOSS_GAMMA * torch.log1p(mcmc_for_plasticity)
 
                     # Dynamic scaling of local Hebbian loss
