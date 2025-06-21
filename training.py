@@ -189,11 +189,11 @@ else:
     orig_global_plasticity_loss_weight = ctm_model_arc.global_plasticity_loss_weight
     orig_local_selector_loss_weight = ctm_model_arc.local_neuron_selector_loss_weight
     for epoch in range(NUM_EPOCHS_ARC):
-# Linear ramp-up of global plasticity weight over first 10 epochs
-        if epoch < 10:
+
+        if epoch < 10: # Linear ramp-up of global plasticity weight over first 10 epochs
             ramp_factor = (epoch + 1) / 10.0
             ctm_model_arc.global_plasticity_loss_weight = orig_global_plasticity_loss_weight * ramp_factor
-        else:
+        else: # Full weight training for the global plasticity weight
             ctm_model_arc.global_plasticity_loss_weight = orig_global_plasticity_loss_weight
             ctm_model_arc.train()
             arc_output_head.train()
@@ -202,6 +202,8 @@ else:
             total_arc_loss = 0
             processed_batches = 0
 
+        total_arc_loss = 0
+        processed_batches = 0
         for batch_idx, batch_data in enumerate(arc_train_loader):
             if not batch_data or batch_data['input_byte_sequences'].numel() == 0:
                 print(f"Skipping empty batch {batch_idx}")
