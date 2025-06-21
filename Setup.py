@@ -368,6 +368,12 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     jepa_loss_weight: float = 0.1 # Weight for the JEPA loss component
     jepa_num_target_blocks: int = 1 # Number of target blocks to predict
 
+    # --- Global Plasticity Loss Parameters ---
+    use_global_plasticity_loss: bool = True
+    global_plasticity_loss_weight: float = 0.05
+    local_neuron_selector_loss_weight: float = 0.1
+    target_hebbian_pattern: float = 0.0  # Target for the aggregated Hebbian signal
+
     # --- Knowledge Store Parameters ---
 
     def __post_init__(self):
@@ -462,7 +468,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             if not self.use_dynamic_entropy_patcher:
                 print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
 
-# Define EnhancedCTMConfig for ARC with EnhancedCTMDiffusion
+# --- Model Configuration ---
 config_arc_diffusion = EnhancedCTMConfig(
     d_model=512,
     n_heads=8,
@@ -526,7 +532,13 @@ config_arc_diffusion = EnhancedCTMConfig(
     ctm_diffusion_coupling_strength=0.8,
     vocab_size=None,
     output_audio_bytes=False,
-    unet_input_feature_dim=8192
+    unet_input_feature_dim=8192,
+
+     # --- Global Plasticity Loss Parameters ---
+    use_global_plasticity_loss= True,
+    global_plasticity_loss_weight = 0.05,
+    local_neuron_selector_loss_weight = 0.1,
+    target_hebbian_pattern = 0.0 # Target for the aggregated Hebbian signal
 )
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
 

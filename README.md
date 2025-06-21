@@ -84,3 +84,95 @@ New Nueral Synapse System Options inspired by Biology and Nuerology
 | Method | Correlation with Targets | Diversity Score | Computational Overhead | 
 | Random | 0.12 ± 0.03 | 0.85 ± 0.05 | 1x (baseline) | (Legacy Baseline) | Hebbian | 0.34 ± 0.06 | 0.78 ± 0.04 | 1.2x | | Plasticity | 0.28 ± 0.05 | 0.82 ± 0.03 | 1.1x | | Competitive | 0.31 ± 0.04 | 0.71 ± 0.06 | 1.3x | | Homeostatic | 0.26 ± 0.04 | 0.88 ± 0.02 | 1.2x | | Evolutionary | 0.33 ± 0.07 | 0.75 ± 0.05 | 1.4x | | Multi-objective | 0.36 ± 0.05 | 0.80 ± 0.03 | 1.5x |
 
+#TEMPORARY
+#How the CTM model reward systems in the Training.py and the Diffusion_NEWNEW file work 
+
+The CTM plasticity machinery is set up so that every gradient step in the main optimizer (backprop through diffusion, CE and MCMC losses) is augmented by a Hebbian‐style synaptic update whose sign and magnitude depend on how well the network is doing:
+
+Local plasticity (apply_activity_plasticity):
+
+• plasticity_loss = diffusion_loss – ce_loss – mcmc_loss.detach()
+
+• learning_signal = clamp(–plasticity_loss, –1.0, 1.0)
+
+– If the network’s diffusion loss is high relative to its CE and MCMC losses (i.e. it isn’t solving the task well), plasticity_loss > 0 ⇒ learning_signal < 0 ⇒ synaptic depression.
+
+– If the network is performing well (diffusion_loss low, CE & MCMC higher), plasticity_loss < 0 ⇒ learning_signal > 0 ⇒ synaptic potentiation.
+
+This ensures that individual synapses are strengthened when their activations correlate with successful predictions, and weakened when they correlate with failure.
+
+Global plasticity:
+
+• global_plasticity_loss = MSE(aggregated_hebbian_signal, target_pattern)
+
+• current_total_loss += global_plasticity_loss_weight × global_plasticity_loss
+
+Because MSE is always ≥0, it is a positive penalty that punishes the network if its overall Hebbian signal drifts away from the desired target. During backprop, reducing this loss will encourage the population‐level firing pattern you’ve specified (e.g. co‐activation of certain neurons).
+
+Local neuron selector loss:
+
+• local_neuron_selector_loss = some function of individual neuron signals
+
+• current_total_loss += local_neuron_selector_loss_weight × that loss
+
+This explicitly penalizes or rewards particular neurons based on whether they should be active (the “selector” criterion), further shaping the reward landscape for single units.
+
+Other CTM‐internal tracking_data losses (predictive coding, diffusion, MCMC) are all summed into model_output_dict['total_loss'], so by switching your training loop to use
+
+total_loss = model_output_dict['total_loss'] + cross_entropy_loss
+
+you automatically include:
+– diffusion_loss
+
+– MCMC loss
+
+– predictive_coding_loss
+
+– ctm_internal_loss
+
+– global_plasticity_loss
+
+– local_neuron_selector_loss
+
+Signals that you return for analysis—‘predictions’, ‘certainties’, ‘final_sync_out’, ‘local_hebbian_signal’—are not directly part of the scalar loss but can be inspected or used by an external head (e.g. for auxiliary objectives).
+
+In summary, the sign conventions and weighted MSE ensure that synapses are potentiated when the network succeeds (positive learning_signal) and depressed when it fails, while the global plasticity and local selector losses tie the distributed Hebbian signals into your overall reward system. Using the model’s own ‘total_loss’ in the training loop guarantees you’re optimizing exactly the combination of losses you described.
+
+ To enhance global plasticity using the existing local Hebbian calculations, you can consider the following multi-step approach:
+
+Aggregate Local Hebbian Signals:
+
+• Each layer (or module) already computes a Hebbian term that adjusts its synaptic strengths based on local co-activations.
+
+• You can aggregate these local Hebbian terms (for example, by summing or averaging them across layers) to form a “global Hebbian signal.”
+
+Introduce a Global Plasticity Loss Term:
+
+• Define a global plasticity loss that penalizes deviations of the aggregated Hebbian signal from a desired target (or “idealized” Hebbian behavior).
+
+• For instance, you might set up a loss term of the form
+
+L_global = ||Aggregate(local Hebbian signals) – Target Hebbian Pattern||²
+
+where the Target Hebbian Pattern could be derived based on empirical or heuristic objectives (such as promoting balanced co-activations across the network).
+
+Combine with the Neuron Selector Loss:
+
+• In your loss function, integrate both the neuron selector’s learning loss and the new global plasticity loss term:
+
+L_total = L_diffusion + L_ctm_internal + L_mcmc + λ₁ * L_local_neuron_selector + λ₂ * L_global
+
+where λ₁ and λ₂ are hyperparameters that control the influence of each component.
+
+Adaptive Weighting and Regularization:
+
+• Consider using an adaptive schedule for λ₂ so that the network first focuses on primary tasks (e.g., reconstruction or diffusion guidance) and gradually shifts toward enforcing global plasticity.
+
+• Regularize the aggregated Hebbian signal (for example, via normalization or sparsity constraints) to prevent runaway changes and ensure stability.
+
+Coordination via Meta-Learning:
+
+• Optionally, employ meta-learning or even an auxiliary network to learn optimal weighting factors across layers, so that each layer’s Hebbian contribution is reweighted to achieve a coherent global behavior.
+ • This meta-level coordination can help the entire system “work together better” by ensuring that local plasticity updates contribute beneficially to the overall network performance.
+
+Implementing these enhancements will allow the system to capitalize on both local and global Hebbian signals, thereby promoting a more plasticity‐like training loss that encourages harmonious and adaptive learning across the entire mode.

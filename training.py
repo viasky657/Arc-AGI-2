@@ -185,13 +185,22 @@ MCMC_LOSS_GAMMA = 0.01
 if not all([ctm_model_arc, arc_output_head, optimizer_arc, arc_train_loader, arc_criterion]):
     print("⚠️ Skipping ARC-AGI-2 training due to missing components.")
 else:
+# Record original global plasticity weight for scheduling
+    orig_global_plasticity_loss_weight = ctm_model_arc.global_plasticity_loss_weight
+    orig_local_selector_loss_weight = ctm_model_arc.local_neuron_selector_loss_weight
     for epoch in range(NUM_EPOCHS_ARC):
-        ctm_model_arc.train()
-        arc_output_head.train()
-        if ctm_mcmc_integration_arc: ctm_mcmc_integration_arc.train()
+# Linear ramp-up of global plasticity weight over first 10 epochs
+        if epoch < 10:
+            ramp_factor = (epoch + 1) / 10.0
+            ctm_model_arc.global_plasticity_loss_weight = orig_global_plasticity_loss_weight * ramp_factor
+        else:
+            ctm_model_arc.global_plasticity_loss_weight = orig_global_plasticity_loss_weight
+            ctm_model_arc.train()
+            arc_output_head.train()
+            if ctm_mcmc_integration_arc: ctm_mcmc_integration_arc.train()
 
-        total_arc_loss = 0
-        processed_batches = 0
+            total_arc_loss = 0
+            processed_batches = 0
 
         for batch_idx, batch_data in enumerate(arc_train_loader):
             if not batch_data or batch_data['input_byte_sequences'].numel() == 0:
@@ -219,12 +228,17 @@ else:
                     current_epoch=epoch
                 )
 
-                # The 'total_loss' from the model output already includes the predictive coding loss,
-                # so we use it directly. This resolves the NameError for PC_LOSS_WEIGHT.
+                # Retrieve CTM output components including all model-internal losses and signals
                 diffusion_loss = model_output_dict.get('diffusion_loss', torch.tensor(0.0, device=input_bytes.device))
-
-                # Initialize total loss for the optimizer with the diffusion loss
-                total_loss = diffusion_loss
+                predictions = model_output_dict.get('predictions', None)
+                certainties = model_output_dict.get('certainties', None)
+                final_sync_out = model_output_dict.get('final_sync_out', None)
+                predictive_coding_loss = model_output_dict.get('predictive_coding_loss', torch.tensor(0.0, device=input_bytes.device))
+                local_hebbian_signal = model_output_dict.get('local_hebbian_signal', torch.tensor(0.0, device=input_bytes.device))
+                local_neuron_selector_loss_model = model_output_dict.get('local_neuron_selector_loss', torch.tensor(0.0, device=input_bytes.device))
+                global_plasticity_loss = model_output_dict.get('global_plasticity_loss', torch.tensor(0.0, device=input_bytes.device))
+                # Initialize total loss for the optimizer with the model's computed total_loss
+                total_loss = model_output_dict.get('total_loss', diffusion_loss)
                 
                 # --- Get CTM core output for auxiliary heads ---
                 ctm_backbone_output = None
@@ -268,6 +282,12 @@ else:
                     
                     # Per goal instructions, create a normalized MCMC loss for the plasticity update
                     norm_mcmc_loss_for_plasticity = MCMC_LOSS_GAMMA * torch.log(1 + mcmc_loss_val.detach())
+
+                    # Dynamic scaling of local Hebbian loss
+                    abs_hebbian_mean = local_hebbian_signal.abs().mean()
+                    dyn_lambda = orig_local_selector_loss_weight / (abs_hebbian_mean + 1e-8)
+                    dynamic_hebbian_loss = dyn_lambda * abs_hebbian_mean
+                    total_loss = total_loss + dynamic_hebbian_loss
 
             # --- NaN Check and Loss Debugging ---
             if torch.isnan(total_loss) or torch.isinf(total_loss):
