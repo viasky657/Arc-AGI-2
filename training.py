@@ -179,6 +179,9 @@ def get_rank_debug():
     print(f"[DEBUG] Rank {rank} out of {world_size} total ranks")
     return rank, world_size
 
+# --- MCMC Plasticity Loss Normalization Factor ---
+MCMC_LOSS_GAMMA = 0.01
+
 if not all([ctm_model_arc, arc_output_head, optimizer_arc, arc_train_loader, arc_criterion]):
     print("⚠️ Skipping ARC-AGI-2 training due to missing components.")
 else:
@@ -248,14 +251,23 @@ else:
                     total_loss = total_loss + ce_loss
 
                 mcmc_loss_val = torch.tensor(0.0, device=input_bytes.device)
+                norm_mcmc_loss_for_plasticity = torch.tensor(0.0, device=input_bytes.device)
                 if ctm_mcmc_integration_arc and ctm_backbone_output is not None:
                     target_grids_for_mcmc = (original_target_grids_for_ce > 0).float()
+                    # Apply y-normalization for MCMC target
+                    y_mean = target_grids_for_mcmc.mean()
+                    y_std = target_grids_for_mcmc.std()
+                    normalized_target_y = (target_grids_for_mcmc - y_mean) / (y_std + 1e-8)
+
                     mcmc_input_features = ctm_backbone_output.detach()
                     if mcmc_input_features.ndim > 2:
                         mcmc_input_features = mcmc_input_features.mean(dim=1)
 
-                    mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=target_grids_for_mcmc)
+                    mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=normalized_target_y)
                     total_loss = total_loss + mcmc_loss_val
+                    
+                    # Per goal instructions, create a normalized MCMC loss for the plasticity update
+                    norm_mcmc_loss_for_plasticity = MCMC_LOSS_GAMMA * torch.log(1 + mcmc_loss_val.detach())
 
             # --- NaN Check and Loss Debugging ---
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -275,7 +287,10 @@ else:
                     torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
                     # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
                     unwrapped_model = ctm_model_arc
-                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss)
+                    # Pass a modified loss to plasticity to ensure the learning signal can be positive.
+                    # By subtracting the large CE loss, we create a metric that is negative when
+                    # the model performs well, which in turn creates a positive learning signal.
+                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss, ce_loss, norm_mcmc_loss_for_plasticity)
                     scaler.step(optimizer_arc)
                     scaler.update()
                     optimizer_arc.zero_grad(set_to_none=True)
@@ -284,7 +299,7 @@ else:
                  if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
                     unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
-                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss)
+                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss, ce_loss, norm_mcmc_loss_for_plasticity)
                     optimizer_arc.step()
                     optimizer_arc.zero_grad()
             else:
@@ -292,15 +307,15 @@ else:
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
                     # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
-                    ctm_model_arc.ctm_core.apply_activity_plasticity(diffusion_loss)
+                    ctm_model_arc.ctm_core.apply_activity_plasticity(diffusion_loss, ce_loss, norm_mcmc_loss_for_plasticity)
                     optimizer_arc.step()
                     optimizer_arc.zero_grad()
             
-            total_arc_loss += loss.item()
+            total_arc_loss += total_loss.item()
             processed_batches += 1
 
             if (batch_idx + 1) % 50 == 0:
-                print(f"  Epoch [{epoch+1}/{NUM_EPOCHS_ARC}], Batch [{batch_idx+1}/{len(arc_train_loader)}], Loss: {loss.item():.4f}")
+                print(f"  Epoch [{epoch+1}/{NUM_EPOCHS_ARC}], Batch [{batch_idx+1}/{len(arc_train_loader)}], Loss: {total_loss.item():.4f}")
         
         avg_epoch_loss = total_arc_loss / processed_batches if processed_batches > 0 else 0
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS_ARC}] completed. Average Loss: {avg_epoch_loss:.4f}")

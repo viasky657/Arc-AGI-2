@@ -2023,6 +2023,13 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
 
     # --- Knowledge Store Parameters ---
 
+    # --- Global Plasticity Loss Parameters ---
+    use_global_plasticity_loss: bool = True
+    global_plasticity_loss_weight: float = 0.05
+    local_neuron_selector_loss_weight: float = 0.1
+    target_hebbian_pattern: float = 0.0 # Target for the aggregated Hebbian signal
+
+
     def __post_init__(self):
         # Validate output dimensions
         if len(self.output_dims) != self.num_outputs:
@@ -2712,7 +2719,7 @@ class OriginalCTMCore(nn.Module):
             
         return total_pc_loss
 
-    def apply_activity_plasticity(self, global_loss: torch.Tensor, learning_rate_gradient: float = 1e-4):
+    def apply_activity_plasticity(self, diffusion_loss: torch.Tensor, ce_loss: torch.Tensor, mcmc_loss: torch.Tensor, learning_rate_gradient: float = 1e-4):
         """
         Updates all weights within the CTM core using a combination of global gradient plasticity
         and local Hebbian updates. This method acts as the sole optimizer for the CTM core,
@@ -2727,11 +2734,12 @@ class OriginalCTMCore(nn.Module):
                 if param.grad is not None:
                     # Apply gradient-based update directly to the data tensor
                     param.data.add_(param.grad, alpha=-learning_rate_gradient)
-            
+
             # 2. Local Hebbian Plasticity for 'plastic_synapses'
             # This provides a more specific, biologically-inspired update rule for these synapses,
             # which is modulated by the overall success (global_loss).
-            learning_signal = torch.clamp(-global_loss.detach(), -1.0, 1.0)
+            plasticity_loss = diffusion_loss - ce_loss - mcmc_loss.detach()
+            learning_signal = torch.clamp(-plasticity_loss, -1.0, 1.0)
             
             if torch.isnan(learning_signal) or torch.isinf(learning_signal):
                 print(f"[Plasticity Warning] Learning signal is NaN or Inf. Skipping Hebbian update for this step.")
@@ -2803,6 +2811,47 @@ class OriginalCTMCore(nn.Module):
             # which would cause the inplace modification error.
             for param in self.parameters():
                 param.grad = None
+
+    def get_local_hebbian_signal(self, state_trace: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the local Hebbian signal (correlation matrix) from a state trace.
+        Mirrors the logic from apply_activity_plasticity.
+        """
+        if not self.use_activity_plasticity:
+            return torch.tensor(0.0, device=self.start_activated_state.device)
+
+        eligible_indices = torch.unique(torch.cat([
+            self.action_neuron_indices_left, self.action_neuron_indices_right,
+            self.out_neuron_indices_left, self.out_neuron_indices_right
+        ]))
+        eligible_traces = state_trace[:, eligible_indices, :]
+        
+        st_batch_mean = eligible_traces.mean(dim=0)
+        st_centered = st_batch_mean - st_batch_mean.mean(dim=1, keepdim=True)
+        
+        stds = torch.std(st_centered, dim=1, keepdim=True)
+        stds.clamp_min_(1e-6)
+        st_normalized = st_centered / stds
+        
+        memory_len = st_normalized.shape[1]
+        divisor = memory_len - 1 if memory_len > 1 else 1
+        
+        local_hebbian_trace = torch.matmul(st_normalized, st_normalized.T) / divisor
+        local_hebbian_trace = torch.nan_to_num(local_hebbian_trace, nan=0.0)
+        local_hebbian_trace = torch.clamp(local_hebbian_trace, -1.0, 1.0)
+        
+        return local_hebbian_trace
+
+    def get_local_neuron_selector_loss(self) -> torch.Tensor:
+        """
+        Computes the loss from the neuron selector.
+        This is a placeholder for a more complex implementation where the selector
+        might have its own loss function (e.g., to encourage sparsity or diversity).
+        """
+        if self.biological_selector and hasattr(self.biological_selector, 'compute_loss'):
+             # Assuming the selector has a compute_loss method
+            return self.biological_selector.compute_loss()
+        return torch.tensor(0.0, device=self.start_activated_state.device)
 
     def forward_with_full_tracking(self, kv_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -2927,11 +2976,17 @@ class OriginalCTMCore(nn.Module):
         # Store final state trace for plasticity update
         self.last_state_trace = state_trace.detach()
 
+        # --- Compute Hebbian and Neuron Selector Signals/Losses for this pass ---
+        local_hebbian_signal = self.get_local_hebbian_signal(state_trace.detach())
+        local_neuron_selector_loss = self.get_local_neuron_selector_loss()
+
         return {
             'predictions': predictions,
             'certainties': certainties,
             'final_sync_out': synchronisation_out,
             'predictive_coding_loss': torch.stack(tracking_data['pc_losses']).mean() if tracking_data['pc_losses'] else torch.tensor(0.0, device=device),
+            'local_hebbian_signal': local_hebbian_signal, # Pass signal to main model
+            'local_neuron_selector_loss': local_neuron_selector_loss, # Pass loss to main model
             **tracking_data
         }
 
@@ -4732,15 +4787,19 @@ class EnhancedCTMDiffusion(nn.Module):
                 elif hasattr(self.training_noise_scheduler, 'config') and hasattr(self.training_noise_scheduler.config, 'prediction_type'):
                     if self.training_noise_scheduler.config.prediction_type == "epsilon":
                         # Halve and zero-center the loss to make a positive learning signal more attainable.
-                        diffusion_loss = (F.mse_loss(predicted_noise_or_x0, noise) / 2.1) - 1.0
+                        # Use tanh to create a bounded, zero-centered loss for the learning signal.
+                        # Use tanh with a scaled threshold to create a bounded, zero-centered "reward" signal.
+                        # This provides a smoother gradient than a hard threshold and prevents extreme values.
+                        # Low MSE -> negative loss -> positive learning signal.
+                        diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, noise) - 2.1) / 2.1)
                     elif self.training_noise_scheduler.config.prediction_type == "sample":
                         # Also apply to the sample prediction type.
-                        diffusion_loss = (F.mse_loss(predicted_noise_or_x0, clean_target_for_unet) / 2.1) - 1.0
+                        diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, clean_target_for_unet) - 2.1) / 2.1)
                     else:
                         print(f"Unsupported diffusion prediction type in training_noise_scheduler: {self.training_noise_scheduler.config.prediction_type}")
                         diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
                 else: # Default to epsilon prediction if config not available
-                    diffusion_loss = (F.mse_loss(predicted_noise_or_x0, noise) / 2.0) - 1.0
+                    diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, noise) - 2.1) / 2.1)
             else:
                 # This case should ideally not be reached if training_noise_scheduler is always initialized
                 print("CRITICAL WARNING: EnhancedCTMDiffusion.training_noise_scheduler not defined. Using zero diffusion loss.")
@@ -4879,8 +4938,6 @@ class EnhancedCTMDiffusion(nn.Module):
             # The training loop needs to be modified to do this.
             # For now, I am adding a placeholder call here to show where it would go.
             # In a real scenario, this would be handled by the trainer.
-            if self.training and 'total_loss' in locals() and self.ctm_core.use_activity_plasticity:
-                 self.ctm_core.apply_activity_plasticity(locals()['total_loss'])
 
             effective_timestep = timestep
             if hasattr(self.config, 'adaptive_scheduling') and self.config.adaptive_scheduling and hasattr(self.diffusion, 'get_adaptive_timesteps'):
@@ -5006,9 +5063,26 @@ class EnhancedCTMDiffusion(nn.Module):
         
         # Add predictive coding loss to total loss
         if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'predictive_coding_loss' in output_dict['ctm_core_data']:
-            pc_loss = output_dict['ctm_core_data']['predictive_coding_loss']
+            pc_loss = output_dict['ctm_core_data'].get('predictive_coding_loss', torch.tensor(0.0, device=device))
             output_dict['predictive_coding_loss'] = pc_loss
             current_total_loss += pc_loss * getattr(self.config, 'ctm_pc_loss_weight', 0.1)
+            output_dict['ctm_internal_loss'] = output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device)) + pc_loss
+
+        # --- Global Plasticity Loss ---
+        if self.config.use_global_plasticity_loss and 'ctm_core_data' in output_dict and output_dict['ctm_core_data']:
+            local_hebbian_signal = output_dict['ctm_core_data'].get('local_hebbian_signal')
+            if local_hebbian_signal is not None:
+                aggregated_hebbian_signal = torch.mean(local_hebbian_signal)
+                target_pattern = torch.tensor(self.config.target_hebbian_pattern, device=aggregated_hebbian_signal.device, dtype=aggregated_hebbian_signal.dtype)
+                global_plasticity_loss = F.mse_loss(aggregated_hebbian_signal, target_pattern)
+                output_dict['global_plasticity_loss'] = global_plasticity_loss * self.config.global_plasticity_loss_weight
+                current_total_loss += output_dict['global_plasticity_loss']
+
+        # --- Local Neuron Selector Loss ---
+        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and output_dict['ctm_core_data'].get('local_neuron_selector_loss') is not None:
+            local_selector_loss = output_dict['ctm_core_data']['local_neuron_selector_loss']
+            output_dict['local_neuron_selector_loss'] = local_selector_loss * self.config.local_neuron_selector_loss_weight
+            current_total_loss += output_dict['local_neuron_selector_loss']
 
         output_dict['total_loss'] = current_total_loss
 
