@@ -2738,8 +2738,14 @@ class OriginalCTMCore(nn.Module):
             # 2. Local Hebbian Plasticity for 'plastic_synapses'
             # This provides a more specific, biologically-inspired update rule for these synapses,
             # which is modulated by the overall success (global_loss).
-            plasticity_loss = diffusion_loss - ce_loss - mcmc_loss.detach()
-            learning_signal = torch.clamp(-plasticity_loss, -1.0, 1.0)
+            # --- Enhanced Stability: Clamp individual losses to prevent extreme values ---
+            clamped_diffusion_loss = torch.clamp(diffusion_loss, -5.0, 5.0)
+            clamped_ce_loss = torch.clamp(ce_loss, -5.0, 5.0)
+            clamped_mcmc_loss = torch.clamp(mcmc_loss.detach(), -5.0, 5.0)
+            
+            plasticity_loss = clamped_diffusion_loss - clamped_ce_loss - clamped_mcmc_loss
+            # Use tanh for smoother, bounded learning signal instead of hard clamp
+            learning_signal = torch.tanh(plasticity_loss / 2.0)  # Normalize by 2.0 for gentler scaling
             
             if torch.isnan(learning_signal) or torch.isinf(learning_signal):
                 print(f"[Plasticity Warning] Learning signal is NaN or Inf. Skipping Hebbian update for this step.")

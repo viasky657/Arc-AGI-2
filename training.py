@@ -180,7 +180,8 @@ def get_rank_debug():
     return rank, world_size
 
 # --- MCMC Plasticity Loss Normalization Factor ---
-MCMC_LOSS_GAMMA = 0.00001  # reduced to further dampen MCMC influence (Has to be very small since the Hebian and global plasticity loss is very small.)
+MCMC_LOSS_GAMMA = 0.001  # Increased from 0.00001 to prevent numerical precision issues
+MAX_MCMC_LOSS_FOR_PLASTICITY = 10.0  # Cap for numerical stability
 
 if not all([ctm_model_arc, arc_output_head, optimizer_arc, arc_train_loader, arc_criterion]):
     print("⚠️ Skipping ARC-AGI-2 training due to missing components.")
@@ -280,60 +281,90 @@ else:
                         mcmc_input_features = mcmc_input_features.mean(dim=1)
 
                     mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=normalized_target_y)
+                    
+                    # --- STABILITY FIX: Clamp MCMC loss to prevent explosion ---
+                    mcmc_loss_val = torch.clamp(mcmc_loss_val, -MAX_MCMC_LOSS_FOR_PLASTICITY, MAX_MCMC_LOSS_FOR_PLASTICITY)
                     total_loss = total_loss + mcmc_loss_val
                     
-                    # Per goal instructions, create a normalized MCMC loss for the plasticity update
-                    # ‣ clamp to ≥0 before taking log, to guarantee the argument to log1p is non-negative
-                    mcmc_for_plasticity = torch.relu(mcmc_loss_val.detach()) 
-                    norm_mcmc_loss_for_plasticity = MCMC_LOSS_GAMMA * torch.log1p(mcmc_for_plasticity)
+                    # --- STABILITY FIX: Improved MCMC loss normalization for plasticity ---
+                    # Use tanh for bounded output instead of log1p which can explode
+                    mcmc_for_plasticity = mcmc_loss_val.detach()
+                    # Normalize to [-1, 1] range using tanh, then scale
+                    norm_mcmc_loss_for_plasticity = MCMC_LOSS_GAMMA * torch.tanh(mcmc_for_plasticity / MAX_MCMC_LOSS_FOR_PLASTICITY)
 
-                    # Dynamic scaling of local Hebbian loss
+                    # --- STABILITY FIX: Improved dynamic scaling with bounds ---
                     abs_hebbian_mean = local_hebbian_signal.abs().mean()
-                    dyn_lambda = orig_local_selector_loss_weight / (abs_hebbian_mean + 1e-8)
-                    dynamic_hebbian_loss = dyn_lambda * abs_hebbian_mean
+                    # Clamp the denominator to prevent division by very small numbers
+                    abs_hebbian_mean_clamped = torch.clamp(abs_hebbian_mean, min=1e-4, max=10.0)
+                    dyn_lambda = torch.clamp(orig_local_selector_loss_weight / abs_hebbian_mean_clamped, min=0.01, max=10.0)
+                    dynamic_hebbian_loss = dyn_lambda * abs_hebbian_mean_clamped
                     total_loss = total_loss + dynamic_hebbian_loss
 
-            # --- NaN Check and Loss Debugging ---
+            # --- Enhanced NaN/Inf Check and Loss Debugging ---
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 print(f"[NaN or Inf Loss Detected] at Epoch {epoch+1}, Batch {batch_idx+1}. Skipping backward pass.")
-                print(f"  - Diffusion Loss: {diffusion_loss.item() if not torch.isnan(diffusion_loss) else 'NaN'}")
-                print(f"  - CE Loss: {ce_loss.item() if not torch.isnan(ce_loss) else 'NaN'}")
-                print(f"  - MCMC Loss: {mcmc_loss_val.item() if not torch.isnan(mcmc_loss_val) else 'NaN'}")
+                print(f"  - Diffusion Loss: {diffusion_loss.item() if torch.isfinite(diffusion_loss) else 'NaN/Inf'}")
+                print(f"  - CE Loss: {ce_loss.item() if torch.isfinite(ce_loss) else 'NaN/Inf'}")
+                print(f"  - MCMC Loss: {mcmc_loss_val.item() if torch.isfinite(mcmc_loss_val) else 'NaN/Inf'}")
+                print(f"  - Dynamic Hebbian Loss: {dynamic_hebbian_loss.item() if torch.isfinite(dynamic_hebbian_loss) else 'NaN/Inf'}")
                 continue # Skip to the next batch
 
-            # --- DEBUGGING: Print all loss components ---
-            print(f"[Losses] Diff: {diffusion_loss.item():.4f}, CE: {ce_loss.item():.4f}, MCMC: {mcmc_loss_val.item():.4f}, Total: {total_loss.item():.4f}")
+            # --- Enhanced Loss Monitoring ---
+            if (batch_idx + 1) % 10 == 0:  # Print every 10 batches instead of every batch
+                print(f"[Losses] Diff: {diffusion_loss.item():.4f}, CE: {ce_loss.item():.4f}, MCMC: {mcmc_loss_val.item():.4f}, Dyn_Heb: {dynamic_hebbian_loss.item():.4f}, Total: {total_loss.item():.4f}")
+                
+                # --- MCMC Loss Monitoring ---
+                if abs(mcmc_loss_val.item()) > 5.0:  # Alert if MCMC loss is getting large
+                    print(f"[WARNING] Large MCMC loss detected: {mcmc_loss_val.item():.4f}")
 
             if scaler:
                 scaler.scale(total_loss).backward()
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     scaler.unscale_(optimizer_arc)
-                    torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                    # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
+                    
+                    # --- Enhanced Gradient Clipping ---
+                    total_norm = torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
+                    if total_norm > MAX_GRAD_NORM * 2:  # Alert if gradients are very large
+                        print(f"[WARNING] Large gradient norm detected: {total_norm:.4f}")
+                    
+                    # --- Activity-Dependent Plasticity with Enhanced Stability ---
                     unwrapped_model = ctm_model_arc
-                    # Pass a modified loss to plasticity to ensure the learning signal can be positive.
-                    # By subtracting the large CE loss, we create a metric that is negative when
-                    # the model performs well, which in turn creates a positive learning signal.
-                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss, ce_loss, norm_mcmc_loss_for_plasticity)
+                    # Enhanced plasticity call with clamped losses
+                    clamped_diffusion_loss = torch.clamp(diffusion_loss, -10.0, 10.0)
+                    clamped_ce_loss = torch.clamp(ce_loss, -10.0, 10.0)
+                    unwrapped_model.ctm_core.apply_activity_plasticity(clamped_diffusion_loss, clamped_ce_loss, norm_mcmc_loss_for_plasticity)
                     scaler.step(optimizer_arc)
                     scaler.update()
                     optimizer_arc.zero_grad(set_to_none=True)
             elif accelerator_arc:
-                 accelerator_arc.backward(total_loss)
-                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
-                    unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
-                    unwrapped_model.ctm_core.apply_activity_plasticity(diffusion_loss, ce_loss, norm_mcmc_loss_for_plasticity)
-                    optimizer_arc.step()
-                    optimizer_arc.zero_grad()
-            else:
-                total_loss.backward()
+                accelerator_arc.backward(total_loss)
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                    # --- Activity-Dependent Plasticity uses ONLY diffusion_loss ---
-                    ctm_model_arc.ctm_core.apply_activity_plasticity(diffusion_loss, ce_loss, norm_mcmc_loss_for_plasticity)
-                    optimizer_arc.step()
-                    optimizer_arc.zero_grad()
+                   # --- Enhanced Gradient Clipping for Accelerator ---
+                   total_norm = torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
+                   if total_norm > MAX_GRAD_NORM * 2:
+                       print(f"[WARNING] Large gradient norm detected (accelerator): {total_norm:.4f}")
+                   
+                   # --- Activity-Dependent Plasticity with Enhanced Stability ---
+                   unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
+                   clamped_diffusion_loss = torch.clamp(diffusion_loss, -10.0, 10.0)
+                   clamped_ce_loss = torch.clamp(ce_loss, -10.0, 10.0)
+                   unwrapped_model.ctm_core.apply_activity_plasticity(clamped_diffusion_loss, clamped_ce_loss, norm_mcmc_loss_for_plasticity)
+                   optimizer_arc.step()
+                   optimizer_arc.zero_grad()
+           else:
+               total_loss.backward()
+               if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                   # --- Enhanced Gradient Clipping ---
+                   total_norm = torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
+                   if total_norm > MAX_GRAD_NORM * 2:
+                       print(f"[WARNING] Large gradient norm detected: {total_norm:.4f}")
+                   
+                   # --- Activity-Dependent Plasticity with Enhanced Stability ---
+                   clamped_diffusion_loss = torch.clamp(diffusion_loss, -10.0, 10.0)
+                   clamped_ce_loss = torch.clamp(ce_loss, -10.0, 10.0)
+                   ctm_model_arc.ctm_core.apply_activity_plasticity(clamped_diffusion_loss, clamped_ce_loss, norm_mcmc_loss_for_plasticity)
+                   optimizer_arc.step()
+                   optimizer_arc.zero_grad()
             
             total_arc_loss += total_loss.item()
             processed_batches += 1
