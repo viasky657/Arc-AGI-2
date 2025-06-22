@@ -180,13 +180,14 @@ def get_rank_debug():
     return rank, world_size
 
 # --- MCMC Plasticity Loss Normalization Factor ---
-MCMC_LOSS_GAMMA = 0.001  # Increased from 0.00001 to prevent numerical precision issues
-MAX_MCMC_LOSS_FOR_PLASTICITY = 10.0  # Cap for numerical stability
+# Scale MCMC loss to prevent overpowering other loss components
+MCMC_LOSS_SCALE = 0.01  # Scale factor for MCMC loss
+MAX_MCMC_LOSS_FOR_PLASTICITY = 1000  # Increased cap to allow larger raw loss values
 
 if not all([ctm_model_arc, arc_output_head, optimizer_arc, arc_train_loader, arc_criterion]):
     print("⚠️ Skipping ARC-AGI-2 training due to missing components.")
 else:
-# Record original global plasticity weight for scheduling
+    # Record original global plasticity weight for scheduling
     orig_global_plasticity_loss_weight = ctm_model_arc.global_plasticity_loss_weight
     orig_local_selector_loss_weight = ctm_model_arc.local_neuron_selector_loss_weight
     for epoch in range(NUM_EPOCHS_ARC):
@@ -283,16 +284,18 @@ else:
                     mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=normalized_target_y)
                     
                     # --- STABILITY FIX: Clamp MCMC loss to prevent explosion ---
+                    # Apply scaling and clamping to MCMC loss
+                    mcmc_loss_val = mcmc_loss_val * MCMC_LOSS_SCALE
                     mcmc_loss_val = torch.clamp(mcmc_loss_val, -MAX_MCMC_LOSS_FOR_PLASTICITY, MAX_MCMC_LOSS_FOR_PLASTICITY)
                     total_loss = total_loss + mcmc_loss_val
                     
-                    # --- STABILITY FIX: Improved MCMC loss normalization for plasticity ---
-                    # Use tanh for bounded output instead of log1p which can explode
+                    # --- STABILITY FIX: MCMC loss normalization for plasticity ---
+                    # Use the scaled loss for plasticity calculations
                     mcmc_for_plasticity = mcmc_loss_val.detach()
-                    # Normalize to [-1, 1] range using tanh, then scale
-                    norm_mcmc_loss_for_plasticity = MCMC_LOSS_GAMMA * torch.tanh(mcmc_for_plasticity / MAX_MCMC_LOSS_FOR_PLASTICITY)
+                    # Apply tanh to bound the plasticity signal between -1 and 1
+                    norm_mcmc_loss_for_plasticity = torch.tanh(mcmc_for_plasticity)
 
-                    # --- STABILITY FIX: Improved dynamic scaling with bounds ---
+                    # --- Dynamic scaling with bounds ---
                     abs_hebbian_mean = local_hebbian_signal.abs().mean()
                     # Clamp the denominator to prevent division by very small numbers
                     abs_hebbian_mean_clamped = torch.clamp(abs_hebbian_mean, min=1e-4, max=10.0)
@@ -351,7 +354,7 @@ else:
                    unwrapped_model.ctm_core.apply_activity_plasticity(clamped_diffusion_loss, clamped_ce_loss, norm_mcmc_loss_for_plasticity)
                    optimizer_arc.step()
                    optimizer_arc.zero_grad()
-           else:
+            else:
                total_loss.backward()
                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                    # --- Enhanced Gradient Clipping ---
