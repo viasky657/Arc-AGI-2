@@ -183,3 +183,31 @@ Dynamic scaling of the local Hebbian loss (λ₃ = base_weight / (mean(|local_he
 
 Captured the original selector weight at training.py:189.
 After MCMC normalization, compute abs_hebbian_mean, dyn_lambda, and apply dynamic_hebbian_loss at training.py:288–training.py:290.
+
+After reviewing the code in ctm_Diffusion_NEWNEW.py, I can provide insight into the plasticity loss sign:
+
+The plasticity loss being negative (-0.9213) is actually GOOD and indicates proper learning. Here's why:
+
+The plasticity loss is computed using a tanh transformation of the MSE loss:
+diffusion_loss = torch.tanh((F.mse_loss(...) - 2.1) / 2.1)
+
+python
+
+
+The code comments explicitly state the intention:
+# Low MSE -> negative loss -> positive learning signal.
+
+
+
+The transformation is designed such that:
+
+Low MSE (good performance) produces negative loss values
+High MSE (poor performance) produces positive loss values
+This approach creates a bounded, zero-centered "reward" signal that:
+
+Provides smoother gradients than hard thresholds
+Prevents extreme values that could destabilize training
+Creates a negative loss value when the model is performing well
+Therefore, the negative plasticity loss value indicates that the neurons are learning correctly and the model is making accurate predictions.
+
+#This new model will be much larger than the original version so it will require about 150GB of hard drive space to save all 20 EPOCHs of training. 
