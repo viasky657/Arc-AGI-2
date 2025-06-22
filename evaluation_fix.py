@@ -190,150 +190,137 @@ class CTMSurrogate:
 
     def predict(self, state: np.ndarray, penalty_weight: float = 0.2) -> float:
         """
-        Calculates a blended score using a smoother reward function with a penalty
-        for drastic changes from the original model's prediction.
-        Includes calibrated rewards and a placeholder for feature-based similarity.
+        Calculates a neural plasticity-focused reward using Hebbian learning and MCMC principles.
+        Emphasizes the formation of robust neural connections through pattern consistency.
         """
-        # --- Fine-Grained Similarity Metric ---
-        if self.feature_extractor:
-            # Placeholder for using a learned feature-based similarity
-            # target_features = self.feature_extractor(self.target_grid)
-            # state_features = self.feature_extractor(state)
-            # sim_to_target = cosine_similarity(target_features, state_features)
-            pass
-
-        sim_to_target = np.sum(state == self.target_grid) / self.target_grid.size
-
-        # --- Calibrated Reward Function ---
-        # Sigmoid scaling to heavily penalize anything less than a perfect match
-        # The steepness (k) makes the reward sharply increase as similarity approaches 1.
-        k = 20
-        reward_from_target = 1 / (1 + np.exp(-k * (sim_to_target - 0.95)))
-
-        # Similarity to the initial (failed) model prediction
-        sim_to_model = np.sum(state == self.model_prediction_cropped) / self.model_prediction_cropped.size
+        h, w = self.target_grid.shape
         
-        # Penalty for deviating too far from the model's original prediction
-        deviation_penalty = np.sum(state != self.model_prediction_cropped) / self.model_prediction_cropped.size
+        # --- Pattern Connectivity Score ---
+        # Measures how well local patterns form connected neural pathways
+        connectivity_score = 0.0
+        pattern_matches = 0
+        for i in range(h):
+            for j in range(w):
+                # Check 3x3 neighborhood (with boundary checks)
+                i_start = max(0, i-1)
+                i_end = min(h, i+2)
+                j_start = max(0, j-1)
+                j_end = min(w, j+2)
+                
+                # Extract and compare neighborhoods
+                state_nhood = state[i_start:i_end, j_start:j_end]
+                target_nhood = self.target_grid[i_start:i_end, j_start:j_end]
+                
+                # Pattern match rewards consistent neural activation pathways
+                if np.array_equal(state_nhood, target_nhood):
+                    connectivity_score += 1.0  # Full reward for exact match
+                    pattern_matches += 1
+                elif np.sum(state_nhood == target_nhood) / target_nhood.size > 0.7:
+                    connectivity_score += 0.5  # Partial reward for similar patterns
         
-        # Dynamically balance rewards based on initial model quality
-        baseline_similarity = np.sum(self.model_prediction_cropped == self.target_grid) / self.target_grid.size
+        # Normalize by total positions
+        if h * w > 0:
+            connectivity_score /= (h * w)
         
-        # If the baseline is good, trust the model more. If not, trust the target reward more.
-        alpha = min(0.9, 1.0 - baseline_similarity**2) # Squaring makes it more sensitive
-
-        # Blended score
-        blended_score = (alpha * reward_from_target +
-                         (1.0 - alpha) * sim_to_model -
-                         penalty_weight * deviation_penalty)
-        return blended_score
-
-    def _run_model_for_grid(self, grid_np: np.ndarray, requires_grad: bool = False) -> Optional[Dict]:
-        """Helper to run the CTM model for a given numpy grid and return the full output dict."""
-        input_bytes_single = serialize_and_pad_grid(grid_np, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE)
-        input_bytes_np = np.frombuffer(input_bytes_single, dtype=np.uint8).copy()
-        input_bytes = torch.from_numpy(input_bytes_np).to(torch.uint8).unsqueeze(0).to(self.device)
-
-        context = torch.enable_grad() if requires_grad else torch.no_grad()
-        with context:
-            eval_timestep = torch.zeros(1, device=self.device).long()
-            # The target here can be the input itself for a self-reconstruction task during meta-learning
-            target_bytes_tensor = torch.from_numpy(np.frombuffer(serialize_and_pad_grid(grid_np, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE), dtype=np.uint8).copy()).to(torch.uint8).unsqueeze(0).to(self.device)
+        # --- Neural Plasticity Factor ---
+        # Encourages gradual rewiring of neural connections
+        plasticity_factor = 1.0
+        if self.model_prediction_cropped.size > 0:
+            # Measure connection changes from original prediction
+            changed_connections = np.sum(state != self.model_prediction_cropped)
+            total_connections = self.model_prediction_cropped.size
             
-            eval_model_output_dict = self.model(
-                byte_sequence=input_bytes,
-                mode='ctm_controlled_diffusion',
-                target_diffusion_output=target_bytes_tensor, # Providing a target enables diffusion and pc loss
-                timestep=eval_timestep,
-                task_name="ARC_AGI_2_META_LEARN"
-            )
-            return eval_model_output_dict
+            # Optimal plasticity: 20-40% connection changes
+            if changed_connections > 0:
+                change_ratio = changed_connections / total_connections
+                if change_ratio < 0.2:
+                    plasticity_factor = 0.5 + 2.5 * change_ratio  # Scale up low changes
+                elif change_ratio > 0.4:
+                    plasticity_factor = 1.5 - 1.25 * change_ratio  # Scale down high changes
+                else:
+                    plasticity_factor = 1.0  # Peak reward in optimal range
+        
+        # --- Final Reward Calculation ---
+        # Combines pattern connectivity with neural plasticity
+        reward = connectivity_score * plasticity_factor
+        
+        # Boost reward when both factors are strong
+        if connectivity_score > 0.7 and plasticity_factor > 0.8:
+            reward *= 1.2
+            
+        return reward
 
     def adapt_to_new_task(self, train_pairs: List[dict], optimizer):
         """
-        Fine-tunes the entire model (CTM core + head) on the training examples
-        of a new task, leveraging predictive coding and activity-dependent plasticity.
+        Fine-tunes the surrogate model's head on the training examples of a new,
+        unseen task to improve its initial predictions (meta-learning).
         """
-        print("  > Meta-learning: Adapting model to new task train examples...")
+        print("  > Meta-learning: Adapting surrogate to new task train examples...")
         
-        # Use the main optimizer and a new scheduler for this adaptation phase.
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10 * len(train_pairs), eta_min=1e-6)
+        # This is a conceptual implementation. A real one would involve
+        # a few quick gradient steps on a small, separate optimizer for the head.
+        # For now, it serves as a structural placeholder.
+        
+        # Create a temporary optimizer for the head for quick adaptation
+        head_optimizer = torch.optim.Adam(self.arc_output_head.parameters(), lr=1e-3)
         loss_fn = FocalLoss(alpha=0.5, gamma=2.0, reduction='mean')
-        PC_LOSS_WEIGHT = 0.1 # Hyperparameter for predictive coding loss
-
-        self.model.train()
-        self.arc_output_head.train()
         
-        num_epochs = 10
-        for epoch in range(num_epochs):
-            total_epoch_loss = 0
-            
+        # --- Pre-computation outside the loop ---
+        # Get the CTM features once, as they don't change for the task
+        with torch.no_grad():
+            eval_timestep = torch.zeros(self.input_bytes_eval.size(0), device=self.device).long()
+            eval_model_output_dict = self.model(
+                byte_sequence=self.input_bytes_eval,
+                mode='ctm_controlled_diffusion',
+                target_diffusion_output=None,
+                timestep=eval_timestep,
+                task_name="ARC_AGI_2_META_LEARN_FEATURES"
+            )
+            ctm_core_output_data = eval_model_output_dict.get('ctm_core_data', {})
+            ctm_backbone_output = ctm_core_output_data.get('final_sync_out', ctm_core_output_data.get('ctm_latent_representation'))
+
+            if ctm_backbone_output is None:
+                print("  > Meta-learning WARNING: Could not extract features. Aborting adaptation.")
+                return
+
+            if ctm_backbone_output.ndim > 2 and ctm_backbone_output.shape[1] > 0:
+                self.ctm_features_for_head = ctm_backbone_output.mean(dim=1).detach()
+            else:
+                self.ctm_features_for_head = ctm_backbone_output.detach()
+
+        # --- Quick fine-tuning loop ---
+        self.arc_output_head.train()
+        for epoch in range(3): # A few quick epochs
+            total_loss = 0
             for pair in train_pairs:
-                optimizer.zero_grad()
+                head_optimizer.zero_grad()
                 
-                # 1. Run model for the current training input, with gradients enabled
-                input_grid_np = pair['input'].squeeze(0).cpu().numpy()
-                # Here we use the new helper that allows gradients
-                model_output_dict = self._run_model_for_grid(input_grid_np, requires_grad=True)
-
-                if model_output_dict is None:
-                    print(f"  > Meta-learning WARNING: Could not get model output for a training pair. Skipping.")
-                    continue
-
-                # 2. Extract features and internal losses
-                ctm_core_data = model_output_dict.get('ctm_core_data', {})
-                predictive_coding_loss = ctm_core_data.get('predictive_coding_loss', torch.tensor(0.0, device=self.device))
-                enhanced_ctm_loss = model_output_dict.get('total_loss', torch.tensor(0.0, device=self.device)) # Diffusion loss, entropy loss etc.
+                # Get target grid and its dimensions
+                output_grid_np = pair['output'].cpu().numpy()
+                h, w = pair['original_output_dims']
                 
-                ctm_backbone_output = ctm_core_data.get('final_sync_out')
-                if ctm_backbone_output is None:
-                    print(f"  > Meta-learning WARNING: 'final_sync_out' not in model output. Skipping.")
-                    continue
-
-                if ctm_backbone_output.ndim > 2:
-                    ctm_features_for_head = ctm_backbone_output.mean(dim=1)
-                else:
-                    ctm_features_for_head = ctm_backbone_output
-
-                # 3. Calculate primary objective loss (Focal Loss on grid prediction)
-                output_grid_np = pair['output'].squeeze(0).cpu().numpy()
-                h_tensor, w_tensor = pair['original_output_dims']
-                h, w = h_tensor.item(), w_tensor.item()
+                # Prepare target tensor for loss calculation
                 target_grid_tensor = torch.from_numpy(output_grid_np).long().to(self.device)
                 
-                predicted_logits = self.arc_output_head(ctm_features_for_head)
-                predicted_logits = predicted_logits.view(1, NUM_ARC_SYMBOLS, MAX_GRID_SIZE[0], MAX_GRID_SIZE[1])
-                cropped_logits = predicted_logits[:, :, :h, :w]
+                # Forward pass through the head ONLY
+                logits = self.arc_output_head(self.ctm_features_for_head)
+                logits = logits.view(1, NUM_ARC_SYMBOLS, MAX_GRID_SIZE[0], MAX_GRID_SIZE[1])
+                cropped_logits = logits[:, :, :h, :w]
                 
-                ce_loss = loss_fn(cropped_logits, target_grid_tensor[:h, :w].unsqueeze(0))
-
-                # 4. Combine all losses
-                loss = ce_loss + enhanced_ctm_loss + (predictive_coding_loss * PC_LOSS_WEIGHT)
+                # Calculate loss
+                loss = loss_fn(cropped_logits, target_grid_tensor[:h, :w].unsqueeze(0))
                 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"  > Meta-learning WARNING: NaN or Inf loss detected. Skipping update.")
-                    continue
-
-                # 5. Backward pass, plasticity update, and optimization step
+                # Backward pass and optimization step
                 loss.backward()
-                
-                # --- Apply Activity-Dependent Plasticity ---
-                self.model.ctm_core.apply_activity_plasticity(loss.detach())
-                
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(self.arc_output_head.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                
-                total_epoch_loss += loss.item()
+                head_optimizer.step()
+                total_loss += loss.item()
             
             if len(train_pairs) > 0:
-                avg_loss = total_epoch_loss / len(train_pairs)
-                print(f"  > Meta-learning epoch {epoch+1}/{num_epochs}, Avg Loss: {avg_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+                print(f"  > Meta-learning epoch {epoch+1}, Avg Loss: {total_loss / len(train_pairs):.4f}")
 
-        self.model.eval()
-        self.arc_output_head.eval()
+        self.arc_output_head.eval() # Return head to evaluation mode
         
+        # After adaptation, re-compute the model's prediction
         print("  > Re-evaluating prediction with adapted head...")
         self.model_prediction_full = self._get_model_prediction()
         h_target, w_target = self.target_grid.shape
@@ -428,14 +415,16 @@ def metropolis_hastings_sampler(
 
 def perform_online_update(model, arc_output_head, optimizer, scheduler, input_bytes, failed_grid_np: np.ndarray, corrected_grid_np: np.ndarray, original_dims: tuple, device, failed_features: Optional[torch.Tensor] = None):
     """
-    Performs a single, targeted fine-tuning step on the model, incorporating
-    predictive coding and activity-dependent plasticity.
+    Performs a single, targeted fine-tuning step on the model using Focal Loss
+    and a learning rate scheduler for more stable and focused updates.
+    Enhanced with comments on alternative loss functions and stability penalties.
     """
     h, w = original_dims
-    target_grid_for_loss = torch.from_numpy(corrected_grid_np[:h, :w]).long().to(device)
-    failed_grid_for_loss = torch.from_numpy(failed_grid_np[:h, :w]).long().to(device)
+    target_for_loss = torch.from_numpy(corrected_grid_np[:h, :w]).long().to(device)
+    failed_for_loss = torch.from_numpy(failed_grid_np[:h, :w]).long().to(device)
 
-    correction_mask = (target_grid_for_loss != failed_grid_for_loss).float()
+    correction_mask = (target_for_loss != failed_for_loss).float()
+
     if torch.sum(correction_mask) == 0:
         print("  > No pixel differences found between failed and corrected grid. Skipping online update.")
         return
@@ -444,14 +433,11 @@ def perform_online_update(model, arc_output_head, optimizer, scheduler, input_by
     arc_output_head.train()
     optimizer.zero_grad()
 
-    # The target for the diffusion component of the loss is the corrected grid
     target_bytes_single = serialize_and_pad_grid(corrected_grid_np, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE)
     target_bytes_np = np.frombuffer(target_bytes_single, dtype=np.uint8).copy()
     target_bytes_tensor = torch.from_numpy(target_bytes_np).to(torch.uint8).unsqueeze(0).to(device)
 
     train_timestep = torch.zeros(1, device=device).long()
-    
-    # Run forward pass with gradients enabled
     output_dict = model(
         byte_sequence=input_bytes,
         mode='ctm_controlled_diffusion',
@@ -460,11 +446,12 @@ def perform_online_update(model, arc_output_head, optimizer, scheduler, input_by
         task_name="ARC_AGI_2_ONLINE_LEARN"
     )
 
-    # Extract all relevant outputs
-    ctm_core_data = output_dict.get('ctm_core_data', {})
-    predictive_coding_loss = ctm_core_data.get('predictive_coding_loss', torch.tensor(0.0, device=device))
-    enhanced_ctm_loss = output_dict.get('total_loss', torch.tensor(0.0, device=device))
-    ctm_backbone_output = ctm_core_data.get('final_sync_out')
+    ctm_core_output_data = output_dict.get('ctm_core_data')
+    ctm_backbone_output = None
+    if ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
+        ctm_backbone_output = ctm_core_output_data['final_sync_out']
+    elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
+        ctm_backbone_output = ctm_core_output_data['ctm_latent_representation']
     
     if ctm_backbone_output is None:
         print("Warning: CTM core output not found. Cannot perform online update.")
@@ -472,40 +459,52 @@ def perform_online_update(model, arc_output_head, optimizer, scheduler, input_by
         arc_output_head.eval()
         return
 
-    # Process features for the head
-    if ctm_backbone_output.ndim > 2:
-         ctm_features_for_head = ctm_backbone_output.mean(dim=1)
+    if ctm_backbone_output.ndim > 2 and ctm_backbone_output.shape[1] > 0:
+         ctm_features_for_head_new = ctm_backbone_output.mean(dim=1)
     else:
-         ctm_features_for_head = ctm_backbone_output
-    
-    # Calculate the primary objective loss (Focal Loss)
-    predicted_logits = arc_output_head(ctm_features_for_head)
+         ctm_features_for_head_new = ctm_backbone_output
+
+    predicted_logits = arc_output_head(ctm_features_for_head_new)
     predicted_logits = predicted_logits.view(1, NUM_ARC_SYMBOLS, MAX_GRID_SIZE[0], MAX_GRID_SIZE[1])
     cropped_logits = predicted_logits[:, :, :h, :w]
-    
-    loss_fn = FocalLoss(alpha=0.5, gamma=2.0)
-    ce_loss = loss_fn(cropped_logits, target_grid_for_loss.unsqueeze(0))
+    target_for_loss_unsqueezed = target_for_loss # Target should be [H, W] for FocalLoss
 
-    # Combine all loss components
-    PC_LOSS_WEIGHT = 0.1
-    loss = ce_loss + enhanced_ctm_loss + (predictive_coding_loss * PC_LOSS_WEIGHT)
-    
-    # Optional: Add stabilization loss
+    # --- Enhanced Self-Learning and Loss Stabilization ---
+    # The current implementation uses FocalLoss, which is a great start.
+    # Other options to explore:
+    # 1. Contrastive Loss: Instead of predicting pixels, predict which of two grids
+    #    (the correct one vs. a distractor) is the true target. This can improve
+    #    the feature representation's quality.
+    # 2. Add a penalty term to discourage drastic changes from the original prediction,
+    #    unless they lead to a significant improvement. This can be a regularization
+    #    term on the weights or a penalty on the latent space distance.
+    #    Example: loss += lambda * ||f(new) - f(old)||^2
+
+    # Use Focal Loss to focus on hard-to-correct pixels
+    loss_fn = FocalLoss(alpha=0.5, gamma=2.0, reduction='none')
+    loss_per_pixel = loss_fn(cropped_logits, target_for_loss_unsqueezed.unsqueeze(0)) # Unsqueeze target here
+
+    # Combine with the correction mask to only learn from changed pixels
+    # To implement multi-sample loss averaging, one could run MCMC multiple times
+    # to generate a batch of corrected grids, and average the loss over that batch.
+    masked_loss = loss_per_pixel * correction_mask.unsqueeze(0)
+    loss = masked_loss.sum() / correction_mask.sum().clamp(min=1e-8)
+    base_loss_val = loss.item()
+
+    # Add stabilization loss if features from the failed prediction are provided
     if failed_features is not None:
-        stabilization_lambda = 0.25
-        stabilization_loss = torch.nn.functional.mse_loss(ctm_features_for_head, failed_features)
+        # The penalty term discourages drastic changes from the original prediction's latent space.
+        stabilization_lambda = 0.25 # Hyperparameter to balance the two loss terms
+        stabilization_loss = torch.nn.functional.mse_loss(ctm_features_for_head_new, failed_features)
         loss += stabilization_lambda * stabilization_loss
-        print(f"  > Combined Loss: {loss.item():.4f} (Focal: {ce_loss.item():.4f}, PC: {predictive_coding_loss.item():.4f}, Stabilize: {stabilization_loss.item():.4f})")
+        print(f"  > Combined Loss: {loss.item():.4f} (Focal: {base_loss_val:.4f}, Stabilize: {stabilization_loss.item():.4f})")
     else:
-        print(f"  > Combined Loss: {loss.item():.4f} (Focal: {ce_loss.item():.4f}, PC: {predictive_coding_loss.item():.4f})")
+        print(f"  > Focused Loss: {base_loss_val:.4f} on {int(correction_mask.sum())} pixels.")
 
-    # Backward pass, plasticity, and optimizer step
     loss.backward()
-    model.ctm_core.apply_activity_plasticity(loss.detach()) # Apply plasticity update
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    torch.nn.utils.clip_grad_norm_(arc_output_head.parameters(), 1.0)
     optimizer.step()
-    scheduler.step()
+    scheduler.step() # Step the learning rate scheduler
 
     model.eval()
     arc_output_head.eval()
@@ -894,6 +893,12 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     jepa_loss_weight: float = 0.1 # Weight for the JEPA loss component
     jepa_num_target_blocks: int = 1 # Number of target blocks to predict
 
+     # --- Global Plasticity Loss Parameters ---
+    use_global_plasticity_loss: bool = True
+    global_plasticity_loss_weight: float = 0.05
+    local_neuron_selector_loss_weight: float = 0.1
+    target_hebbian_pattern: float = 0.0 # Target for the aggregated Hebbian signal
+
     # --- Knowledge Store Parameters ---
 
     def __post_init__(self):
@@ -1093,19 +1098,19 @@ if 'EnhancedCTMDiffusion' in globals() and EnhancedCTMDiffusion is not None:
     print("✓ EnhancedCTMDiffusion model for ARC (ctm_model_arc) initialized.")
 
     # The external ARC output head will take features from the CTM core part of EnhancedCTMDiffusion
-    arc_output_head_input_dim = config_arc_diffusion.output_dims[0]
+    arc_output_head_input_dim = config_arc_diffusion.ctm_out_dims
     arc_output_head = nn.Linear(arc_output_head_input_dim, ARC_OUTPUT_HEAD_DIM).to(device)
     print(f"✓ ARC Output Head initialized (input_dim: {arc_output_head_input_dim}, output_dim: {ARC_OUTPUT_HEAD_DIM}).")
 
     # Handle external MCMC integration if enabled
     if 'enhanced_ctm_mcmc' in globals() and ENABLE_CTM_MCMC_INTEGRATION_FOR_ARC and enhanced_ctm_mcmc:
         # Ensure the external MCMC module's input_dim matches the new CTM's output
-        if enhanced_ctm_mcmc.thought_network[0].in_features != config_arc_diffusion.output_dims[0]:
-            print(f"Re-initializing external enhanced_ctm_mcmc for new input_dim {config_arc_diffusion.output_dims[0]}")
+        if enhanced_ctm_mcmc.thought_network[0].in_features != config_arc_diffusion.ctm_out_dims:
+            print(f"Re-initializing external enhanced_ctm_mcmc for new input_dim {config_arc_diffusion.ctm_out_dims}")
             # This part of the code assumes 'EnhancedCTMFenchelYoungIntegration' and other related variables are defined.
             # If not, this will raise an error, which is expected behavior if setup is wrong.
             enhanced_ctm_mcmc = EnhancedCTMFenchelYoungIntegration(
-                input_dim=config_arc_diffusion.output_dims[0],
+                input_dim=config_arc_diffusion.ctm_out_dims,
                 output_space=arc_grid_output_space,
                 mcmc_config=MCMC_CONFIG_ARC,
                 use_large_neighborhood_search=True,
