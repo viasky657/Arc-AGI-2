@@ -245,11 +245,14 @@ else:
                 total_loss = model_output_dict.get('total_loss', diffusion_loss)
                 
                 # --- Get CTM core output for auxiliary heads ---
+                # Use predictions first (for meta-learning), but ensure 512-dim features for ARC head
                 ctm_backbone_output = None
                 if model_output_dict and 'predictions' in model_output_dict:
                     ctm_backbone_output = model_output_dict['predictions'][:, :, -1]
+                    print(f"  [TRAINING] Using predictions with shape: {ctm_backbone_output.shape}")
                 elif model_output_dict and 'final_sync_out' in model_output_dict:
                     ctm_backbone_output = model_output_dict['final_sync_out']
+                    print(f"  [TRAINING] Using final_sync_out with shape: {ctm_backbone_output.shape}")
                 else:
                     print("Warning: CTM core output not found. Using zeros for auxiliary head inputs.")
                     ctm_backbone_output = torch.zeros(current_batch_size, config_arc_diffusion.ctm_out_dims, device=input_bytes.device)
@@ -261,6 +264,17 @@ else:
                         ctm_features_for_head = ctm_backbone_output.mean(dim=1)
                     else:
                         ctm_features_for_head = ctm_backbone_output
+                    
+                    # Check if features match ARC head expectations, use final_sync_out if needed
+                    if ctm_features_for_head.shape[-1] != arc_output_head.in_features:
+                        print(f"  [TRAINING] Feature dimension mismatch for ARC head! Expected {arc_output_head.in_features}, got {ctm_features_for_head.shape[-1]}")
+                        if model_output_dict and 'final_sync_out' in model_output_dict:
+                            alt_features = model_output_dict['final_sync_out']
+                            if alt_features.ndim > 2:
+                                alt_features = alt_features.mean(dim=1)
+                            if alt_features.shape[-1] == arc_output_head.in_features:
+                                ctm_features_for_head = alt_features
+                                print(f"  [TRAINING] Using final_sync_out for ARC head with shape: {ctm_features_for_head.shape}")
                     
                     predicted_logits = arc_output_head(torch.tanh(ctm_features_for_head))
                     predicted_logits_reshaped = predicted_logits.view(current_batch_size * ARC_INPUT_FLAT_DIM, NUM_ARC_SYMBOLS)

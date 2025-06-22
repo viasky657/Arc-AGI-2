@@ -165,10 +165,14 @@ class CTMSurrogate:
                 task_name="ARC_AGI_2_EVAL_DIFFUSION"
             )
             
-            # 2. Extract features consistent with training loop logic
+            # 2. Extract features consistent with training loop logic - use predictions first for meta-learning
             ctm_core_output_data = eval_model_output_dict.get('ctm_core_data')
             ctm_backbone_output = None
-            if ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
+            if eval_model_output_dict and 'predictions' in eval_model_output_dict:
+                ctm_backbone_output = eval_model_output_dict['predictions'][:, :, -1]
+            elif eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
+                ctm_backbone_output = eval_model_output_dict['final_sync_out']
+            elif ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
                 ctm_backbone_output = ctm_core_output_data['final_sync_out']
             elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
                 ctm_backbone_output = ctm_core_output_data['ctm_latent_representation']
@@ -179,6 +183,17 @@ class CTMSurrogate:
                      ctm_features_for_head = ctm_backbone_output.mean(dim=1)
                 else:
                      ctm_features_for_head = ctm_backbone_output
+                
+                # Check if features match ARC head expectations, use final_sync_out if needed
+                if ctm_features_for_head.shape[-1] != self.arc_output_head.in_features:
+                    print(f"  [EVAL] Feature dimension mismatch for ARC head! Expected {self.arc_output_head.in_features}, got {ctm_features_for_head.shape[-1]}")
+                    if eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
+                        alt_features = eval_model_output_dict['final_sync_out']
+                        if alt_features.ndim > 2:
+                            alt_features = alt_features.mean(dim=1)
+                        if alt_features.shape[-1] == self.arc_output_head.in_features:
+                            ctm_features_for_head = alt_features
+                            print(f"  [EVAL] Using final_sync_out for ARC head with shape: {ctm_features_for_head.shape}")
                 
                 # 3. Get logits from the prediction head
                 logits = self.arc_output_head(ctm_features_for_head)
@@ -307,8 +322,9 @@ class CTMSurrogate:
                 logits = logits.view(1, NUM_ARC_SYMBOLS, MAX_GRID_SIZE[0], MAX_GRID_SIZE[1])
                 cropped_logits = logits[:, :, :h, :w]
                 
-                # Calculate loss
-                loss = loss_fn(cropped_logits, target_grid_tensor[:h, :w].unsqueeze(0))
+                # Calculate loss - fix tensor shape mismatch
+                target_for_loss = target_grid_tensor[:h, :w]  # Shape: [h, w]
+                loss = loss_fn(cropped_logits, target_for_loss)  # Don't add extra unsqueeze
                 
                 # Backward pass and optimization step
                 loss.backward()
@@ -993,12 +1009,11 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             if not self.use_dynamic_entropy_patcher:
                 print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
 
-# Define EnhancedCTMConfig for ARC with EnhancedCTMDiffusion
+# Define EnhancedCTMConfig for ARC with EnhancedCTMDiffusion - MATCHING Setup.py configuration
 config_arc_diffusion = EnhancedCTMConfig(
     d_model=512,
-    #inferred_task_latent_dim=64, # This line remains commented out
     n_heads=8,
-    n_layers=24, 
+    n_layers=24,
     max_sequence_length=MAX_SEQUENCE_LENGTH,
     dropout=0.1,
     use_dynamic_entropy_patcher=True,
@@ -1010,41 +1025,28 @@ config_arc_diffusion = EnhancedCTMConfig(
     entropy_patcher_relative_threshold=0.1,
     entropy_patcher_min_patch_size=4,
     entropy_patcher_max_patch_size=128,
-    # Parameters for the learnable entropy model within LearnedBytePatcherEncoder
     entropy_model_byte_vocab_size=256,
     entropy_model_embedding_dim=64,
     entropy_model_hidden_dim=128,
     entropy_model_num_layers=1,
     entropy_model_dropout=0.1,
     entropy_model_loss_weight=0.1,
-    
     ctm_input_dim=256,
     ctm_d_model=512,
     ctm_iterations=5,
     ctm_heads=8,
     ctm_out_dims=512,
     ctm_neuron_select_type='bio_multi_objective',
-    
-    # Attention Mechanism Type
-    attention_type="subquadratic",  # Options: "standard", "binary_sparse", "subquadratic"
-    
-    # Subquadratic Attention Parameters
+    attention_type="subquadratic",
     subquadratic_attn_epsilon=1e-6,
     subquadratic_attn_poly_degree=5,
-    attention_qkv_bias=True, # Corrected capitalization
-    
-    # Positional Embedding Parameters
+    attention_qkv_bias=True,
     positional_embedding_type='multi-learnable-fourier',
     positional_embedding_dim=None,
     reshape_patch_sequence_to_grid=True,
-    #patch_grid_width=None, #Already defined in the byte patch section of this config. 
-
-    # Pipeline Parallelism Parameters
     enable_pipeline_parallelism=True,
     pipeline_stages=4,
     pipeline_overlap_ratio=0.7,
-    
-    # Adaptive Batch Sizing Parameters
     enable_adaptive_batching=True,
     initial_batch_size=32,
     min_batch_size=8,
@@ -1052,39 +1054,31 @@ config_arc_diffusion = EnhancedCTMConfig(
     batch_adaptation_frequency=100,
     memory_threshold_high=0.85,
     memory_threshold_low=0.6,
-    
-    # Smart Data Sampling Parametersa
     enable_smart_sampling=True,
     sample_importance_weight=0.6,
     sample_diversity_weight=0.4,
     initial_sample_ratio=0.3,
     complexity_analysis_enabled=True,
-    
-    # Multi-input/output parameters
     num_inputs=1,
     num_outputs=1,
-    output_dims=[64],  # Directly pass the list value
-    
-    # Self-supervised learning
+    output_dims=[64],  # CRITICAL: This matches Setup.py - the actual output dimension
     ssl_dim=128,
     ssl_weight=0.1,
     ssl_temperature=0.07,
     ssl_noise_std=0.1,
-    
-    # Spatiotemporal Processing
     use_spatial=True,
-    
-    # WINA Attention
     use_wina_attention=True,
-    
-    # Multi-task Learning Parameters
     max_tasks=50,
     diffusion_steps=1000,
     ctm_diffusion_coupling_strength=0.8,
     vocab_size=None,
-    #enable_enhanced_mcmc=False, #ONLY USE THE ARC_AGI NOTEBOOK VERSION AND NOT THE ONE IMPORTED FROM THE DIFFUSION_NEWNEW file (This needs to be false). This flie cannot use this variable.
-    #mcmc_config=MCMC_CONFIG_ARC, #I don't think this is needed. 
-    output_audio_bytes=False
+    output_audio_bytes=False,
+    unet_input_feature_dim=8192,
+    # Global Plasticity Loss Parameters - matching Setup.py
+    use_global_plasticity_loss=True,
+    global_plasticity_loss_weight=0.05,
+    local_neuron_selector_loss_weight=0.1,
+    target_hebbian_pattern=0.0
 )
 
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
@@ -1098,7 +1092,8 @@ if 'EnhancedCTMDiffusion' in globals() and EnhancedCTMDiffusion is not None:
     print("✓ EnhancedCTMDiffusion model for ARC (ctm_model_arc) initialized.")
 
     # The external ARC output head will take features from the CTM core part of EnhancedCTMDiffusion
-    arc_output_head_input_dim = config_arc_diffusion.ctm_out_dims
+    # CRITICAL FIX: The checkpoint was trained with 512 input features, so we need to match that
+    arc_output_head_input_dim = config_arc_diffusion.ctm_out_dims  # Use 512 to match checkpoint
     arc_output_head = nn.Linear(arc_output_head_input_dim, ARC_OUTPUT_HEAD_DIM).to(device)
     print(f"✓ ARC Output Head initialized (input_dim: {arc_output_head_input_dim}, output_dim: {ARC_OUTPUT_HEAD_DIM}).")
 
@@ -1275,22 +1270,142 @@ else:
     head_checkpoint_path_eval = os.path.join(CHECKPOINT_DIR_ARC, f"arc_output_head_epoch_{latest_epoch}.safetensors")
 
     try:
-        # Load CTM Model
+        # Load CTM Model - using the same approach as training.py
         if os.path.exists(ctm_checkpoint_path_eval):
             print(f"  > Loading CTM checkpoint from {ctm_checkpoint_path_eval}...")
             # Load state_dict using the safetensors library directly, as per user feedback
             state_dict_ctm = load_file(ctm_checkpoint_path_eval, device="cpu")
-            ctm_model_arc.load_state_dict(state_dict_ctm, strict=False)
-            print(f"✓ Loaded CTM checkpoint from epoch {latest_epoch}.")
+            
+            # Get the model to load into (unwrap if using accelerator)
+            model_to_load_ctm = ctm_model_arc
+            if ACCELERATE_AVAILABLE and 'accelerator_arc' in globals():
+                try:
+                    model_to_load_ctm = accelerator_arc.unwrap_model(ctm_model_arc)
+                except:
+                    model_to_load_ctm = ctm_model_arc
+            
+            # Initialize model parameters by running a dummy forward pass
+            print("  > Initializing model parameters...")
+            try:
+                with torch.no_grad():
+                    dummy_input = torch.zeros(1, MAX_SEQUENCE_LENGTH, dtype=torch.uint8, device=device)
+                    dummy_timestep = torch.zeros(1, device=device).long()
+                    _ = model_to_load_ctm(
+                        byte_sequence=dummy_input,
+                        mode='ctm_controlled_diffusion',
+                        target_diffusion_output=None,
+                        timestep=dummy_timestep,
+                        task_name="INIT"
+                    )
+                print("  > Model parameters initialized successfully.")
+            except Exception as init_error:
+                print(f"  > Warning: Could not initialize model parameters: {init_error}")
+                print("  > Proceeding with direct state dict loading...")
+            
+            # Filter out parameters with shape mismatches (same approach as training saves)
+            try:
+                model_state_dict = model_to_load_ctm.state_dict()
+                filtered_state_dict = {}
+                skipped_keys = []
+                
+                for key, param in state_dict_ctm.items():
+                    if key in model_state_dict:
+                        try:
+                            # Safely check if shapes match
+                            model_param = model_state_dict[key]
+                            if hasattr(model_param, 'shape') and param.shape == model_param.shape:
+                                filtered_state_dict[key] = param
+                            else:
+                                model_shape = getattr(model_param, 'shape', 'uninitialized')
+                                skipped_keys.append(f"{key} (checkpoint: {param.shape}, model: {model_shape})")
+                        except RuntimeError as e:
+                            if "uninitialized" in str(e):
+                                # Parameter is uninitialized, skip it
+                                skipped_keys.append(f"{key} (checkpoint: {param.shape}, model: uninitialized)")
+                            else:
+                                raise e
+                    else:
+                        # Key not in model, will be handled by strict=False
+                        pass
+                
+                if skipped_keys:
+                    print(f"  [INFO] Skipped {len(skipped_keys)} parameters due to shape mismatches or uninitialized parameters:")
+                    for skip_info in skipped_keys[:5]:  # Show first 5 mismatches
+                        print(f"    - {skip_info}")
+                    if len(skipped_keys) > 5:
+                        print(f"    ... and {len(skipped_keys) - 5} more")
+                
+                # Load the filtered state dict
+                model_to_load_ctm.load_state_dict(filtered_state_dict, strict=False)
+                print(f"✓ Loaded CTM checkpoint from epoch {latest_epoch} ({len(filtered_state_dict)}/{len(state_dict_ctm)} parameters loaded).")
+            except Exception as load_error:
+                print(f"  > Warning: Error during filtered loading: {load_error}")
+                print("  > Attempting direct load with strict=False...")
+                try:
+                    model_to_load_ctm.load_state_dict(state_dict_ctm, strict=False)
+                    print(f"✓ Loaded CTM checkpoint from epoch {latest_epoch} (direct load).")
+                except Exception as direct_error:
+                    print(f"  > Error: Could not load checkpoint: {direct_error}")
+                    raise direct_error
         else:
             print(f"⚠️ CTM Checkpoint not found at {ctm_checkpoint_path_eval}.")
 
-        # Load ARC Output Head Model
+        # Load ARC Output Head Model - using the same approach as training.py
         if os.path.exists(head_checkpoint_path_eval):
             print(f"  > Loading ARC Output Head checkpoint from {head_checkpoint_path_eval}...")
             state_dict_head = load_file(head_checkpoint_path_eval, device="cpu")
-            arc_output_head.load_state_dict(state_dict_head, strict=False)
-            print(f"✓ Loaded ARC Output Head checkpoint from epoch {latest_epoch}.")
+            
+            # Get the model to load into (unwrap if using accelerator)
+            model_to_load_head = arc_output_head
+            if ACCELERATE_AVAILABLE and 'accelerator_arc' in globals():
+                try:
+                    model_to_load_head = accelerator_arc.unwrap_model(arc_output_head)
+                except:
+                    model_to_load_head = arc_output_head
+            
+            # Filter out parameters with shape mismatches
+            try:
+                head_model_state_dict = model_to_load_head.state_dict()
+                filtered_head_state_dict = {}
+                head_skipped_keys = []
+                
+                for key, param in state_dict_head.items():
+                    if key in head_model_state_dict:
+                        try:
+                            # Safely check if shapes match
+                            head_model_param = head_model_state_dict[key]
+                            if hasattr(head_model_param, 'shape') and param.shape == head_model_param.shape:
+                                filtered_head_state_dict[key] = param
+                            else:
+                                head_model_shape = getattr(head_model_param, 'shape', 'uninitialized')
+                                head_skipped_keys.append(f"{key} (checkpoint: {param.shape}, model: {head_model_shape})")
+                        except RuntimeError as e:
+                            if "uninitialized" in str(e):
+                                # Parameter is uninitialized, skip it
+                                head_skipped_keys.append(f"{key} (checkpoint: {param.shape}, model: uninitialized)")
+                            else:
+                                raise e
+                    else:
+                        # Key not in model, will be handled by strict=False
+                        pass
+                
+                if head_skipped_keys:
+                    print(f"  [INFO] Skipped {len(head_skipped_keys)} head parameters due to shape mismatches or uninitialized parameters:")
+                    for skip_info in head_skipped_keys:
+                        print(f"    - {skip_info}")
+                
+                # Load the filtered state dict
+                model_to_load_head.load_state_dict(filtered_head_state_dict, strict=False)
+                print(f"✓ Loaded ARC Output Head checkpoint from epoch {latest_epoch} ({len(filtered_head_state_dict)}/{len(state_dict_head)} parameters loaded).")
+            except Exception as head_load_error:
+                print(f"  > Warning: Error during filtered head loading: {head_load_error}")
+                print("  > Attempting direct head load with strict=False...")
+                try:
+                    model_to_load_head.load_state_dict(state_dict_head, strict=False)
+                    print(f"✓ Loaded ARC Output Head checkpoint from epoch {latest_epoch} (direct load).")
+                except Exception as head_direct_error:
+                    print(f"  > Error: Could not load head checkpoint: {head_direct_error}")
+                    raise head_direct_error
         else:
             print(f"⚠️ ARC Output Head Checkpoint not found at {head_checkpoint_path_eval}.")
 
@@ -1349,13 +1464,21 @@ else:
                     )
                     
                     preds_grid = np.zeros(MAX_GRID_SIZE, dtype=int)
-                    # Extract features consistent with training loop logic
+                    # Extract features consistent with training loop logic - use predictions first for meta-learning
                     ctm_core_output_data = eval_model_output_dict.get('ctm_core_data')
                     ctm_backbone_output = None
-                    if ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
+                    if eval_model_output_dict and 'predictions' in eval_model_output_dict:
+                        ctm_backbone_output = eval_model_output_dict['predictions'][:, :, -1]
+                        print(f"  [EVAL] Using predictions with shape: {ctm_backbone_output.shape}")
+                    elif eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
+                        ctm_backbone_output = eval_model_output_dict['final_sync_out']
+                        print(f"  [EVAL] Using final_sync_out with shape: {ctm_backbone_output.shape}")
+                    elif ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
                         ctm_backbone_output = ctm_core_output_data['final_sync_out']
+                        print(f"  [EVAL] Using ctm_core_data final_sync_out with shape: {ctm_backbone_output.shape}")
                     elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
                         ctm_backbone_output = ctm_core_output_data['ctm_latent_representation']
+                        print(f"  [EVAL] Using ctm_latent_representation with shape: {ctm_backbone_output.shape}")
                     
                     if ctm_backbone_output is not None:
                         # Process features like in training
@@ -1363,6 +1486,17 @@ else:
                              ctm_features_for_head = ctm_backbone_output.mean(dim=1)
                         else:
                              ctm_features_for_head = ctm_backbone_output
+                        
+                        # Check if features match ARC head expectations, use final_sync_out if needed
+                        if ctm_features_for_head.shape[-1] != arc_output_head.in_features:
+                            print(f"  [EVAL] Feature dimension mismatch for ARC head! Expected {arc_output_head.in_features}, got {ctm_features_for_head.shape[-1]}")
+                            if eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
+                                alt_features = eval_model_output_dict['final_sync_out']
+                                if alt_features.ndim > 2:
+                                    alt_features = alt_features.mean(dim=1)
+                                if alt_features.shape[-1] == arc_output_head.in_features:
+                                    ctm_features_for_head = alt_features
+                                    print(f"  [EVAL] Using final_sync_out for ARC head with shape: {ctm_features_for_head.shape}")
                         
                         logits = arc_output_head(ctm_features_for_head)
                         preds_flat = torch.argmax(logits.view(-1, NUM_ARC_SYMBOLS), dim=-1)
