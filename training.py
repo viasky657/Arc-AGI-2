@@ -231,6 +231,13 @@ else:
                     task_name="ARC_AGI_2",
                     current_epoch=epoch
                 )
+                # Ensure both predictions and final_sync_out are always available at top level
+                if 'ctm_core_data' in model_output_dict:
+                    ctm_core = model_output_dict['ctm_core_data']
+                    if 'predictions' in ctm_core and 'predictions' not in model_output_dict:
+                        model_output_dict['predictions'] = ctm_core['predictions']
+                    if 'final_sync_out' in ctm_core and 'final_sync_out' not in model_output_dict:
+                        model_output_dict['final_sync_out'] = ctm_core['final_sync_out']
 
                 # Retrieve CTM output components including all model-internal losses and signals
                 diffusion_loss = model_output_dict.get('diffusion_loss', torch.tensor(0.0, device=input_bytes.device))
@@ -245,16 +252,15 @@ else:
                 total_loss = model_output_dict.get('total_loss', diffusion_loss)
                 
                 # --- Get CTM core output for auxiliary heads ---
-                # Use predictions first (for meta-learning), but ensure 512-dim features for ARC head
+                # Always use final_sync_out for consistent 512-dim features for ARC head
                 ctm_backbone_output = None
-                if model_output_dict and 'predictions' in model_output_dict:
-                    ctm_backbone_output = model_output_dict['predictions'][:, :, -1]
-                    print(f"  [TRAINING] Using predictions with shape: {ctm_backbone_output.shape}")
-                elif model_output_dict and 'final_sync_out' in model_output_dict:
+                if model_output_dict and 'final_sync_out' in model_output_dict:
                     ctm_backbone_output = model_output_dict['final_sync_out']
+                    if ctm_backbone_output.ndim > 2:
+                        ctm_backbone_output = ctm_backbone_output.mean(dim=1)
                     print(f"  [TRAINING] Using final_sync_out with shape: {ctm_backbone_output.shape}")
                 else:
-                    print("Warning: CTM core output not found. Using zeros for auxiliary head inputs.")
+                    print("Warning: final_sync_out not found in model output. Using zeros for auxiliary head inputs.")
                     ctm_backbone_output = torch.zeros(current_batch_size, config_arc_diffusion.ctm_out_dims, device=input_bytes.device)
                 
                 # --- Calculate and add auxiliary losses to the total_loss for the optimizer ---

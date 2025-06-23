@@ -5395,6 +5395,14 @@ class EnhancedCTMDiffusion(nn.Module):
         # Total loss
         total_loss = diffusion_loss + sum(additional_losses.values())
         
+        # FIX: Ensure CTM data contains final_sync_out for consistent ARC head input
+        if 'final_sync_out' not in ctm_data and 'predictions' in ctm_data:
+            # If final_sync_out is missing but predictions exist, use predictions
+            # but note: predictions may be 64D while ARC head expects 512D
+            # This is a fallback and may cause issues if predictions dimension doesn't match
+            ctm_data['final_sync_out'] = ctm_data['predictions']
+            print ("Predictions dimensions were used instead of final_sync_out: ERROR")
+        
         return total_loss, {
             'diffusion_loss': diffusion_loss,
             'total_loss': total_loss,

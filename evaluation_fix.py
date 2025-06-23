@@ -165,6 +165,14 @@ class CTMSurrogate:
                 task_name="ARC_AGI_2_EVAL_DIFFUSION"
             )
             
+            # Ensure predictions and final_sync_out are available at top level
+            if 'ctm_core_data' in eval_model_output_dict:
+                ctm_core = eval_model_output_dict['ctm_core_data']
+                if 'predictions' in ctm_core and 'predictions' not in eval_model_output_dict:
+                    eval_model_output_dict['predictions'] = ctm_core['predictions']
+                if 'final_sync_out' in ctm_core and 'final_sync_out' not in eval_model_output_dict:
+                    eval_model_output_dict['final_sync_out'] = ctm_core['final_sync_out']
+            
             # 2. Extract features consistent with training loop logic - use predictions first for meta-learning
             ctm_core_output_data = eval_model_output_dict.get('ctm_core_data')
             ctm_backbone_output = None
@@ -291,6 +299,14 @@ class CTMSurrogate:
                 timestep=eval_timestep,
                 task_name="ARC_AGI_2_META_LEARN_FEATURES"
             )
+            # Ensure predictions and final_sync_out are available at top level
+            if 'ctm_core_data' in eval_model_output_dict:
+                ctm_core = eval_model_output_dict['ctm_core_data']
+                if 'predictions' in ctm_core and 'predictions' not in eval_model_output_dict:
+                    eval_model_output_dict['predictions'] = ctm_core['predictions']
+                if 'final_sync_out' in ctm_core and 'final_sync_out' not in eval_model_output_dict:
+                    eval_model_output_dict['final_sync_out'] = ctm_core['final_sync_out']
+            
             ctm_core_output_data = eval_model_output_dict.get('ctm_core_data', {})
             ctm_backbone_output = ctm_core_output_data.get('final_sync_out', ctm_core_output_data.get('ctm_latent_representation'))
 
@@ -302,6 +318,20 @@ class CTMSurrogate:
                 self.ctm_features_for_head = ctm_backbone_output.mean(dim=1).detach()
             else:
                 self.ctm_features_for_head = ctm_backbone_output.detach()
+
+        # Check if features match ARC head expectations, use final_sync_out if needed
+        if self.ctm_features_for_head.shape[-1] != self.arc_output_head.in_features:
+            print(f"  [META-LEARNING] Feature dimension mismatch for ARC head! Expected {self.arc_output_head.in_features}, got {self.ctm_features_for_head.shape[-1]}")
+            # Try to get alternative features from the model output
+            if eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
+                alt_features = eval_model_output_dict['final_sync_out']
+                if alt_features.ndim > 2:
+                    alt_features = alt_features.mean(dim=1)
+                if alt_features.shape[-1] == self.arc_output_head.in_features:
+                    self.ctm_features_for_head = alt_features.detach()
+                    print(f"  [META-LEARNING] Using final_sync_out for ARC head with shape: {self.ctm_features_for_head.shape}")
+            else:
+                print("  [META-LEARNING] WARNING: No alternative features available. Proceeding with current features.")
 
         # --- Quick fine-tuning loop ---
         self.arc_output_head.train()
