@@ -400,7 +400,7 @@ else:
 
         # === SAVE ONLY ON RANK 0 ===
         rank, world_size = get_rank_debug()
-        if rank == 0 and CHECKPOINT_DIR_ARC:
+        if rank == 0 and CHECKPOINT_DIR_ARC and (epoch+1 in [5, 20]):
             model_to_save_ctm = accelerator_arc.unwrap_model(ctm_model_arc) if accelerator_arc else ctm_model_arc
             model_to_save_head = accelerator_arc.unwrap_model(arc_output_head) if accelerator_arc else arc_output_head
 
