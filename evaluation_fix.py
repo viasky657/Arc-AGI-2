@@ -176,10 +176,10 @@ class CTMSurrogate:
             # 2. Extract features consistent with training loop logic - use predictions first for meta-learning
             ctm_core_output_data = eval_model_output_dict.get('ctm_core_data')
             ctm_backbone_output = None
-            if eval_model_output_dict and 'predictions' in eval_model_output_dict:
-                ctm_backbone_output = eval_model_output_dict['predictions'][:, :, -1]
-            elif eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
+            if eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
                 ctm_backbone_output = eval_model_output_dict['final_sync_out']
+            elif eval_model_output_dict and 'predictions' in eval_model_output_dict:
+                ctm_backbone_output = eval_model_output_dict['predictions'][:, :, -1]
             elif ctm_core_output_data and 'final_sync_out' in ctm_core_output_data:
                 ctm_backbone_output = ctm_core_output_data['final_sync_out']
             elif ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
@@ -196,12 +196,19 @@ class CTMSurrogate:
                 if ctm_features_for_head.shape[-1] != self.arc_output_head.in_features:
                     print(f"  [EVAL] Feature dimension mismatch for ARC head! Expected {self.arc_output_head.in_features}, got {ctm_features_for_head.shape[-1]}")
                     if eval_model_output_dict and 'final_sync_out' in eval_model_output_dict:
-                        alt_features = eval_model_output_dict['final_sync_out']
-                        if alt_features.ndim > 2:
-                            alt_features = alt_features.mean(dim=1)
-                        if alt_features.shape[-1] == self.arc_output_head.in_features:
-                            ctm_features_for_head = alt_features
-                            print(f"  [EVAL] Using final_sync_out for ARC head with shape: {ctm_features_for_head.shape}")
+                         alt_features = eval_model_output_dict['final_sync_out']
+                         if alt_features.ndim > 2:
+                              alt_features = alt_features.mean(dim=1)
+                         if alt_features.shape[-1] == self.arc_output_head.in_features:
+                              ctm_features_for_head = alt_features
+                              print(f"  [EVAL] Using final_sync_out for ARC head with shape: {ctm_features_for_head.shape}")
+                    if ctm_features_for_head.shape[-1] != self.arc_output_head.in_features and ctm_core_output_data and 'ctm_latent_representation' in ctm_core_output_data:
+                         alt_features = ctm_core_output_data['ctm_latent_representation']
+                         if alt_features.ndim > 2:
+                              alt_features = alt_features.mean(dim=1)
+                         if alt_features.shape[-1] == self.arc_output_head.in_features:
+                              ctm_features_for_head = alt_features
+                              print(f"  [EVAL] Using ctm_latent_representation for ARC head with shape: {ctm_features_for_head.shape}")
                 
                 # 3. Get logits from the prediction head
                 logits = self.arc_output_head(ctm_features_for_head)
@@ -1493,7 +1500,7 @@ else:
                         task_name="ARC_AGI_2_EVAL_DIFFUSION"
                     )
                     
-                    preds_grid = np.zeros(MAX_GRID_SIZE, dtype=int)
+                    preds_grid = np.zeros(MAX_GRID_SIZE, datype=int)
                     # Extract features consistent with training loop logic - use predictions first for meta-learning
                     ctm_core_output_data = eval_model_output_dict.get('ctm_core_data')
                     ctm_backbone_output = None
