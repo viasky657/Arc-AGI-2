@@ -1,5 +1,10 @@
 import math
 import random
+
+# Plasticity evaluation parameters
+OLD_TASK_MEMORY_SIZE = 20
+MIN_PLASTICITY_REWARD = 0.5
+import random
 import re
 from dataclasses import dataclass
 from typing import List, Callable, Tuple, Optional
@@ -27,8 +32,8 @@ class ModelState:
     """Represents a state of the DGM, essentially its current code."""
     def __init__(self, code_representation, surrogate_func_ref=None):
         self.code = code_representation
-        # The surrogate_func_ref is now implicitly handled by the MCTS loop's surrogate instance
         self.surrogate_func_ref = surrogate_func_ref
+        self.resource_metrics = {'gpu_memory': 0, 'ram_usage': 0}
 
     def apply_mutation(self, mutation_task: str):
         """
@@ -166,9 +171,18 @@ class JudgedNeuralSurrogate(SurrogateValueFunction):
         else:
             return self.internal_surrogate.predict(state)
 
-    def update(self, state: ModelState, true_reward: float):
+    def update(self, state: ModelState, true_reward: float, resource_metrics: dict):
         """Called when MCTS gets a true reward, to further train the surrogate."""
         self._update_judge_probability(state, true_reward)
+        state.resource_metrics = resource_metrics
+        
+        # Update plasticity tracking
+        state.generations_since_retraining += 1
+        if state.generations_since_retraining > 5:
+            # Schedule retraining on old tasks
+            state.old_task_performance = self.evaluate_on_old_tasks(state)
+            state.generations_since_retraining = 0
+        
         self.internal_surrogate.update(state, true_reward)
 
     def _update_judge_probability(self, state: ModelState, true_reward: float):
@@ -400,9 +414,18 @@ def MCTS_AlphaZero_Style(root_state: ModelState, surrogate_value_function: Judge
         # Update the surrogate with this new, high-quality data point
         surrogate_value_function.update(best_child_node.state, true_reward)
         
-        # Final check: only accept if the true reward is high enough
-        if true_reward > 0.7: # Example final acceptance threshold
-            return best_child_node.state, true_reward
+        # Calculate resource efficiency boost (1.0 = 100% efficient)
+        resource_efficiency_boost = max(0, 1.0 - (model_state.resource_metrics.get('gpu_memory', 0) / 10.0) - (model_state.resource_metrics.get('ram_usage', 0) / 20.0))
+        
+        # Calculate plasticity reward (performance on old tasks)
+        plasticity_reward = min(1.0, max(0.5, 1.0 - (0.1 * model_state.generations_since_retraining)))
+        
+        # Combine rewards
+        combined_reward = true_reward * (1.0 + resource_efficiency_boost) * plasticity_reward
+        
+        # Final check: only accept if the combined reward is high enough
+        if combined_reward > 0.7: # Example final acceptance threshold
+            return best_child_node.state, combined_reward
         else:
             return root_state, None # Failed final evaluation
     else:

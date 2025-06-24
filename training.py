@@ -190,6 +190,11 @@ else:
     # Record original global plasticity weight for scheduling
     orig_global_plasticity_loss_weight = ctm_model_arc.global_plasticity_loss_weight
     orig_local_selector_loss_weight = ctm_model_arc.local_neuron_selector_loss_weight
+    # Initialize surrogate model
+    from dgm.alpha_mcmc_evolution import GodelMachineJudge, JudgedNeuralSurrogate
+    judge = GodelMachineJudge()
+    surrogate_func_instance = JudgedNeuralSurrogate(judge)
+
     for epoch in range(NUM_EPOCHS_ARC):
 
         if epoch < 10: # Linear ramp-up of global plasticity weight over first 10 epochs
@@ -394,9 +399,23 @@ else:
 
             if (batch_idx + 1) % 50 == 0:
                 print(f"  Epoch [{epoch+1}/{NUM_EPOCHS_ARC}], Batch [{batch_idx+1}/{len(arc_train_loader)}], Loss: {total_loss.item():.4f}")
+                
+                # Periodic self-modification
+                if epoch > 10:  # After initial training
+                    self_modify(ctm_model_arc, surrogate_func_instance)
         
         avg_epoch_loss = total_arc_loss / processed_batches if processed_batches > 0 else 0
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS_ARC}] completed. Average Loss: {avg_epoch_loss:.4f}")
+        print(f"  GPU Memory: {metadata.get('gpu_memory', 0):.2f} GB, RAM: {metadata.get('ram_usage', 0):.2f} GB")
+        
+        # MCMC evaluation at epoch end
+        model_state = ModelState(ctm_model_arc.get_code_representation())
+        candidate_score = surrogate_func_instance.predict(model_state)
+        if candidate_score > VALUE_THRESHOLD:
+            print(f"High-scoring model candidate ({candidate_score:.3f}), running full evaluation")
+            true_score = model_state.evaluate_true_performance()
+            surrogate_func_instance.update(model_state, true_score)
+            print(f"True evaluation score: {true_score:.3f}")
 
         # === SAVE ONLY ON RANK 0 ===
         rank, world_size = get_rank_debug()
