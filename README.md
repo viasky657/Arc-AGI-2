@@ -276,3 +276,11 @@ Meta-learning adaptation
 Edit simulation and selection
 Online model updates
 The system replaces SEAL's natural language instructions with direct MCMC exploration but achieves similar self-editing functionality through weight updates. The RL-based approach with neural plasticity metrics provides a biologically-inspired alternative to LoRA.
+
+# The Godel Evolution (WIP)
+
+The system allows the model to edit its own code in a secure isolated container inside of a Docker container and create a new trained model from running that new code if the edit it suggests reaches a certain quality threshold (0.8 in this case). 
+It differs from the original implementation by encouraging the model to use MCMC to have a better search method to start searching closer to the "best" answer or model eduts for a reasoning chain to simulate different edits and propose them to the surrogate judge 
+who will learn from the Gemini 2.5 Pro judge (or whatever the newest model is). 
+The surogate judge model will learn to judge eventually on its own so the system will not require an api call to an external judge. This will allow the model to grow to become more accurate at tasks, become better at maintaining prior knowledge (plasticity), and decrease energy requirements to run it without losing accuracy. 
+There may be some room to improve this by encoouraging the model to reduce weights (parameters) to the bare mimumim needed for tasks to reduce hardware space requirements but this will require far more care to not negatively affect preformance.
