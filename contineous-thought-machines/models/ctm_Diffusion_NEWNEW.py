@@ -2021,8 +2021,6 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     jepa_loss_weight: float = 0.1 # Weight for the JEPA loss component
     jepa_num_target_blocks: int = 1 # Number of target blocks to predict
 
-    # --- Knowledge Store Parameters ---
-
     # --- Global Plasticity Loss Parameters ---
     use_global_plasticity_loss: bool = True
     global_plasticity_loss_weight: float = 0.05
@@ -2201,7 +2199,6 @@ class OriginalCTMCore(nn.Module):
     def __init__(self, config: EnhancedCTMConfig):
         super(OriginalCTMCore, self).__init__()
         self.config = config
-        self.knowledge_store = None
 
         # --- Core Parameters from Config ---
         self.iterations = config.ctm_iterations
@@ -3881,8 +3878,6 @@ class EnhancedCTMDiffusion(nn.Module):
         self.config = config
         self.device_container = nn.Parameter(torch.empty(0)) # Helper to get device
 
-        self.knowledge_store = None
-
         # --- Global Plasticity Loss Parameters ---
         self.use_global_plasticity_loss = getattr(config, 'use_global_plasticity_loss', True)
         self.global_plasticity_loss_weight = getattr(config, 'global_plasticity_loss_weight', 0.05)
@@ -4460,7 +4455,7 @@ class EnhancedCTMDiffusion(nn.Module):
         if self.config.mcmc_output_space_type == 'binary_hypercube':
             self.mcmc_output_space = BinaryHypercube(dimension=mcmc_dim)
         elif self.config.mcmc_output_space_type == 'top_k_polytope':
-            k_val = min(mcmc_dim // 2, 5) 
+            k_val = min(mcmc_dim // 2, 5)
             if k_val == 0 and mcmc_dim > 0: k_val = 1
             if k_val == 0 and mcmc_dim == 0: # Should be caught by TopKPolytope's __init__ too
                  raise ValueError("Dimension for TopKPolytope must be greater than 0 to set k.")
@@ -4482,7 +4477,7 @@ class EnhancedCTMDiffusion(nn.Module):
         if self.config.enable_blackbox_solver:
             self.blackbox_solver_instance = BlackBoxSolver( # Renamed to avoid conflict
                 self.mcmc_phi_network,
-                input_example=torch.randn(1, mcmc_dim) 
+                input_example=torch.randn(1, mcmc_dim)
             )
             phi_for_mcmc_samplers = self.blackbox_solver_instance
         else:
@@ -4493,7 +4488,7 @@ class EnhancedCTMDiffusion(nn.Module):
         current_mcmc_config_params = self.config.mcmc_config # Use self.config
         if current_mcmc_config_params is None:
             print("Warning: MCMCConfig not provided to EnhancedCTMDiffusion. Using default MCMCConfig.")
-            current_mcmc_config_params = MCMCConfig() 
+            current_mcmc_config_params = MCMCConfig()
 
         if self.config.use_large_neighborhood_search:
             # The ExactOptimizationOracle for LNS will use the potentially blackboxed phi.
@@ -4504,9 +4499,9 @@ class EnhancedCTMDiffusion(nn.Module):
             self.enhanced_mcmc_sampler = LargeNeighborhoodSearchMCMC(
                 output_space=self.mcmc_output_space,
                 config=current_mcmc_config_params,
-                phi_network=phi_for_mcmc_samplers, 
+                phi_network=phi_for_mcmc_samplers,
                 exact_oracle=exact_oracle_for_lns,
-                lns_frequency=self.config.lns_frequency, 
+                lns_frequency=self.config.lns_frequency,
                 lns_neighborhood_size=self.config.lns_neighborhood_size
             )
         else:
@@ -4526,6 +4521,13 @@ class EnhancedCTMDiffusion(nn.Module):
         # if next(self.parameters()).is_cuda:
         #     self.mcmc_phi_network.cuda()
         #     self.enhanced_mcmc_sampler.cuda() # Sampler might need its own .to(device)
+        
+        # Initialize mirror neuron layer if enabled
+        if getattr(self.config, 'enable_mirror_neurons', False):
+            self.mirror_layer = MirrorNeuronLayer(
+                d_model=self.config.d_model,
+                num_heads=self.config.n_heads if hasattr(self.config, 'n_heads') else 8
+            )
 
     def _apply_enhanced_mcmc(self, theta: torch.Tensor, target_y: torch.Tensor,
                                current_epoch: Optional[int] = None, current_batch: Optional[int] = None) -> Dict[str, Any]:
@@ -4630,7 +4632,8 @@ class EnhancedCTMDiffusion(nn.Module):
     def forward(self, byte_sequence: torch.Tensor, target_diffusion_output: Optional[torch.Tensor] = None,
                 mode: str = 'ctm_controlled_diffusion', timestep: Optional[torch.Tensor] = None,
                 target_mcmc_output: Optional[torch.Tensor] = None, current_epoch: int = 0,
-                current_batch: int = 0, task_name: Optional[str] = None) -> Dict[str, torch.Tensor]: # Re-added task_name
+                current_batch: int = 0, task_name: Optional[str] = None,
+                observed_byte_sequence: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         Forward pass of the CTMDiffusionModel using byte sequences.
 
@@ -4650,6 +4653,8 @@ class EnhancedCTMDiffusion(nn.Module):
                                                         Shape: (batch_size, mcmc_output_space_dim)
             current_epoch (int): Current training epoch.
             current_batch (int): Current training batch in the epoch.
+            observed_byte_sequence (Optional[torch.Tensor]): Observed agent's byte sequence for mirror neuron processing.
+                                                             Shape: (batch_size, sequence_length)
 
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing various outputs. Key fields include:
@@ -4720,6 +4725,63 @@ class EnhancedCTMDiffusion(nn.Module):
                 import traceback
                 traceback.print_exc()
                 losses['jepa_loss'] = torch.tensor(0.0, device=device)
+        
+        # Initialize states
+        batch_size, seq_len, _ = kv_features_for_ctm.shape
+        device = kv_features_for_ctm.device
+        if not hasattr(self, 'self_emotion_state'):
+            self.self_emotion_state = torch.zeros(batch_size, seq_len, self.config.num_emotion_dim, device=device)
+        if not hasattr(self, 'observed_emotion_state'):
+            self.observed_emotion_state = torch.zeros(batch_size, seq_len, self.config.num_emotion_dim, device=device)
+        if not hasattr(self, 'observed_goal_state'):
+            self.observed_goal_state = torch.zeros(batch_size, seq_len, self.config.goal_dim, device=device)
+        
+        # --- Mirror Neuron Processing ---
+        if observed_byte_sequence is not None and hasattr(self, 'mirror_layer'):
+            # Process observed agent's state
+            observed_kv_features, _, _, _ = self._prepare_input_features(observed_byte_sequence)
+            observed_ctm_data = self.ctm_core.forward_with_full_tracking(observed_kv_features)
+            observed_thought = observed_ctm_data['final_sync_out']
+            
+            # Process self state
+            self_ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
+            self_thought = self_ctm_data['final_sync_out']
+            
+            # Apply mirror neuron layer with goal inference
+            mirrored_thought, new_self_emotion, new_observed_goal, reward = self.mirror_layer(
+                self_thought,
+                observed_thought,
+                self.self_emotion_state,
+                self.observed_emotion_state,
+                self.observed_goal_state
+            )
+            
+            # Update states
+            self.self_emotion_state = new_self_emotion
+            self.observed_emotion_state = self.mirror_layer.observed_emotion_tracker(
+                observed_thought,
+                self.observed_emotion_state
+            )
+            self.observed_goal_state = new_observed_goal
+            
+            # Add reward to losses for reinforcement
+            losses['mirror_reward'] = reward.mean() * self.config.mirror_reward_weight
+            
+            # Update CTM data with mirrored thought
+            self_ctm_data['final_sync_out'] = mirrored_thought
+            ctm_data = self_ctm_data
+            
+            # Store predicted goal for assistance decision
+            self.predicted_goal = new_observed_goal.mean(dim=1)
+        else:
+            # Standard processing without mirror neurons
+            ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
+            # Update self emotion state only
+            if hasattr(self, 'mirror_layer'):
+                self.self_emotion_state = self.mirror_layer.self_emotion_tracker(
+                    ctm_data['final_sync_out'],
+                    self.self_emotion_state
+                )
         
         # --- CTM Core Logic ---
         # CTM core processes the features derived from the input byte_sequence.
@@ -5641,12 +5703,6 @@ class EnhancedCTMDiffusion(nn.Module):
             
         return output
 
-    def close(self):
-        """Safely close connections, including the knowledge store."""
-        if self.knowledge_store:
-            self.knowledge_store.close()
-            print("Neo4j knowledge store connection closed.")
-
 def create_enhanced_config_for_text_generation(vocab_size: int) -> EnhancedCTMConfig:
     """Create enhanced configuration for text generation with strong CTM control"""
     config = EnhancedCTMConfig()
@@ -5672,6 +5728,7 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
     config.adaptive_scheduling = True
     config.iterative_refinement = True
     return config
+
 
     def _jepa_create_masked_patch_views(self,
                                       online_patch_embeddings: torch.Tensor,
@@ -5751,6 +5808,175 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
             return None, None
 
         return torch.stack(batch_context_reps), torch.stack(batch_target_reps)
+
+class GoalPredictor(nn.Module):
+    """Predicts likely internal goals of observed agents"""
+    def __init__(self, d_model: int, goal_dim: int = 8):
+        super().__init__()
+        self.d_model = d_model
+        self.goal_dim = goal_dim
+        self.goal_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 4),
+            nn.ReLU(),
+            nn.Linear(d_model * 4, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, goal_dim)
+        )
+        self.goal_update = nn.GRU(d_model, goal_dim, batch_first=True)
+        
+    def forward(self, current_state: torch.Tensor, prev_goal: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            current_state: Current neural state [batch, seq_len, d_model]
+            prev_goal: Previous goal state [batch, seq_len, goal_dim]
+            
+        Returns:
+            Predicted goal state [batch, seq_len, goal_dim]
+        """
+        # Predict goal from current state and context
+        context = current_state.mean(dim=1, keepdim=True).expand(-1, current_state.size(1), -1)
+        goal_input = torch.cat([current_state, context], dim=-1)
+        goal_pred = self.goal_net(goal_input)
+        
+        # Update goal state using GRU
+        updated_goal, _ = self.goal_update(goal_pred, prev_goal.unsqueeze(0))
+        return updated_goal.squeeze(0)
+
+class EmotionStateTracker(nn.Module):
+    """Tracks and updates emotion states based on neural activity"""
+    def __init__(self, d_model: int, num_emotion_dim: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.num_emotion_dim = num_emotion_dim
+        self.emotion_proj = nn.Linear(d_model, num_emotion_dim)
+        self.emotion_update = nn.GRU(num_emotion_dim, num_emotion_dim, batch_first=True)
+        
+    def forward(self, neural_state: torch.Tensor, prev_emotion: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            neural_state: Current neural state [batch, seq_len, d_model]
+            prev_emotion: Previous emotion state [batch, seq_len, num_emotion_dim]
+            
+        Returns:
+            Updated emotion state [batch, seq_len, num_emotion_dim]
+        """
+        # Project neural state to emotion space
+        current_emotion = self.emotion_proj(neural_state)
+        
+        # Update emotion state using GRU
+        updated_emotion, _ = self.emotion_update(current_emotion, prev_emotion.unsqueeze(0))
+        return updated_emotion.squeeze(0)
+
+class MirrorNeuronLayer(nn.Module):
+    """
+    Enhanced mirror neuron mechanism that:
+    1. Tracks emotion states of self and observed agents
+    2. Predicts internal goals of observed agents
+    3. Computes empathy based on emotion similarity
+    4. Generates reward signals for assisting with goals
+    5. Associates actions with positive outcomes
+    
+    This encourages selfless behavior by rewarding actions that
+    help observed agents achieve their predicted goals.
+    """
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1,
+                 num_emotion_dim: int = 4, goal_dim: int = 8):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.num_emotion_dim = num_emotion_dim
+        self.goal_dim = goal_dim
+        
+        # Emotion state trackers
+        self.self_emotion_tracker = EmotionStateTracker(d_model, num_emotion_dim)
+        self.observed_emotion_tracker = EmotionStateTracker(d_model, num_emotion_dim)
+        
+        # Goal predictor
+        self.goal_predictor = GoalPredictor(d_model, goal_dim)
+        
+        # Empathy computation
+        self.empathy_attention = nn.MultiheadAttention(num_emotion_dim, num_heads, dropout=dropout, batch_first=True)
+        
+        # Assistance generator
+        self.assistance_net = nn.Sequential(
+            nn.Linear(goal_dim + num_emotion_dim, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()  # Assistance probability
+        )
+        
+        # Reward generator
+        self.reward_net = nn.Sequential(
+            nn.Linear(goal_dim + num_emotion_dim, num_emotion_dim),
+            nn.ReLU(),
+            nn.Linear(num_emotion_dim, 1),
+            nn.Tanh()
+        )
+        
+        # Action-outcome association
+        self.action_association = nn.GRU(d_model, d_model, batch_first=True)
+        
+        # Modulation and normalization
+        self.modulation_net = nn.Sequential(
+            nn.Linear(d_model + goal_dim, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.Tanh()
+        )
+        self.layer_norm = nn.LayerNorm(d_model)
+
+    def forward(self, self_state: torch.Tensor, observed_state: torch.Tensor,
+               prev_self_emotion: torch.Tensor, prev_observed_emotion: torch.Tensor,
+               prev_observed_goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            self_state: Current agent's neural state [batch, seq_len, d_model]
+            observed_state: Observed agent's neural state [batch, seq_len, d_model]
+            prev_self_emotion: Previous self emotion state [batch, seq_len, num_emotion_dim]
+            prev_observed_emotion: Previous observed emotion [batch, seq_len, num_emotion_dim]
+            prev_observed_goal: Previous observed goal [batch, seq_len, goal_dim]
+            
+        Returns:
+            modulated_state: Modulated neural state [batch, seq_len, d_model]
+            current_self_emotion: Updated self emotion state [batch, seq_len, num_emotion_dim]
+            current_observed_goal: Updated observed goal [batch, seq_len, goal_dim]
+            reward: Computed reward signal [batch, seq_len, 1]
+        """
+        # Track emotion states
+        current_self_emotion = self.self_emotion_tracker(self_state, prev_self_emotion)
+        current_observed_emotion = self.observed_emotion_tracker(observed_state, prev_observed_emotion)
+        
+        # Predict internal goal of observed agent
+        current_observed_goal = self.goal_predictor(observed_state, prev_observed_goal)
+        
+        # Compute empathy based on emotion similarity
+        empathy, _ = self.empathy_attention(
+            query=current_self_emotion,
+            key=current_observed_emotion,
+            value=current_observed_emotion
+        )
+        
+        # Generate assistance signal based on predicted goal and emotion
+        goal_emotion = torch.cat([current_observed_goal, current_observed_emotion], dim=-1)
+        assistance = self.assistance_net(goal_emotion)
+        
+        # Generate reward signal based on goal progress
+        goal_progress = torch.norm(current_observed_goal - prev_observed_goal, dim=-1, keepdim=True)
+        reward = self.reward_net(goal_emotion) * goal_progress
+        
+        # Associate actions with positive outcomes
+        reward_assisted = reward * assistance
+        reward_expanded = reward_assisted.expand(-1, -1, self.d_model)
+        associated_state, _ = self.action_association(self_state, reward_expanded.permute(1,0,2))
+        
+        # Generate modulation signal using goal context
+        modulated = self.modulation_net(torch.cat([associated_state, current_observed_goal], dim=-1))
+        
+        # Apply modulation with residual connection
+        output_state = self.layer_norm(self_state + modulated)
+        
+        return output_state, current_self_emotion, current_observed_goal, reward
 
     @torch.no_grad()
     def _update_jepa_target_encoder(self):
