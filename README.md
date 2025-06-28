@@ -284,3 +284,61 @@ It differs from the original implementation by encouraging the model to use MCMC
 who will learn from the Gemini 2.5 Pro judge (or whatever the newest model is). 
 The surogate judge model will learn to judge eventually on its own so the system will not require an api call to an external judge. This will allow the model to grow to become more accurate at tasks, become better at maintaining prior knowledge (plasticity), and decrease energy requirements to run it without losing accuracy. 
 There may be some room to improve this by encoouraging the model to reduce weights (parameters) to the bare mimumim needed for tasks to reduce hardware space requirements but this will require far more care to not negatively affect preformance.
+
+# FeedBack and FeedForward Network Incorporation to Allow the CTM_Core and OG CTM Class to be able to dynamically adjust the thought vector generation at any point including during the Diffusion final processing output. (WIP)
+
+Excellent, the changes have been applied successfully.
+
+I have now implemented the internal feedback mechanism within the OriginalCTMCore itself. This enhancement allows the CTM to modulate its own thought process dynamically, iteration by iteration.
+
+Here's a summary of the final changes in contineous-thought-machines/models/ctm_Diffusion_NEWNEW.py:
+
+Configuration Flag: A new boolean flag, ctm_use_internal_feedback, has been added to the EnhancedCTMConfig class. You can use this to easily enable or disable the new functionality. It is enabled by default.
+Internal Feedback Module: The OriginalCTMCore now contains its own instance of the CTMFeedbackModule, which is used for self-modulation.
+Recursive Feedback Loop: Within the core recurrent loop of the OriginalCTMCore, the activated_state is now fed back into itself at each "thought" step, allowing the CTM to refine its internal state and final output continuously.
+This completes the implementation of a fully dynamic, dual-feedback system where the CTM can modulate both the higher-level diffusion process and its own internal thought-generation process.
+
+
+Task Completed
+I have successfully implemented the internal, self-modulating feedback loop within the OriginalCTMCore in contineous-thought-machines/models/ctm_Diffusion_NEWNEW.py. The CTM can now dynamically adjust its own thought process, in addition to guiding the main diffusion process. A new configuration flag, ctm_use_internal_feedback, has been added to control this feature.
+
+Let's break down how the FeedbackModule and the CTMControlledDiffusionProcessor are designed to interact, based on the code you've provided.
+
+Conceptual Role of FeedbackModule
+The FeedbackModule class is a component designed to facilitate communication from higher processing layers to lower ones. Here’s a summary of its internal mechanics:
+
+Inputs: It takes two arguments:
+
+higher_level_output_pooled: A summarized representation (e.g., an average or pooled tensor) of the output from a higher, more abstract layer in a neural network.
+lower_level_state_seq: The detailed, sequential state of a lower processing layer.
+Gating Mechanism: The module first calculates a gate_value. This gate acts like a filter, determining how much of the feedback signal from the higher layer should be allowed to pass through. It makes this decision by looking at both the higher-level and lower-level states, allowing the feedback to be context-sensitive.
+
+Transformation: The feedback from the higher layer is processed through its own small neural network (feedback_transform), allowing the model to learn the most effective way to shape the feedback signal.
+
+Combination: The gated and transformed feedback is then combined with the original lower-level state. A residual connection is used (lower_level_state_seq + modulated_state_update), which is a standard practice to ensure stable training and prevent the original signal from being lost.
+
+In the CTMControlledDiffusionProcessor, instances of this FeedbackModule are created during initialization for each adjacent pair of layers. The intention is to create a hierarchical processing system where higher layers can refine the computations of the layers below them.
+
+Actual Interaction in the CTMControlledDiffusionProcessor
+While the CTMControlledDiffusionProcessor initializes the feedback_modules, a careful look at its forward method shows that they are not used. Instead, a different, more specialized feedback component is used: the CTMFeedbackModule.
+
+This CTMFeedbackModule implements a more direct and potent form of feedback. Here's how it works in practice within the forward method's refinement loop:
+
+Initialization: At the end of the CTMControlledDiffusionProcessor's __init__ method, a single ctm_feedback_module is created if the CTM produces a synchronization output.
+
+Usage: Inside the multi-stage refinement loop of the forward method, this module is called in every iteration:
+
+feedback_signal = self.ctm_feedback_module(current_noise_for_feedback, ctm_data['final_sync_out'])
+current_noise = current_noise + feedback_signal.squeeze(1)
+
+Mechanism: The CTMFeedbackModule operates differently from the general FeedbackModule:
+
+It takes the entire CTM's final "thought vector" (ctm_data['final_sync_out']) as its primary guidance signal.
+It uses a cross-attention mechanism to compare this CTM thought vector against the current state of the diffusion noise (current_noise).
+This allows the module to generate a highly context-aware feedback_signal that modulates the noise refinement process based on the CTM's overall understanding.
+
+Summary of the Relationship
+
+Intended Design: The architecture includes FeedbackModule instances to create a granular, layer-by-layer feedback system, allowing for a hierarchical flow of information.
+Actual Implementation: The primary forward logic opts for a more powerful, holistic feedback approach. It uses the specialized CTMFeedbackModule to inject the final, synthesized output of the entire CTM directly into the diffusion noise refinement process. This acts as a strong, top-down guidance signal from the "conscious" part of the model (the CTM) to the generative part (the diffusion processor).
+In essence, while the design allows for local feedback between layers, the implemented version prioritizes a global feedback loop from the CTM's final conclusion back into the generative process to ensure the output aligns with the CTM's "thought".

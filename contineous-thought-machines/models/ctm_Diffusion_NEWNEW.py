@@ -32,7 +32,7 @@ import random
 import copy # For JEPA target encoder deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import queue
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler #Need to install with pip
 import numpy as np
 
 
@@ -89,11 +89,8 @@ def batched_numeric_tensor_to_bytes(numeric_batch_tensor: torch.Tensor, source_d
     return stacked_bytes
 
 
-class MetaWINASparsifier(WINASparsifier):
+class WINASparsifier:
     """
-    Extends WINA sparsifier with meta-learning control that dynamically adjusts sparsity
-    based on an auxiliary objective (e.g., prediction error or consistency).
-
     WINA (Weight Informed Neuron Activation) sparse activation framework.
     
     This implements the training-free sparse activation method that jointly considers
@@ -105,33 +102,7 @@ class MetaWINASparsifier(WINASparsifier):
     - Provides theoretical guarantees for tighter approximation error bounds
     - Training-free and plug-and-play design
     - Supports heterogeneous sparsity across layers
-
     """
-    def __init__(self, sparsity_ratio: float = 0.5, use_layer_specific: bool = True, control_dim: int = 64):
-        super().__init__(sparsity_ratio, use_layer_specific)
-        self.control_net = nn.Sequential(
-            nn.Linear(control_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
-        self.control_dim = control_dim
-        
-    def apply_wina_gating(self, hidden_states, weight_matrix, layer_name="default", cache_key=None, control_input=None):
-        # First compute base WINA gating
-        base_gated = super().apply_wina_gating(hidden_states, weight_matrix, layer_name, cache_key)
-        
-        # If control input provided, use it to adjust sparsity
-        if control_input is not None:
-            control_signal = self.control_net(control_input)  # (batch_size, 1)
-            # Reshape control_signal to match hidden_states dimensions
-            control_signal = control_signal.view(-1, *([1]*(hidden_states.dim()-1)))
-            # Interpolate between original and gated based on control signal
-            output = control_signal * base_gated + (1 - control_signal) * hidden_states
-        else:
-            output = base_gated
-            
-        return output
     
     def __init__(self, sparsity_ratio: float = 0.5, use_layer_specific: bool = True):
         """
@@ -279,6 +250,37 @@ class MetaWINASparsifier(WINASparsifier):
         self._cache_hits = 0
         self._cache_misses = 0
 
+class MetaWINASparsifier(WINASparsifier):
+    """
+    Extends WINA sparsifier with meta-learning control that dynamically adjusts sparsity
+    based on an auxiliary objective (e.g., prediction error or consistency).
+    """
+    def __init__(self, sparsity_ratio: float = 0.5, use_layer_specific: bool = True, control_dim: int = 64):
+        super().__init__(sparsity_ratio, use_layer_specific)
+        self.control_net = nn.Sequential(
+            nn.Linear(control_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+        self.control_dim = control_dim
+        
+    def apply_wina_gating(self, hidden_states, weight_matrix, layer_name="default", cache_key=None, control_input=None):
+        # First compute base WINA gating
+        base_gated = super().apply_wina_gating(hidden_states, weight_matrix, layer_name, cache_key)
+        
+        # If control input provided, use it to adjust sparsity
+        if control_input is not None:
+            control_signal = self.control_net(control_input)  # (batch_size, 1)
+            # Reshape control_signal to match hidden_states dimensions
+            control_signal = control_signal.view(-1, *([1]*(hidden_states.dim()-1)))
+            # Interpolate between original and gated based on control signal
+            output = control_signal * base_gated + (1 - control_signal) * hidden_states
+        else:
+            output = base_gated
+            
+        return output
+
 
 class TopDownAttention(nn.Module):
     """
@@ -324,6 +326,21 @@ class TopDownAttention(nn.Module):
         attn_output = self.out_proj(attn_output)
         
         return attn_output
+    
+
+
+class WINAAttention(nn.Module):
+    """
+    Multi-head attention with WINA sparse activation.
+    
+    This attention mechanism applies WINA sparsification at multiple stages:
+    1. Input projections (Q, K, V)
+    2. Attention weights
+    3. Output projection
+    
+    This provides significant computational savings while maintaining
+    better approximation quality than magnitude-only sparse methods.
+    """
     
     def __init__(self,
                  d_model: int,
@@ -492,6 +509,7 @@ class WINAEnhancedMLP(nn.Module):
         
         return output
 
+    
 class SubquadraticAttention(nn.Module):
     def __init__(self, embed_dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
                  epsilon=1e-6, poly_degree=5, scale=None): # Changed dim to embed_dim
@@ -691,7 +709,7 @@ class ConsciousnessController(nn.Module):
             with torch.no_grad():
                 self.attention_level.fill_(target_attention) # Updated for PyTorch best practice
 
-            if target_attention >= 0.99: # The HTML entity > was the problem here.
+            if target_attention >= 0.99:
                 self.consciousness_state = 'awake'
                 print(f"  🌅 Model fully awakened (attention: {target_attention:.3f})")
             else:
@@ -2001,6 +2019,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     sparse_attention: bool = True  # Now implemented with BinarySparseAttention
     adaptive_depth: bool = False   # Defaulting to False, can be enabled if implemented
     use_activity_plasticity: bool = True # To enable/disable plasticity updates; Needs to be set to TRUE
+    ctm_use_internal_feedback: bool = True # Enable self-modulating feedback within the CTM core
     
     # Sparse Attention Parameters
     sparse_attention_ratio: float = 0.1  # Keep only 10% of attention connections
@@ -2383,6 +2402,17 @@ class OriginalCTMCore(nn.Module):
         # --- Output Procesing (projects from CTM's synchronisation to ctm_out_dims) ---
         self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
 
+        # --- Internal Feedback Module (Self-Modulation) ---
+        self.use_internal_feedback = getattr(config, 'ctm_use_internal_feedback', True)
+        if self.use_internal_feedback:
+            self.internal_feedback_module = CTMFeedbackModule(
+                ctm_sync_dim=self.d_model,
+                diffusion_model_dim=self.d_model,
+                n_heads=config.ctm_heads
+            )
+        else:
+            self.internal_feedback_module = None
+
 
     # --- Core CTM Methods ---
 
@@ -2714,6 +2744,16 @@ class OriginalCTMCore(nn.Module):
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace) # (B, d_model)
 
+            # --- Apply Internal CTM Feedback (Self-Modulation) ---
+            if self.use_internal_feedback and self.internal_feedback_module is not None:
+                # The current state provides the query (thought) and key/value (context)
+                feedback_signal = self.internal_feedback_module(
+                    diffusion_state=activated_state.unsqueeze(1), # (B, 1, D)
+                    ctm_thought_vector=activated_state # (B, D)
+                )
+                # Add the feedback to the current state
+                activated_state = activated_state + feedback_signal.squeeze(1)
+
             # --- Calculate Synchronisation for Output Predictions ---
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
 
@@ -3017,6 +3057,15 @@ class OriginalCTMCore(nn.Module):
             
             # Apply neuron-level models
             activated_state = self.trace_processor(state_trace)
+
+            # --- Apply Internal CTM Feedback (Self-Modulation) ---
+            if self.use_internal_feedback and self.internal_feedback_module is not None:
+                feedback_signal = self.internal_feedback_module(
+                    diffusion_state=activated_state.unsqueeze(1),
+                    ctm_thought_vector=activated_state
+                )
+                activated_state = activated_state + feedback_signal.squeeze(1)
+
             tracking_data['activated_states'].append(activated_state.clone())
 
             # --- Predictive Coding Loss ---
@@ -3053,6 +3102,66 @@ class OriginalCTMCore(nn.Module):
             'local_neuron_selector_loss': local_neuron_selector_loss, # Pass loss to main model
             **tracking_data
         }
+
+class FeedbackModule(nn.Module):
+    """
+    A biologically-inspired feedback module for meta-learning.
+    It uses cross-attention to allow a lower layer to dynamically query
+    a higher layer for relevant information, which is then gated and used
+    to modulate the lower layer's state.
+    """
+    def __init__(self, d_model: int, n_heads: int):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
+        
+        self.feedback_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            batch_first=True
+        )
+        
+        self.final_norm = nn.LayerNorm(d_model)
+
+    def forward(self, higher_level_output_pooled: torch.Tensor, lower_level_state_seq: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            higher_level_output_pooled: Output from a higher layer, pooled. (B, D)
+            lower_level_state_seq: State of the lower layer. (B, S, D)
+            
+        Returns:
+            The modulated lower-level state sequence. (B, S, D)
+        """
+        seq_len = lower_level_state_seq.size(1)
+        
+        higher_level_expanded = higher_level_output_pooled.unsqueeze(1)
+
+        # The lower layer queries the higher layer for relevant information
+        # Query: lower_level_state_seq
+        # Key/Value: higher_level_expanded
+        attn_output, _ = self.feedback_attention(
+            query=lower_level_state_seq,
+            key=higher_level_expanded,
+            value=higher_level_expanded
+        )
+        
+        # Calculate a gate value based on the higher-level input and the lower-level state
+        gate_input = torch.cat([
+            higher_level_expanded.expand(-1, seq_len, -1),
+            lower_level_state_seq
+        ], dim=-1)
+        gate_value = self.gate(gate_input)
+        
+        # Apply the gate to the attention output
+        feedback_modulation = attn_output * gate_value
+        
+        # Directly modulate the lower level state and normalize
+        return self.final_norm(lower_level_state_seq + feedback_modulation)
 
 class CTMControlledDiffusionProcessor(nn.Module):
     """
@@ -3091,7 +3200,10 @@ class CTMControlledDiffusionProcessor(nn.Module):
         # Add feedback modules
         self.feedback_modules = nn.ModuleDict()
         for layer in range(config.num_layers - 1):
-            self.feedback_modules[f"layer_{layer}"] = FeedbackModule(config.d_model)
+            self.feedback_modules[f"layer_{layer}"] = FeedbackModule(
+                d_model=config.d_model,
+                n_heads=config.n_heads
+            )
             
         # Add predictive coding modules
         self.predictive_coders = nn.ModuleDict()
@@ -3305,6 +3417,16 @@ class CTMControlledDiffusionProcessor(nn.Module):
             nn.Linear(64, 1),
             nn.Sigmoid()
         )
+
+        # CTM Feedback Module
+        if config.ctm_n_synch_out > 0:
+            self.ctm_feedback_module = CTMFeedbackModule(
+                ctm_sync_dim=config.ctm_n_synch_out,
+                diffusion_model_dim=self.target_noise_dim,
+                n_heads=config.n_heads
+            )
+        else:
+            self.ctm_feedback_module = None
     
     def forward(self, noisy_input: torch.Tensor, timestep: torch.Tensor,
                 ctm_data: Optional[Dict[str, torch.Tensor]] = None,
@@ -3415,11 +3537,22 @@ class CTMControlledDiffusionProcessor(nn.Module):
             device_for_fallback = base_noise_pred.device
             dtype_for_fallback = base_noise_pred.dtype
 
-            sync_inf = ctm_influences[0] if len(ctm_influences) > 0 else torch.zeros(batch_size_for_fallback, config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
-            state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros(batch_size_for_fallback, config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
+            sync_inf = ctm_influences[0] if len(ctm_influences) > 0 else torch.zeros(batch_size_for_fallback, self.config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
+            state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros(batch_size_for_fallback, self.config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
             
             # Multi-stage refinement
             for i, refinement_layer in enumerate(self.ctm_noise_refinement):
+                # CTM Feedback
+                if hasattr(self, 'ctm_feedback_module') and self.ctm_feedback_module is not None and ctm_data and 'final_sync_out' in ctm_data:
+                    if current_noise.dim() == 2:
+                        current_noise_for_feedback = current_noise.unsqueeze(1)
+                    else:
+                        current_noise_for_feedback = current_noise
+                    
+                    if current_noise_for_feedback.size(-1) == self.ctm_feedback_module.diffusion_model_dim:
+                        feedback_signal = self.ctm_feedback_module(current_noise_for_feedback, ctm_data['final_sync_out'])
+                        current_noise = current_noise + feedback_signal.squeeze(1)
+
                 # Combine current noise with CTM influences
                 refinement_input = torch.cat([current_noise, sync_inf, state_inf], dim=-1)
                 refinement = refinement_layer(refinement_input)
@@ -3956,6 +4089,47 @@ class CTMControlledDiffusionProcessor(nn.Module):
             
         return prev_sample
 
+class CTMFeedbackModule(nn.Module):
+    """
+    A feedback module designed to work with the CTM. It takes the CTM's
+    final synchronization vector (thought vector) and generates a modulation
+    signal for the diffusion process.
+    This version adds a residual connection from the thought vector to the modulation signal to ensure more information is preserved.
+    """
+    def __init__(self, ctm_sync_dim: int, diffusion_model_dim: int, n_heads: int = 8):
+        super().__init__()
+        self.ctm_sync_dim = ctm_sync_dim
+        self.diffusion_model_dim = diffusion_model_dim
+        
+        self.thought_projector = nn.Linear(ctm_sync_dim, diffusion_model_dim)
+        self.residual_projector = nn.Linear(ctm_sync_dim, diffusion_model_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=diffusion_model_dim,
+            num_heads=n_heads,
+            batch_first=True
+        )
+        self.modulation_net = nn.Sequential(
+            nn.Linear(diffusion_model_dim, diffusion_model_dim * 2),
+            nn.GELU(),
+            nn.Linear(diffusion_model_dim * 2, diffusion_model_dim)
+        )
+        self.norm = nn.LayerNorm(diffusion_model_dim)
+
+    def forward(self, diffusion_state: torch.Tensor, ctm_thought_vector: torch.Tensor) -> torch.Tensor:
+        """
+        Produce a modulation signal based on the CTM's thought vector.
+        """
+        # Project the thought vector for attention
+        query = self.thought_projector(ctm_thought_vector).unsqueeze(1)
+        key_value = diffusion_state
+        attn_output, _ = self.cross_attention(query, key_value, key_value)
+        modulation = self.modulation_net(attn_output)
+        
+        # Project the thought vector for residual connection and add to modulation
+        residual = self.residual_projector(ctm_thought_vector).unsqueeze(1)  # [B, 1, D]
+        modulated_with_residual = modulation + residual
+        
+        return self.norm(modulated_with_residual)
 
 class EnhancedCTMDiffusion(nn.Module):
     """
@@ -5348,17 +5522,18 @@ class EnhancedCTMDiffusion(nn.Module):
         return output_dict
     
     def iterative_ctm_diffusion_sample(self, shape: Tuple[int, ...],
-                                      initial_byte_sequence_for_inference: Optional[torch.Tensor] = None,
-                                      num_steps: int = 50,
-                                      # ctm_refinement_steps: int = 3, # Not directly used with denoise_one_step
-                                      enable_early_stopping: bool = True,
-                                      # guidance_scale: float = 1.0, # Not directly used by this sampling structure
-                                      eta: float = 0.0, # For DDIM scheduler
-                                      generator: Optional[torch.Generator] = None
-                                      ) -> Tuple[torch.Tensor, Dict]:
+                                       initial_byte_sequence_for_inference: Optional[torch.Tensor] = None,
+                                       num_steps: int = 50,
+                                       # ctm_refinement_steps: int = 3, # Not directly used with denoise_one_step
+                                       enable_early_stopping: bool = True,
+                                       # guidance_scale: float = 1.0, # Not directly used by this sampling structure
+                                       eta: float = 0.0, # For DDIM scheduler
+                                       generator: Optional[torch.Generator] = None
+                                       ) -> Tuple[torch.Tensor, Dict]:
         """
         Advanced sampling with iterative CTM-diffusion refinement and early stopping.
         Uses an initial_byte_sequence_for_inference to determine task characteristics and HIPA control.
+        Adds flexible thought adjustment during generation.
         """
         device = self.device_container.device # More robust way to get device
         batch_size = shape[0]
@@ -5386,8 +5561,9 @@ class EnhancedCTMDiffusion(nn.Module):
         x = torch.randn(shape, device=device, generator=generator)
 
         sampling_info = {'steps_taken': [], 'early_stops': [], 'stop_reasons': {},
-                         'convergence_history': [], 'certainty_history': []}
-        
+                         'convergence_history': [], 'certainty_history': [],
+                         'thought_adjustments': []}  # Track thought adjustments
+
         self.diffusion.noise_scheduler.set_timesteps(num_steps, device=device)
         timesteps_to_iterate = self.diffusion.noise_scheduler.timesteps
 
@@ -5396,19 +5572,66 @@ class EnhancedCTMDiffusion(nn.Module):
         else:
             pb = timesteps_to_iterate
 
+        # Initialize thought history for bidirectional adjustment
+        thought_history = []
+
         for i, t_tensor in enumerate(pb):
             current_timestep_batched = t_tensor.expand(batch_size) if t_tensor.ndim == 0 else t_tensor
             if current_timestep_batched.ndim == 0 :
                  current_timestep_batched = current_timestep_batched.repeat(batch_size)
 
             # CTM core processes the current diffusion state `x` (x_t).
-            # `x` is assumed to be in the feature space expected by ctm_core.
-            # This means `x` should have the same characteristics as the output of `_prepare_input_features`
-            # (i.e., the `kv_features_for_ctm` that `_prepare_input_features` would have produced).
-            # This is a key assumption: the `shape` argument to this sampling function must match
-            # the expected input shape for `self.ctm_core.forward_with_full_tracking`.
             ctm_input_features_for_core_step = x.detach()
             ctm_data_guidance = self.ctm_core.forward_with_full_tracking(ctm_input_features_for_core_step)
+
+            # Store current thought for potential adjustment
+            current_thought = ctm_data_guidance.get('final_sync_out')
+            if current_thought is not None:
+                thought_history.append(current_thought.detach().clone())
+
+            # Check confidence and adjust thought if needed
+            if 'certainties' in ctm_data_guidance and ctm_data_guidance['certainties'] is not None:
+                # Get average certainty for the current step
+                current_certainty = ctm_data_guidance['certainties'][:, 0, -1].mean().item()
+                sampling_info['certainty_history'].append(current_certainty)
+                # Refine thought if confidence is below threshold and we have a previous thought
+                min_confidence = getattr(self.config, 'min_confidence_threshold', 0.6)
+                max_adjustments = getattr(self.config, 'max_thought_adjustments', 10)
+                
+                # Check if we've exceeded max adjustments
+                if len(sampling_info['thought_adjustments']) >= max_adjustments:
+                    if not hasattr(self, '_final_thought_committed'):
+                        print(f"  🛑 Max adjustments reached ({max_adjustments}). Committing to final thought.")
+                        self._final_thought_committed = True
+                # Only adjust if below confidence threshold and under max adjustments
+                elif current_certainty < min_confidence and thought_history:
+                    # Determine adjustment direction based on certainty trend
+                    direction = "backward"
+                    if len(thought_history) > 1 and current_certainty < sampling_info['certainty_history'][-2]:
+                        direction = "forward"
+                    
+                    # Get the thought to adjust (current by default)
+                    thought_to_adjust = thought_history[-1]
+                    
+                    # For backward adjustment, use previous thought
+                    if direction == "backward" and len(thought_history) > 1:
+                        thought_to_adjust = thought_history[-2]
+                    
+                    # Blend thoughts: 70% adjusted thought + 30% current thought
+                    adjusted_thought = 0.7 * thought_to_adjust + 0.3 * current_thought
+                    
+                    # Update guidance data with adjusted thought
+                    ctm_data_guidance['final_sync_out'] = adjusted_thought
+                    
+                    # Update thought history
+                    thought_history[-1] = adjusted_thought.detach().clone()
+                    
+                    sampling_info['thought_adjustments'].append({
+                        'step': i,
+                        'direction': direction,
+                        'certainty': current_certainty
+                    })
+                    print(f"  🔄 Thought adjusted {direction} at step {i} (certainty: {current_certainty:.2f})")
 
             if enable_early_stopping and i > self.config.early_stop_min_steps and hasattr(self.diffusion, 'should_early_stop'):
                 should_stop_flags, stop_reason_details_dict = self.diffusion.should_early_stop(ctm_data_guidance, i, len(timesteps_to_iterate))
@@ -5892,7 +6115,7 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
     return config
 
 
-    def _jepa_create_masked_patch_views(self,
+def _jepa_create_masked_patch_views(self,
                                       online_patch_embeddings: torch.Tensor,
                                       target_patch_embeddings: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
@@ -6161,19 +6384,54 @@ class MirrorNeuronLayer(nn.Module):
 
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
-    
-    def __init__(self, embed_dim=512, num_heads=8, task_analyzer: 'TaskAnalyzer' = None): # Added task_analyzer
+
+    def __init__(self, embed_dim=512, num_heads=8, task_analyzer: 'TaskAnalyzer' = None,
+                 theta_range: Tuple[float, float] = (4.0, 8.0),
+                 beta_range: Tuple[float, float] = (13.0, 30.0),
+                 gamma_range: Tuple[float, float] = (30.0, 100.0),
+                 theta_boost: float = 1.5,
+                 gamma_boost: float = 1.7,
+                 beta_boost: float = 1.2,
+                 max_theta_boost: float = 2.5,
+                 max_gamma_boost: float = 3.0,
+                 max_beta_boost: float = 1.5,
+                 theta_gamma_coupling_strength: float = 0.5,
+                 default_sample_rate: int = 16000):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
-        self.task_analyzer = task_analyzer # Store the task_analyzer instance
+        self.task_analyzer = task_analyzer
+
+        # Wave Oscillations that Encourage Creative Thinking
+        self.theta_range = theta_range
+        self.beta_range = beta_range
+        self.gamma_range = gamma_range
         
+        # Static and dynamic boost parameters
+        self.theta_boost = theta_boost
+        self.gamma_boost = gamma_boost
+        self.beta_boost = beta_boost
+        self.max_theta_boost = max_theta_boost
+        self.max_gamma_boost = max_gamma_boost
+        self.max_beta_boost = max_beta_boost
+        
+        self.theta_gamma_coupling_strength = theta_gamma_coupling_strength
+        self.default_sample_rate = default_sample_rate
+
+        # Add creativity controller to dynamically adjust boost factors based on the thought vector.
+        self.creativity_controller = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, 3),
+            nn.Sigmoid()
+        )
+
         # Multi-head attention for frequency-aware processing
         self.freq_attention = nn.MultiheadAttention(
             embed_dim, num_heads, batch_first=True
         )
-        
+
         # Frequency enhancement networks
         self.freq_enhancer = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
@@ -6181,100 +6439,111 @@ class FrequencyDomainAwareAttention(nn.Module):
             nn.Linear(embed_dim * 2, embed_dim),
             nn.LayerNorm(embed_dim)
         )
-        
-    def apply_frequency_enhancement(self, x, modality_config):
+
+    def apply_frequency_enhancement(self, x, modality_config, theta_boost, gamma_boost, beta_boost):
         """Apply frequency enhancement based on detected modality."""
-        if not modality_config['use_hipa']:
-            return x  # Skip enhancement for text/discrete tasks
-        
+        if not modality_config.get('use_hipa', False):
+            return x # Skip enhancement for text/discrete tasks
+
         original_shape = x.shape
         
         try:
             # Apply FFT on specified dimensions
-            fft_dims = modality_config['fft_dims']
+            fft_dims = modality_config.get('fft_dims', [])
             if not fft_dims:
                 return x
-            
+
+            sample_rate = modality_config.get('sample_rate', self.default_sample_rate)
             # Compute FFT
             x_fft = torch.fft.fftn(x, dim=fft_dims)
-            
-            # Create frequency mask for enhancement
-            freq_threshold = modality_config['freq_threshold']
-            enhancement_strength = modality_config['enhancement_strength']
-            
             # Generate frequency coordinates
             freq_mask = torch.ones_like(x_fft.real)
             
+            # Apply theta-gamma coupling
+            coupled_gamma_boost = gamma_boost * (1.0 + (theta_boost - 1.0) * self.theta_gamma_coupling_strength)
+
             for dim in fft_dims:
                 size = x.shape[dim]
-                freqs = torch.fft.fftfreq(size, device=x.device)
-                
-                # Create high-frequency mask
-                high_freq_mask = torch.abs(freqs) > freq_threshold
-                
-                # Expand mask to match tensor dimensions
-                mask_shape = [1] * len(x.shape)
+                freqs = torch.fft.fftfreq(size, d=1.0/sample_rate, device=x.device)
+
+                mask_shape = [1] * x.dim()
                 mask_shape[dim] = size
-                high_freq_mask = high_freq_mask.view(mask_shape)
                 
-                # Broadcast and apply
-                freq_mask = freq_mask * (1.0 + enhancement_strength * high_freq_mask.float())
-            
-            # Apply frequency enhancement
+                # Create masks for theta, beta, and gamma bands
+                mask_theta = (torch.abs(freqs) >= self.theta_range[0]) & (torch.abs(freqs) <= self.theta_range[1])
+                mask_beta = (torch.abs(freqs) >= self.beta_range[0]) & (torch.abs(freqs) <= self.beta_range[1])
+                mask_gamma = (torch.abs(freqs) >= self.gamma_range[0]) & (torch.abs(freqs) <= self.gamma_range[1])
+
+                # Update frequency mask with boost factors
+                mask_theta = mask_theta.view(*mask_shape)
+                mask_beta = mask_beta.view(*mask_shape)
+                mask_gamma = mask_gamma.view(*mask_shape)
+                
+                freq_mask = freq_mask * (1.0 + (theta_boost - 1.0) * mask_theta.float() +
+                                          (coupled_gamma_boost - 1.0) * mask_gamma.float() +
+                                          (beta_boost - 1.0) * mask_beta.float())
+
             x_fft_enhanced = x_fft * freq_mask
-            
-            # Convert back to spatial/temporal domain
             x_enhanced = torch.fft.ifftn(x_fft_enhanced, dim=fft_dims).real
-            
             return x_enhanced
             
         except Exception as e:
             print(f"Warning: Frequency enhancement failed: {e}")
-            return x  # Fallback to original
-    
+            import traceback
+            traceback.print_exc()
+            return x
+
     def forward(self, x: torch.Tensor, hipa_control_signal: Optional[torch.Tensor] = None, context_hints: Optional[Dict] = None) -> Tuple[torch.Tensor, Dict]:
         """
         Forward pass with dynamically controlled frequency enhancement.
         HiPA is now primarily controlled by hipa_control_signal.
         Task_analyzer might still provide base modality characteristics.
         """
-        batch_size, seq_len, embed_dim = x.shape # Assuming x is (batch, seq_len, embed_dim)
+        batch_size, seq_len, embed_dim = x.shape
 
-        # Use task_analyzer to get a base modality_config (e.g., for fft_dims, static thresholds)
-        # It should not rely on task_id anymore, but can use context_hints or analyze x directly.
         modality_config = self.task_analyzer.detect_modality(x, task_id=None, context_hints=context_hints)
 
+        current_theta_boost = self.theta_boost
+        current_gamma_boost = self.gamma_boost
+        current_beta_boost = self.beta_boost
+        
+        thought_vector = None
+        if context_hints and 'ctm_data' in context_hints and context_hints['ctm_data']:
+            ctm_data = context_hints['ctm_data']
+            if 'final_sync_out' in ctm_data and ctm_data['final_sync_out'] is not None:
+                thought_vector_candidate = ctm_data['final_sync_out']
+                if thought_vector_candidate.dim() > 2:
+                    thought_vector = thought_vector_candidate.mean(dim=1)
+                else:
+                    thought_vector = thought_vector_candidate
+            elif 'activated_states' in ctm_data and ctm_data['activated_states']:
+                thought_vector = ctm_data['activated_states'][-1].mean(dim=1)
+
+        if thought_vector is not None:
+            if thought_vector.shape[-1] == self.embed_dim:
+                dynamic_boost_ratios = self.creativity_controller(thought_vector)
+                d_theta, d_gamma, d_beta = dynamic_boost_ratios.chunk(3, dim=-1)
+                
+                reshape_dims = [-1] + [1] * (x.dim() - 1)
+                d_theta = d_theta.view(*reshape_dims)
+                d_gamma = d_gamma.view(*reshape_dims)
+                d_beta = d_beta.view(*reshape_dims)
+                
+                current_theta_boost = 1.0 + d_theta * (self.max_theta_boost - 1.0)
+                current_gamma_boost = 1.0 + d_gamma * (self.max_gamma_boost - 1.0)
+                current_beta_boost = 1.0 + d_beta * (self.max_beta_boost - 1.0)
+            else:
+                 print(f"Warning: Thought vector dim ({thought_vector.shape[-1]}) mismatches creativity_controller input dim ({self.embed_dim}). Using static boosts.")
+
         x_processed = x
-        # Check if HIPA should be used at all for this base modality
-        if modality_config.get('use_hipa', False): # Default to False if not specified
-            # Now, check the dynamic hipa_control_signal
+        if modality_config.get('use_hipa', False):
             if hipa_control_signal is not None:
-                # Assuming hipa_control_signal is (batch, 1), threshold it
-                # For a soft application, use it as a multiplier.
-                # For a hard switch, threshold it. Let's use soft.
-                control = hipa_control_signal.view(batch_size, 1, 1) # Reshape for broadcasting
-                
-                # Apply frequency enhancement based on modality_config
-                x_enhanced_by_modality = self.apply_frequency_enhancement(x, modality_config)
-                
-                # Interpolate between original and enhanced based on control signal
+                control = hipa_control_signal.view(batch_size, 1, 1)
+                x_enhanced_by_modality = self.apply_frequency_enhancement(x, modality_config, current_theta_boost, current_gamma_boost, current_beta_boost)
                 x_processed = control * x_enhanced_by_modality + (1 - control) * x
             else:
-                # No dynamic control signal, just use the static modality_config
-                x_processed = self.apply_frequency_enhancement(x, modality_config)
-        
-        # Standard multi-head attention projections on the (potentially) HIPA-processed features
-        # The self.freq_attention and self.freq_enhancer from the original code seem to be a separate attention path.
-        # The request was to control HIPA on/off.
-        # If the existing self.freq_attention is the HIPA mechanism, then x_processed should go into it.
-        # Let's assume self.freq_attention IS the HiPA-specific attention.
-        
-        # The original code had:
-        # if x_flat.shape[-1] == self.embed_dim:
-        #     attn_out, _ = self.freq_attention(x_flat, x_flat, x_flat)
-        #     enhanced = self.freq_enhancer(attn_out)
-        # else:
-        #     enhanced = x_flat
+                x_processed = self.apply_frequency_enhancement(x, modality_config, current_theta_boost, current_gamma_boost, current_beta_boost)
+
         # This implies freq_attention is a standard MHA. The "frequency aware" part was in apply_frequency_enhancement.
         # So, we apply MHA on x_processed.
 
@@ -6284,11 +6553,10 @@ class FrequencyDomainAwareAttention(nn.Module):
             x_flat = x_processed.view(batch_size, -1, x_processed.shape[-1])
         else:
             x_flat = x_processed
-            seq_len = x_flat.shape[1] # Update seq_len if flattened differently
 
-        # Standard attention mechanism (using self.freq_attention as the MHA layer)
-        if x_flat.shape[-1] == self.embed_dim: # Ensure dimension matches MHA
-            attn_output, _ = self.freq_attention(x_flat, x_flat, x_flat) # Q, K, V are the same
+         # Standard attention mechanism (using self.freq_attention as the MHA layer)
+        if x_flat.shape[-1] == self.embed_dim:
+            attn_output, _ = self.freq_attention(x_flat, x_flat, x_flat)
             # The original code also had a self.freq_enhancer after attention.
             # If this is part of HIPA, it should also be controlled or always applied after HIPA-MHA.
             # Let's assume it's part of the HIPA block.
@@ -6298,17 +6566,15 @@ class FrequencyDomainAwareAttention(nn.Module):
             # This path needs clarification. For now, assume if HIPA is on, attention runs.
             # If HIPA was off (x_processed is x), does it still go through this attention?
             # Let's assume this MHA is always run on x_processed.
-            # If x_flat.shape[-1] != self.embed_dim, it's an issue.
+             # If x_flat.shape[-1] != self.embed_dim, it's an issue.
              raise ValueError(f"Dimension mismatch for attention: x_flat has dim {x_flat.shape[-1]}, expected {self.embed_dim}")
 
-
-        # Reshape back to original if flattened
         if len(original_shape) > 3:
-            final_output = final_output_flat.view(original_shape[0], *original_shape[1:-1], self.embed_dim) # Ensure last dim is embed_dim
+            final_output = final_output_flat.view(original_shape[0], *original_shape[1:-1], self.embed_dim)
         else:
             final_output = final_output_flat
             
-        return final_output, modality_config # Return modality_config for potential logging/debugging
+        return final_output, modality_config
 
 
 class TemporalSpatialTracker(nn.Module):
