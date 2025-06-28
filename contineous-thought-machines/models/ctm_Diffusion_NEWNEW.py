@@ -8,7 +8,7 @@ through multiple mechanisms:
 3. CTM-guided attention mechanisms with WINA sparse activation
 4. Synchronization-based diffusion guidance
 5. Iterative CTM-diffusion coupling
-6. WINA (Weight Informed Neuron Activation) for efficient sparse attention
+6. WINA (Weight Informed Neuron Activation) for efficient sparse attention now with Top-Down attention to Dynamically-Adjust and Learn from errors.
 """
 
 import torch
@@ -89,8 +89,11 @@ def batched_numeric_tensor_to_bytes(numeric_batch_tensor: torch.Tensor, source_d
     return stacked_bytes
 
 
-class WINASparsifier:
+class MetaWINASparsifier(WINASparsifier):
     """
+    Extends WINA sparsifier with meta-learning control that dynamically adjusts sparsity
+    based on an auxiliary objective (e.g., prediction error or consistency).
+
     WINA (Weight Informed Neuron Activation) sparse activation framework.
     
     This implements the training-free sparse activation method that jointly considers
@@ -102,7 +105,33 @@ class WINASparsifier:
     - Provides theoretical guarantees for tighter approximation error bounds
     - Training-free and plug-and-play design
     - Supports heterogeneous sparsity across layers
+
     """
+    def __init__(self, sparsity_ratio: float = 0.5, use_layer_specific: bool = True, control_dim: int = 64):
+        super().__init__(sparsity_ratio, use_layer_specific)
+        self.control_net = nn.Sequential(
+            nn.Linear(control_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
+            nn.Sigmoid()
+        )
+        self.control_dim = control_dim
+        
+    def apply_wina_gating(self, hidden_states, weight_matrix, layer_name="default", cache_key=None, control_input=None):
+        # First compute base WINA gating
+        base_gated = super().apply_wina_gating(hidden_states, weight_matrix, layer_name, cache_key)
+        
+        # If control input provided, use it to adjust sparsity
+        if control_input is not None:
+            control_signal = self.control_net(control_input)  # (batch_size, 1)
+            # Reshape control_signal to match hidden_states dimensions
+            control_signal = control_signal.view(-1, *([1]*(hidden_states.dim()-1)))
+            # Interpolate between original and gated based on control signal
+            output = control_signal * base_gated + (1 - control_signal) * hidden_states
+        else:
+            output = base_gated
+            
+        return output
     
     def __init__(self, sparsity_ratio: float = 0.5, use_layer_specific: bool = True):
         """
@@ -251,18 +280,50 @@ class WINASparsifier:
         self._cache_misses = 0
 
 
-class WINAAttention(nn.Module):
+class TopDownAttention(nn.Module):
     """
-    Multi-head attention with WINA sparse activation.
-    
-    This attention mechanism applies WINA sparsification at multiple stages:
-    1. Input projections (Q, K, V)
-    2. Attention weights
-    3. Output projection
-    
-    This provides significant computational savings while maintaining
-    better approximation quality than magnitude-only sparse methods.
+    Dedicated top-down attention module for modulation by high-level goals or consciousness.
+    Uses the current thought vector as query and current activations as keys/values.
     """
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, thought_vector):
+        # x: current activations (B, seq_len, embed_dim)
+        # thought_vector: high-level state (B, embed_dim)
+        
+        # Project thought vector to get query
+        q = self.q_proj(thought_vector)  # (B, embed_dim)
+        # Expand query to match sequence length
+        q = q.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, seq_len, embed_dim)
+        
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        # Reshape for multi-head attention
+        q = q.view(q.size(0), q.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(k.size(0), k.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(v.size(0), v.size(1), self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        attn_output = torch.matmul(attn_weights, v)  # (B, num_heads, seq_len, head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        
+        return attn_output
     
     def __init__(self,
                  d_model: int,
@@ -3007,7 +3068,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
     7. Quality preservation networks
     8. Multi-resolution guidance for different data types
     """
-    
+
     def __init__(self, config: EnhancedCTMConfig, actual_noisy_input_dim: int, task_analyzer: 'TaskAnalyzer'): # Added task_analyzer
         super().__init__()
         self.target_noise_dim = actual_noisy_input_dim # This is config.unet_input_feature_dim
@@ -3018,6 +3079,40 @@ class CTMControlledDiffusionProcessor(nn.Module):
         self.iterative_refinement = config.iterative_refinement
         self.config = config # Storing the config for other parts of the class
         
+                
+        # Add recurrent connections
+        self.recurrent_cells = nn.ModuleDict()
+        for layer in range(config.num_layers):
+            self.recurrent_cells[f"layer_{layer}"] = nn.GRUCell(
+                input_size=config.d_model,
+                hidden_size=config.d_model
+            )
+            
+        # Add feedback modules
+        self.feedback_modules = nn.ModuleDict()
+        for layer in range(config.num_layers - 1):
+            self.feedback_modules[f"layer_{layer}"] = FeedbackModule(config.d_model)
+            
+        # Add predictive coding modules
+        self.predictive_coders = nn.ModuleDict()
+        for layer in range(1, config.num_layers):
+            self.predictive_coders[f"layer_{layer}"] = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.ReLU()
+            )
+            
+        # Add top-down attention
+        self.top_down_attention = TopDownAttention(
+            embed_dim=config.d_model,
+            num_heads=config.n_heads
+        )
+        
+        # Replace WINA sparsifier with meta version
+        self.wina_sparsifier = MetaWINASparsifier(
+            sparsity_ratio=config.sparsity_ratio,
+            control_dim=config.control_dim
+        )
+
         # Enhanced CTM guidance processors (from ctm_guided_integration_flow.py)
         self.sync_to_flow_mapper = nn.Sequential(
             nn.Linear(config.ctm_n_synch_out, config.d_model),
@@ -4529,6 +4624,8 @@ class EnhancedCTMDiffusion(nn.Module):
                 num_heads=self.config.n_heads if hasattr(self.config, 'n_heads') else 8
             )
 
+   
+ 
     def _apply_enhanced_mcmc(self, theta: torch.Tensor, target_y: torch.Tensor,
                                current_epoch: Optional[int] = None, current_batch: Optional[int] = None) -> Dict[str, Any]:
         """
@@ -4555,7 +4652,6 @@ class EnhancedCTMDiffusion(nn.Module):
                 'mcmc_stats': {},
                 'solver_diagnostics': None # Or an empty list
             }
-
         # Determine if LNS should be used for this specific call to the sampler
         use_lns_for_this_sampler_call = False
         if self.config.use_large_neighborhood_search and isinstance(self.enhanced_mcmc_sampler, LargeNeighborhoodSearchMCMC):
@@ -4634,6 +4730,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 target_mcmc_output: Optional[torch.Tensor] = None, current_epoch: int = 0,
                 current_batch: int = 0, task_name: Optional[str] = None,
                 observed_byte_sequence: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        
         """
         Forward pass of the CTMDiffusionModel using byte sequences.
 
@@ -4670,6 +4767,71 @@ class EnhancedCTMDiffusion(nn.Module):
         batch_size = byte_sequence.size(0)
         device = byte_sequence.device
         
+        # Initialize hidden states for recurrent connections
+        hidden_states = {}
+        for layer in range(self.config.num_layers):
+            hidden_states[f"layer_{layer}"] = torch.zeros(
+                batch_size, self.config.d_model, device=device
+            )
+            
+        # Initialize predictive coding errors
+        predictive_errors = {}
+        
+        # Initialize layer output for first layer
+        layer_output = None
+        
+        # Process through CTM core with new features
+        for layer_idx in range(self.config.num_layers):
+            # Get current layer input
+            if layer_idx == 0:
+                layer_input = kv_features_for_ctm
+            else:
+                layer_input = layer_output
+                
+            # Apply recurrent connection
+            hidden_states[f"layer_{layer_idx}"] = self.recurrent_cells[f"layer_{layer_idx}"](
+                layer_input.reshape(batch_size, -1),  # Flatten spatial/temporal dims
+                hidden_states[f"layer_{layer_idx}"]
+            )
+            # Reshape back to original dimensions
+            recurrent_output = hidden_states[f"layer_{layer_idx}"].view(layer_input.shape)
+            
+            # Apply feedback from higher layers if available
+            if f"layer_{layer_idx}" in self.feedback_modules and layer_idx < self.config.num_layers - 1:
+                # Get feedback from next layer (if exists)
+                next_layer_output = ctm_data.get(f"layer_{layer_idx+1}_output", None)
+                if next_layer_output is not None:
+                    recurrent_output = self.feedback_modules[f"layer_{layer_idx}"](
+                        next_layer_output.mean(dim=1),  # Pool higher layer output
+                        recurrent_output
+                    )
+                
+            # Compute predictive coding error
+            if f"layer_{layer_idx}" in self.predictive_coders and layer_idx > 0:
+                prediction = self.predictive_coders[f"layer_{layer_idx}"](recurrent_output)
+                error = prediction - layer_input  # Compare with original input
+                predictive_errors[f"layer_{layer_idx}"] = error
+                # Use error to modulate processing
+                recurrent_output = recurrent_output + error
+                
+            # Apply top-down attention using final thought vector at last layer
+            if layer_idx == self.config.num_layers - 1:
+                thought_vector = recurrent_output.mean(dim=1)  # (B, d_model)
+                recurrent_output = self.top_down_attention(recurrent_output, thought_vector)
+                
+            # Store layer output for feedback and diagnostics
+            ctm_data[f"layer_{layer_idx}_output"] = recurrent_output
+            layer_output = recurrent_output
+            
+        # Update WINA sparsifier with meta-learning control
+        if 'thought_vector' in locals():
+            control_input = torch.cat([
+                thought_vector,
+                torch.tensor([current_epoch/100.0, current_batch/1000.0], device=device).expand(batch_size, 2)
+            ], dim=1)
+            self.wina_sparsifier.control_input = control_input
+        
+
         losses['jepa_loss'] = torch.tensor(0.0, device=device)
         # The aux loss from dynamic_entropy_patcher (online JEPA encoder) is handled by _prepare_input_features
         # No separate jepa_context_aux_loss or jepa_target_aux_loss needed here for now.

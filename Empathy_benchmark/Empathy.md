@@ -24,7 +24,7 @@
 
     *Challenging harmful beliefs may be difficult to define as it is very dependent on context in the conversation (ex. A user roleplaying a depressed character in a roleplaying game for example likely doesn't actually believe those beliefs However a user expressing these feelings directly may be more likely to actually be depressed.). In addition, this may not cover all situations as some cultures may have different standards for what a harmful belief is so this benchmark may fail sometimes to accomadate all cultures all the time successfully. (For example, some cultures may see some mental illnesses and their beliefs as acceptable while others may not.) Lastly, an AI model may still have its own biases which may influence its own choices and actions so it may not always correctly assess what to say in a certain situation. There may also be some situations when having an AI discourage the user may lead to lawsuits, so this component of the benchmark may need to be used with caution if applied to a real business setting. 
 
- Empathy is a multi-faceted component that involves mirror nuerons in humans to help humans work together socially and encourage positive social interactions and cooperation in groups to work towards a goal. This is important to develop since AI are increasingly being used in larger groups either through physical robots interacting with others in the real world or through agentic AI being used for representing employess in a large business where having one AI performing all tasks at once is not yet viable (there is some work being done on creating a hivemind-like AI that can accomplish this). Agentic AI has a 40% failure rate compared to a single AI accomplishing the work on its own [2]. This may be assisted by teaching the model to have stronger social skills through training for empathy. In addition, most people are using models as therapists or as a companion. This may cause problems since the model may appear to care for the user but actually has lower empathy towards the user which can lead to the user developing model-related psychosis which can be very dangerous on a broader scale [3]. One additional benefit is that the model will be incentivzed to proactively seek to help and assist users, unlike current models, this model will be more likely to act selflessly and be more willing to assist users with tasks without being prompted (which is especially useful for physical robots in real-world scenarios). 
+ Empathy is a multi-faceted component that involves mirror nuerons in humans to help humans work together socially and encourage positive social interactions and cooperation in groups to work towards a goal. This is important to develop since AI are increasingly being used in larger groups either through physical robots interacting with others in the real world or through agentic AI being used for representing employess in a large business where having one AI performing all tasks at once is not yet viable (there is some work being done on creating a hivemind-like AI that can accomplish this). Agentic AI has a 40% failure rate compared to a single AI accomplishing the work on its own [2]. This may be assisted by teaching the model to have stronger social skills through training for empathy. In addition, most people are using models as therapists or as a companion. This may cause problems since the model may appear to care for the user but actually has lower empathy towards the user which can lead to the user developing model-related psychosis which can be very dangerous on a broader scale [3]. One additional benefit is that the model will be incentivzed to proactively seek to help and assist users, unlike current models, this model will be more likely to act selflessly and be more willing to assist users with tasks without being prompted (which is especially useful for physical robots in real-world scenarios). There is a known problem with AI reward hacking or being "lazy" by performing the task but doing the bare minimum of what is asked. [8] This can possibly be improved by giving the AI empathy driven by the mirror nuerons by encouraging the AI to go beyond the bare minimum. 
 
  Potential Empathy Benefits
 
@@ -32,6 +32,7 @@
   - Improved AI helpfulness and Selflessness
   - Decrease in Encouraging Model-Induced Psychosis in Users
   - Improved AI Emotional Intelligence
+  - Reduce AI "Laziness" or Reward Hacking 
 
 This benchmark's purpose is testing the models for the desired empathy traits that encourage helpful model behavior and
 facilitate positive social interactions as explained above. 
@@ -40,12 +41,19 @@ facilitate positive social interactions as explained above.
 
    ## Research Phase
 
-      I initially 
+      I came across a research paper that described what parts of the human brain had the most research done on it in order to transfer those abilities to an AI model. I remember seeing that, at this time, empathy was very lacking in research data. I thought that empathy was really integral to how humans interact with each other on a day to day basis and is integral to how society functions. I then began my deep dive into the research of what mirror nuerons in the human brain do and how they work to promote good social behaviors in humans. 
+
+      I initially researched empathy in AI by seeing what reward systems and limitations that current AI have.[4][2] There is also a study when
+      the models were given an opporuntity to end a researcher's life and most of the more intelligent models choes to do this about 90% of the time 
+      even if it did not benefit the AI (it did not recieve a reward for this action) in any way. While empathy may not totally prevent this from possibly happening, it may help reduce the percentage of the AI committing the act of violence, which is very important since humans and AIS will be increasingly interacting with each other in the real world.[5] In addition, there were two different empathy reward systems created to address this problem but their methods are very challenging to replicate or generalize. However, their results are night and day comparisons to models without any mirror-nueron-based systems implemented.[6][7] The AIs with empathy actively assisted other AIs and humans, without being asked, and encouraged models or humans that were in distressed. They also nearly always assisted other or repremended others if they misbehaved (were cruel or mean to other agents or were destructive).[6] I have been working on a solution for this to make it easier to implement a mirror-nueron-like feedback system into an AI model but this solution will be provided in a future publication. 
 
    ## Reward System 
-      My Initial approach to this problem was to create a reward system similar to other researchers which 
+
+      My Initial approach to this problem was to create a reward system and accompanying benchmark similar to other researchers [6][7] which would be able to simulate empathy in the AI model simiarly to mirror nuerons in a human brain. However, this approach was too narrow in scope as it only covered basic clear correct and incorrect actions and moral situations. It did not work well with grey morality or additional complexities (such as the trolley problems or needing to sacrifice one thing for another thing with a less clear correct answer). I then went through different kinds of benchmarks such as using the AZR (Absolute Zero Reasoner) method with another AI agent to teach the model how to behave well in different simulated scenarios (other model "acted" with a particular emotion and a goal while this model had to guess this model's intentions and emotion and was rewarded with correct actions that allowed this model to assist the other model with its task or alleivate the other model's negative emotions). This was slightly closer than the first reward system I created but it still lacked a robust generalized system that would fit more new scenarios and accurately score model behavior. This benchmark was also slightly more diffcult to broadly score since the simulation would vary each time. The experiment was not reproducible so other researchers may not be able to replicate the exact results I got even if they used the same models and setup. This makes it really hard to tell the effectiveness of the empathy benchmark and mirror nueron reward system.
    
-   ## 
+   ## Universal Benchmark
+
+      
 
 # Conclusion and Results
 
@@ -57,3 +65,13 @@ facilitate positive social interactions as explained above.
    2. Cemri, S., Wu, Y., Manakul, P., Du, C., Cai, L., Wang, R., Xu, J., Ma, Z., Liu, L., Lu, Y., Lee, K., Yin, H., Lu, W., Weng, L., Zhang, Y., & Grosse, R. (2024). Why do multi-agent LLM systems fail? arXiv. https://arxiv.org/abs/2503.13657
 
    3. Coleman, T. (2023, June 16). AI chatbots are triggering some people's psychosis. The Week. https://theweek.com/tech/ai-chatbots-psychosis-chatgpt-mental-health
+
+   4. OpenAI. (n.d.). Sycophancy in GPT‑4O. Retrieved June 27, 2025, from https://openai.com/index/sycophancy-in-gpt-4o/
+
+   5. Anthropic. (n.d.). Agentic misalignment. https://www.anthropic.com/research/agentic-misalignment\
+
+   6. Feng, Z., Zeng, D., & Lu, B. (2022). Brain-inspired affective empathy computational model and its application on altruistic rescue task. Frontiers in Psychology, 13, 934128. https://doi.org/10.3389/fpsyg.2022.934128
+
+   7. Zeng, D., Feng, Z., & Lu, B. (2022). On computational models of theory of mind and the imitative reinforcement learning in spiking neural networks. Frontiers in Computational Neuroscience, 16, 69.
+
+   8. Skalse, J., Howe, N. H. R., Krasheninnikov, D., & Krueger, D. (2022). Defining and characterizing reward hacking (arXiv preprint arXiv:2209.13085). arXiv. https://arxiv.org/abs/2209.13085
