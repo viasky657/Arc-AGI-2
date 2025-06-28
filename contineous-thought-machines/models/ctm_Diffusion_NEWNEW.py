@@ -5019,6 +5019,12 @@ class EnhancedCTMDiffusion(nn.Module):
         losses['entropy_model_aux_loss'] = entropy_aux_loss * self.config.entropy_model_loss_weight
         online_patch_embeddings = kv_features_for_ctm # Shape: (B, S_patches, D_embed)
 
+        
+        # PARALLEL BINARY PATCH GENERATION
+        # Flatten patches for parallel processing with entropy-based guidance
+        batch_size, num_patches, patch_dim = online_patch_embeddings.shape
+        parallel_patches = online_patch_embeddings.view(batch_size, -1)
+
         # --- JEPA Loss Calculation ---
         if self.config.use_jepa_training and self.training and \
            self.jepa_target_patch_encoder is not None and self.jepa_predictor is not None and \
@@ -5120,38 +5126,68 @@ class EnhancedCTMDiffusion(nn.Module):
                 )
         
         # --- CTM Core Logic ---
-        # CTM core processes the features derived from the input byte_sequence.
+        # CTM core Process flattened parallel patches with the features derived from the input byte_sequence.
         # ctm_output_features = self.ctm_core(kv_features_for_ctm) # If CTM core is a separate module
         # For now, assuming kv_features_for_ctm are directly used or further processed by CTM core if it's integrated.
-        # The `ctm_data` used by diffusion processor will come from `self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)` later.
+        # The `ctm_data` used by diffusion processor will come from `self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)` later.        ctm_data = self.ctm_core.forward_with_full_tracking(parallel_patches)
         
         # --- Diffusion Model Logic ---
         numeric_target_diffusion_output = None
         if target_diffusion_output is not None:
-            # --- Corrected ARC Grid Data Processing for Diffusion ---
-            # The input `target_diffusion_output` is a byte tensor (uint8) representing ARC grids (symbols 0-10).
-            # It needs to be converted to a float tensor and normalized for the diffusion model.
-            # The previous method `batched_bytes_to_numeric_tensor` was incorrect as it reinterpreted
-            # memory, which is only valid if the bytes were originally serialized from floats.
-
-            if target_diffusion_output.dtype == torch.uint8:
-                # 1. Convert the byte tensor to float.
-                float_target = target_diffusion_output.float()
-                
+            # PARALLEL PATCH GENERATION MODIFICATION
+            # Flatten target for parallel processing
+            target_flat = target_diffusion_output.view(batch_size, -1)
+            
+            # Normalize flattened target
+            if target_flat.dtype == torch.uint8:
+                float_target = target_flat.float() 
                 # 2. Normalize the values. ARC symbols are 0-9, padding is 10.
                 # Normalizing to the standard [-1, 1] range.
                 # Max value is 10. (val / 5.0) - 1.0 maps [0, 10] to [-1, 1].
-                normalized_target = (float_target / 5.0) - 1.0
+                normalized_target = (float_target / 255.0) * 2.0 - 1.0  # Normalize to [-1, 1]
                 numeric_target_diffusion_output = normalized_target
             else: # Already numeric (e.g., during sampling)
-                numeric_target_diffusion_output = target_diffusion_output
+                numeric_target_diffusion_output = target_flat
 
-            if kv_features_for_ctm.size(1) != numeric_target_diffusion_output.size(1) and hasattr(self.diffusion, 'unet') and numeric_target_diffusion_output.ndim > 1:
-                 print(f"Warning: Sequence length mismatch between CTM features ({kv_features_for_ctm.size(1)}) and numeric diffusion target ({numeric_target_diffusion_output.size(1)}). This might affect conditioning.")
+            # Use flattened CTM data and parallel patches
+            ctm_data_flat = {
+                k: v.view(batch_size, -1) if isinstance(v, torch.Tensor) else v
+                for k, v in ctm_data.items()
+            }
+            
+            # Generate noise based on flattened target
+            noise = torch.randn_like(numeric_target_diffusion_output)
+            noisy_input = self.diffusion.add_noise(numeric_target_diffusion_output, noise, timestep)
+            
+            # Predict with diffusion using parallel inputs
+            pred = self.diffusion(
+                noisy_input=noisy_input,
+                timestep=timestep,
+                ctm_data=ctm_data_flat,
+                hipa_control_signal=current_hipa_signal
+            )
+            
+            # Compute loss on flattened outputs
+            diffusion_loss = F.mse_loss(pred, noise)
+            losses['diffusion_loss'] = diffusion_loss
 
-            # Use EnhancedCTMDiffusion's own training_noise_scheduler for the noising process
-            if hasattr(self, 'training_noise_scheduler'):
-                t = torch.randint(0, self.training_noise_scheduler.config.num_train_timesteps, (batch_size,), device=byte_sequence.device).long()
+        # PARALLEL PATCH GENERATION MODIFICATION
+        # For sampling modes, reshape output to original patch dimensions
+        if mode in ['ctm_only', 'mcmc_only']:
+            final_output = ctm_data.get('final_sync_out', torch.zeros_like(parallel_patches))
+            final_output = final_output.view(batch_size, num_patches, patch_dim)
+            
+        elif mode in ['ctm_controlled_diffusion', 'diffusion_only']:
+            # In diffusion modes, output is already flattened
+            final_output = pred if 'pred' in locals() else torch.zeros_like(parallel_patches)
+
+        # Convert final output back to bytes if needed
+        if mode in ['ctm_controlled_diffusion', 'diffusion_only']:
+            # PARALLEL PATCH GENERATION MODIFICATION
+            # Output is already in flattened form, convert directly
+            if final_output.dtype != torch.uint8:
+                final_output = (final_output * 0.5 + 0.5) * 255.0
+                final_output = final_output.clamp(0, 255).byte()
 
                 # --- FIX: Resize target to match UNet input dimension ---
                 current_len = numeric_target_diffusion_output.shape[-1]
