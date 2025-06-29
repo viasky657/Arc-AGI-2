@@ -285,9 +285,7 @@ who will learn from the Gemini 2.5 Pro judge (or whatever the newest model is).
 The surogate judge model will learn to judge eventually on its own so the system will not require an api call to an external judge. This will allow the model to grow to become more accurate at tasks, become better at maintaining prior knowledge (plasticity), and decrease energy requirements to run it without losing accuracy. 
 There may be some room to improve this by encoouraging the model to reduce weights (parameters) to the bare mimumim needed for tasks to reduce hardware space requirements but this will require far more care to not negatively affect preformance.
 
-# FeedBack and FeedForward Network Incorporation to Allow the CTM_Core and OG CTM Class to be able to dynamically adjust the thought vector generation at any point including during the Diffusion final processing output. (WIP)
-
-Excellent, the changes have been applied successfully.
+# FeedBack and FeedForward Network Incorporation to Allow the CTM_Core Variable Output of the OG CTM model Class and OG CTM Class to be able to dynamically adjust the thought vector generation at any point including during the Diffusion final processing output Based on Entropy in Generation and allowing the Higher Layers (More Conscious Parts of the Model) to Influence the Lower Layers (Less Conscious Parts of the Model that Often First Begin the Generations from the Model Input). This is Biologically Inpsired by How Humans have their Higher Level Consciousness Influence Their Lower-Level Thoughts. It also has an option for Bidirectional Dynamic Binary Patches with Entropy (In Place of Tokens) to Allow the CTM Model to Generate Its Thoughts and Adjust Them At Any Point in the Generation If Its Confidnece Is Low Up to 10 Times Before Being Required to Finish the Generation and Output Its Final Output.(WIP)
 
 I have now implemented the internal feedback mechanism within the OriginalCTMCore itself. This enhancement allows the CTM to modulate its own thought process dynamically, iteration by iteration.
 
@@ -299,8 +297,7 @@ Recursive Feedback Loop: Within the core recurrent loop of the OriginalCTMCore, 
 This completes the implementation of a fully dynamic, dual-feedback system where the CTM can modulate both the higher-level diffusion process and its own internal thought-generation process.
 
 
-Task Completed
-I have successfully implemented the internal, self-modulating feedback loop within the OriginalCTMCore in contineous-thought-machines/models/ctm_Diffusion_NEWNEW.py. The CTM can now dynamically adjust its own thought process, in addition to guiding the main diffusion process. A new configuration flag, ctm_use_internal_feedback, has been added to control this feature.
+The internal self-modulating feedback loop within the OriginalCTMCore in contineous-thought-machines/models/ctm_Diffusion_NEWNEW.py. The CTM can now dynamically adjust its own thought process, in addition to guiding the main diffusion process. A new configuration flag, ctm_use_internal_feedback, has been added to control this feature.
 
 Let's break down how the FeedbackModule and the CTMControlledDiffusionProcessor are designed to interact, based on the code you've provided.
 
@@ -342,3 +339,36 @@ Summary of the Relationship
 Intended Design: The architecture includes FeedbackModule instances to create a granular, layer-by-layer feedback system, allowing for a hierarchical flow of information.
 Actual Implementation: The primary forward logic opts for a more powerful, holistic feedback approach. It uses the specialized CTMFeedbackModule to inject the final, synthesized output of the entire CTM directly into the diffusion noise refinement process. This acts as a strong, top-down guidance signal from the "conscious" part of the model (the CTM) to the generative part (the diffusion processor).
 In essence, while the design allows for local feedback between layers, the implemented version prioritizes a global feedback loop from the CTM's final conclusion back into the generative process to ensure the output aligns with the CTM's "thought".
+
+# Mercury Diffusion Dynamic Binary Patches Generations for a x1000 Potential Model Generation Speed Up (WIP)
+
+Based on my analysis of the ctm_Diffusion_NEWNEW.py file, I can confirm that it implements the core properties from the Mercury paper, with the exception of the binary dynamic entropy patching-based method instead of tokens. Here's a detailed breakdown:
+
+Properties from Mercury Paper Present:
+Diffusion-based Language Modeling:
+
+The file implements a diffusion-based approach with denoising diffusion loss EnhancedCTMDiffusion.forward()
+Uses a forward/reverse diffusion process defined in the paper EnhancedCTMDiffusion.forward()
+Parallel Token Generation:
+
+Implements coarse-to-fine parallel generation iterative_ctm_diffusion_sample()
+Uses batched parallel processing PipelineParallelProcessor
+Transformer Architecture:
+
+Core CTM model uses Transformer-based components WINAAttention and WINAEnhancedMLP
+Training with Denoising Diffusion Loss:
+
+Implements denoising diffusion loss EnhancedCTMDiffusion.forward()
+Inference with Iterative Refinement:
+
+Sampling with iterative refinement iterative_ctm_diffusion_sample()
+Adaptive scheduling based on CTM certainty ConsciousnessController
+High Throughput Capabilities:
+
+Pipeline parallelism optimizations PipelineParallelProcessor
+Sparse attention mechanisms WINASparsifier for efficiency
+Exception: Binary Dynamic Entropy Patching
+Instead of tokens, the implementation uses:
+
+Binary dynamic entropy patching batched_bytes_to_numeric_tensor() and batched_numeric_tensor_to_bytes()
+Learned byte patching encoder LearnedBytePatcherEncoder (reference in JEPA section
