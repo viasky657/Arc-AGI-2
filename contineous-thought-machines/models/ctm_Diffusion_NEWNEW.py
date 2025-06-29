@@ -2107,7 +2107,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     local_neuron_selector_loss_weight: float = 0.1
     target_hebbian_pattern: float = 0.0 # Target for the aggregated Hebbian signal
 
-    # --- Basal Ganglia Parameters ---
+    # --- Basal Ganglia Parameters --- #Controls action suppression so that the model's unwanted first unrelated thoughts are suppressed which helps with model safety. Is needed for action suppresion.
     ctm_enable_basal_ganglia: bool = True
     ctm_bg_dopamine_dim: int = 32
 
