@@ -2107,6 +2107,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     local_neuron_selector_loss_weight: float = 0.1
     target_hebbian_pattern: float = 0.0 # Target for the aggregated Hebbian signal
 
+    # --- Basal Ganglia Parameters ---
+    ctm_enable_basal_ganglia: bool = True
+    ctm_bg_dopamine_dim: int = 32
+
 
     def __post_init__(self):
         # Validate output dimensions
@@ -2413,6 +2417,16 @@ class OriginalCTMCore(nn.Module):
         else:
             self.internal_feedback_module = None
 
+        self.use_basal_ganglia = getattr(config, 'ctm_enable_basal_ganglia', True)
+        if self.use_basal_ganglia and self.synch_representation_size_action > 0:
+            self.basal_ganglia = BasalGangliaMechanism(
+                d_model=self.d_model,
+                action_dim=self.synch_representation_size_action,
+                dopamine_dim=config.ctm_bg_dopamine_dim
+            )
+        else:
+            self.basal_ganglia = None
+
 
     # --- Core CTM Methods ---
 
@@ -2680,6 +2694,7 @@ class OriginalCTMCore(nn.Module):
         synch_out_tracking = []
         synch_action_tracking = []
         attention_tracking = []
+        dopamine_error_tracking = []
 
         # --- Input Features (x is assumed to be pre-processed) ---
         # x has shape (B, S, d_input) where S is sequence length of features
@@ -2706,6 +2721,17 @@ class OriginalCTMCore(nn.Module):
 
             # --- Calculate Synchronisation for Input Data Interaction ---
             synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
+
+            # --- Basal Ganglia Gating ---
+            if self.basal_ganglia is not None:
+                action_gate, dopamine_error = self.basal_ganglia(
+                    thought_vector=activated_state,
+                    context=activated_state,
+                    reward_signal=None
+                )
+                synchronisation_action = synchronisation_action * action_gate
+                if track:
+                    dopamine_error_tracking.append(dopamine_error.detach().cpu().numpy())
 
             # --- Interact with Data via Attention ---
             if self.attention is not None and self.q_proj is not None:
@@ -2777,7 +2803,12 @@ class OriginalCTMCore(nn.Module):
 
         # --- Return Values ---
         if track:
-            return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+            tracking_results = (np.array(synch_out_tracking), np.array(synch_action_tracking)), \
+                               np.array(pre_activations_tracking), np.array(post_activations_tracking), \
+                               np.array(attention_tracking)
+            if dopamine_error_tracking:
+                return predictions, certainties, tracking_results, np.array(dopamine_error_tracking)
+            return predictions, certainties, tracking_results
         return predictions, certainties, synchronisation_out
 
     def compute_predictive_coding_loss(self, activated_state: torch.Tensor) -> torch.Tensor:
@@ -2981,7 +3012,8 @@ class OriginalCTMCore(nn.Module):
             'activated_states': [],
             'state_traces': [],
             'attention_weights': [],
-            'pc_losses': []
+            'pc_losses': [],
+            'dopamine_errors': []
         }
         
         # Initialize recurrent state
@@ -3019,6 +3051,17 @@ class OriginalCTMCore(nn.Module):
                 synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
                     activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action'
                 )
+
+                # --- Basal Ganglia Gating ---
+                if self.basal_ganglia is not None:
+                    action_gate, dopamine_error = self.basal_ganglia(
+                        thought_vector=activated_state,
+                        context=activated_state,
+                        reward_signal=None
+                    )
+                    synchronisation_action = synchronisation_action * action_gate
+                    tracking_data['dopamine_errors'].append(dopamine_error)
+
                 tracking_data['sync_action_history'].append(synchronisation_action.clone())
                 
                 # Interact with data via attention
@@ -3098,6 +3141,7 @@ class OriginalCTMCore(nn.Module):
             'certainties': certainties,
             'final_sync_out': synchronisation_out,
             'predictive_coding_loss': torch.stack(tracking_data['pc_losses']).mean() if tracking_data['pc_losses'] else torch.tensor(0.0, device=device),
+            'dopamine_loss': torch.stack(tracking_data['dopamine_errors']).mean() if tracking_data['dopamine_errors'] else torch.tensor(0.0, device=device),
             'local_hebbian_signal': local_hebbian_signal, # Pass signal to main model
             'local_neuron_selector_loss': local_neuron_selector_loss, # Pass loss to main model
             **tracking_data
@@ -5205,7 +5249,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 # Generate noise based on the correctly-sized target's shape and type
                 noise = torch.randn_like(clean_target_for_unet)
                 # Use a distinct variable name for the noisy input passed to the diffusion processor
-                noisy_input_for_diffusion_processor = self.training_noise_scheduler.add_noise(clean_target_for_unet, noise, t)
+                noisy_input_for_diffusion_processor = self.training_noise_scheduler.add_noise(clean_target_for_unet, noise, timestep)
                 
                 # CTMControlledDiffusionProcessor.forward (self.diffusion) is the model that predicts noise (or x0)
                 # It needs the noisy input, timestep, and CTM conditioning data.
@@ -5216,7 +5260,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 # The diffusion processor's forward method is CTMControlledDiffusionProcessor.forward
                 prediction_output_tuple = self.diffusion(
                     noisy_input=noisy_input_for_diffusion_processor,
-                    timestep=t,
+                    timestep=timestep,
                     ctm_data=ctm_data_for_diffusion_conditioning,
                     hipa_control_signal=current_hipa_signal # Pass HIPA signal
                 )
@@ -5514,7 +5558,14 @@ class EnhancedCTMDiffusion(nn.Module):
             current_total_loss += pc_loss * getattr(self.config, 'ctm_pc_loss_weight', 0.1)
             output_dict['ctm_internal_loss'] = output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device)) + pc_loss
 
-        # --- Global Plasticity Loss ---
+        # --- Dopamine Loss from Basal Ganglia ---
+        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'dopamine_loss' in output_dict['ctm_core_data']:
+            # The 'dopamine_loss' is -predicted_reward. We want to maximize reward, so we minimize -reward.
+            dopamine_loss = output_dict['ctm_core_data'].get('dopamine_loss', torch.tensor(0.0, device=device))
+            output_dict['dopamine_loss'] = dopamine_loss
+            current_total_loss += dopamine_loss * 0.1 # Add with some weight
+
+    # --- Global Plasticity Loss ---
         if self.use_global_plasticity_loss and 'ctm_core_data' in output_dict and output_dict['ctm_core_data']:
             local_hebbian_signal = output_dict['ctm_core_data'].get('local_hebbian_signal')
             if local_hebbian_signal is not None:
@@ -7124,6 +7175,84 @@ class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diff
         x_final = self._apply_hipa_attention(x, task_id=task_id, freq_domain=True)
         
         return x_final
+
+class BasalGangliaMechanism(nn.Module):
+    """
+    Basal Ganglia-inspired action gating mechanism.
+    Implements direct (Go) and indirect (NoGo) pathways to produce a gate
+    that modulates a continuous action vector. Also includes a dopaminergic
+    reward prediction system.
+    """
+    def __init__(self, d_model: int, action_dim: int, dopamine_dim: int = 32):
+        super().__init__()
+        self.d_model = d_model
+        self.action_dim = action_dim
+        self.dopamine_dim = dopamine_dim
+        
+        # Direct pathway (Go signal)
+        self.direct_pathway = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, action_dim),
+            nn.Sigmoid()  # Produces a gate between 0 and 1
+        )
+        
+        # Indirect pathway (NoGo signal)
+        self.indirect_pathway = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, action_dim),
+            nn.Sigmoid()  # Produces an inhibition gate between 0 and 1
+        )
+        
+        # Dopaminergic system (reward prediction error)
+        self.dopamine_predictor = nn.Sequential(
+            nn.Linear(d_model, dopamine_dim),
+            nn.ReLU(),
+            nn.Linear(dopamine_dim, 1),
+            nn.Tanh() # Predicts a reward value between -1 and 1
+        )
+        
+        # Contextual biasing
+        self.context_gating = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, thought_vector: torch.Tensor, context: torch.Tensor,
+                reward_signal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            thought_vector: Current thought vector (B, d_model)
+            context: Contextual information (B, d_model)
+            reward_signal: Optional external reward signal (B, 1)
+            
+        Returns:
+            net_action_gate: A gating vector to modulate the continuous action. (B, action_dim)
+            dopamine_error: Dopamine prediction error signal (B, 1)
+        """
+        # Apply contextual gating
+        context_gate = self.context_gating(context)
+        gated_thought = thought_vector * context_gate
+        
+        # Direct pathway: "Go" signal, encourages action features
+        selection_gate = self.direct_pathway(gated_thought)
+        
+        # Indirect pathway: "NoGo" signal, inhibits action features
+        inhibition_gate = self.indirect_pathway(gated_thought)
+        
+        # Combine pathways: action features are passed if Go is high and NoGo is low
+        net_action_gate = selection_gate * (1 - inhibition_gate)
+        
+        # Dopamine reward prediction
+        predicted_reward = self.dopamine_predictor(gated_thought)
+        
+        # Calculate dopamine error if reward signal is provided
+        dopamine_error = -predicted_reward # By default, the error is the negative predicted reward
+        if reward_signal is not None:
+            dopamine_error = reward_signal - predicted_reward
+        
+        return net_action_gate, dopamine_error
 
 class JEPAPredictor(nn.Module):
     """

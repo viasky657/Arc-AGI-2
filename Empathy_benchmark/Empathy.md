@@ -41,7 +41,7 @@ facilitate positive social interactions as explained above.
 
    ## Research Phase
 
-      I came across a research paper that described what parts of the human brain had the most research done on it in order to transfer those abilities to an AI model. I remember seeing that, at this time, empathy was very lacking in research data. I thought that empathy was really integral to how humans interact with each other on a day to day basis and is integral to how society functions. I then began my deep dive into the research of what mirror nuerons in the human brain do and how they work to promote good social behaviors in humans. 
+      I came across a research paper that described what parts of the human brain had the most research done on it in order to transfer those abilities to an AI model  [11]. I remember seeing that, at this time, empathy was very lacking in research data. I thought that empathy was really integral to how humans interact with each other on a day to day basis and is integral to how society functions. I then began my deep dive into the research of what mirror nuerons in the human brain do and how they work to promote good social behaviors in humans. 
 
       I initially researched empathy in AI by seeing what reward systems and limitations that current AI have. [4][2] There is also a study when
       the models were given an opporuntity to end a researcher's life and most of the more intelligent models choes to do this about 90% of the time 
@@ -53,7 +53,7 @@ facilitate positive social interactions as explained above.
    
    ## Universal Benchmark
 
-
+      The solution is to create a replicable empathy benchmark that had enough variety to allow for at least 1000 or more scenarios in case I need to use this benchmark for meta learning for a model so it will learn 
       
 
 # Conclusion and Results
@@ -80,3 +80,7 @@ facilitate positive social interactions as explained above.
    9. Wikipedia contributors. (n.d.). Mirror neuron. In Wikipedia, The Free Encyclopedia. Retrieved June 28, 2025, from https://en.wikipedia.org/wiki/Mirror_neuron
 
    10. Zhao, A., Wu, Y., Yue, Y., Wu, T., Xu, Q., Yue, Y., Lin, M., Wang, S., Wu, Q., Zheng, Z., & Huang, G. (2025, May 6). Absolute Zero: Reinforced self‑play reasoning with zero data (arXiv preprint arXiv:2505.03335). arXiv. https://arxiv.org/abs/2505.03335 
+
+   11. Luo, L., Callaway, E. M., & Svoboda, K. (2017). Genetic dissection of neural circuits. Neuron, 98(2), 236-251. https://doi.org/10.1016/j.neuron.2017.09.012
+
+
