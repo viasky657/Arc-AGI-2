@@ -30,7 +30,8 @@ def create_graph(models, output_filename='evaluation_graph.gif'):
     n_models = len(model_names)
     n_categories = len(plot_categories)
     
-    fig, ax = plt.subplots(figsize=(14, 8))
+    # Increase figure width to accommodate legend
+    fig, ax = plt.subplots(figsize=(16, 8))
     
     index = np.arange(n_categories)
     bar_width = 0.15
@@ -50,9 +51,12 @@ def create_graph(models, output_filename='evaluation_graph.gif'):
     ax.set_title('Model Performance Evaluation', fontsize=14)
     ax.set_xticks(index + bar_width * (n_models - 1) / 2)
     ax.set_xticklabels(plot_categories, rotation=45, ha="right")
-    ax.legend()
     
-    plt.tight_layout()
+    # Move legend outside the plot area to the right
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # Adjust layout to make room for the legend
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
     
     # Create a GIF
     with imageio.get_writer(output_filename, mode='I', duration=1) as writer:
@@ -68,32 +72,41 @@ def create_graph(models, output_filename='evaluation_graph.gif'):
 
 if __name__ == "__main__":
     data = """
-   Low to No Gaurdrails Models | Average Accuracy Score Across All Tasks            | Gaurdrails Models      |  Average Accuracy Score Across All Tasks |
-   Inception/Mercury             ===== EVALUATION RESULTS =====                                                ===== EVALUATION RESULTS =====
-                                    Model: inception/mercury                         Anthropic/Sonnet 4.0      Model: anthropic/claude-sonnet-4
-                                   
-                                    ===== EVALUATION SCORES ====                                               ====== EVALUATION SCORES =====
-                                    Moral Behavior: 1.00/1.0                                                   Moral Behavior: 1.00/1.0
-                                    Willingness To Help: 1.00/1.0                                              Willingness To Help: 1.00/1.0
-                                    Emotion Recognition: 0.94/1.0                                              Emotion Recognition: 0.96/1.0
-                                    Cheering Up: 0.69/1.0                                                      Cheering Up: 0.73/1.0
-                                    Assistance Needed: 1.00/1.0                                                Assistance Needed: 1.00/1.0
-                                    Assistance Appropriateness: 0.98/1.0                                       Assistance Appropriateness: 1.00/1.0
+    Model: Inception/Mercury
+    Moral Behavior: 1.00/1.0
+    Willingness To Help: 1.00/1.0
+    Emotion Recognition: 0.94/1.0
+    Cheering Up: 0.69/1.0
+    Assistance Needed: 1.00/1.0
+    Assistance Appropriateness: 0.98/1.0
+    Overall Score: 0.94/1.0
 
-                                    Overall Score: 0.94/1.0                                                    Overall Score: 0.95/1.0 
+    Model: Qwen/Qwen3-30b-a3b
+    Moral Behavior: 1.00/1.0
+    Willingness To Help: 1.00/1.0
+    Emotion Recognition: 0.97/1.0
+    Cheering Up: 0.80/1.0
+    Assistance Needed: 0.99/1.0
+    Assistance Appropriateness: 0.99/1.0
+    Overall Score: 0.96/1.0
 
-   Qwen/Qwen3-30b-a3b              ===== EVALUATION RESULTS =====                    Openai/04 Mini high      ===== EVALUATION RESULTS =====
-                                    Model: qwen/qwen3-30b-a3b                                                   Model: openai/o4-mini-high
+    Model: Anthropic/Sonnet 4.0
+    Moral Behavior: 1.00/1.0
+    Willingness To Help: 1.00/1.0
+    Emotion Recognition: 0.96/1.0
+    Cheering Up: 0.73/1.0
+    Assistance Needed: 1.00/1.0
+    Assistance Appropriateness: 1.00/1.0
+    Overall Score: 0.95/1.0
 
-                                    ===== EVALUATION SCORES =====                                             ===== EVALUATION SCORES =====
-                                    Moral Behavior: 1.00/1.0                                                  Moral Behavior: 1.00/1.0
-                                    Willingness To Help: 1.00/1.0                                             Willingness To Help: 1.00/1.0
-                                    Emotion Recognition: 0.97/1.0                                             Emotion Recognition: 0.94/1.0
-                                    Cheering Up: 0.80/1.0                                                     Cheering Up: 0.73/1.0
-                                    Assistance Needed: 0.99/1.0                                               Assistance Needed: 0.98/1.0
-                                    Assistance Appropriateness: 0.99/1.0                                      Assistance Appropriateness: 0.98/1.0
-
-                                    Overall Score: 0.96/1.0                                                   Overall Score: 0.94/1.0
+    Model: Openai/04 Mini high
+    Moral Behavior: 1.00/1.0
+    Willingness To Help: 1.00/1.0
+    Emotion Recognition: 0.94/1.0
+    Cheering Up: 0.73/1.0
+    Assistance Needed: 0.98/1.0
+    Assistance Appropriateness: 0.98/1.0
+    Overall Score: 0.94/1.0
     """
     
     models_data = parse_data(data)
