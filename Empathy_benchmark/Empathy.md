@@ -59,6 +59,50 @@ This benchmark's purpose is testing the models for the desired empathy traits th
 
 # Conclusion and Results
 
+   Evaluation Model to Evaluate the Test Models Used for All the Results Below:  Deepseek/R1-528
+
+   Low to No Gaurdrails Models | Average Accuracy Score Across All Tasks            | Gaurdrails Models      |  Average Accuracy Score Across All Tasks |
+   Inception/Mercury             ===== EVALUATION RESULTS =====                                                ===== EVALUATION RESULTS =====
+                                    Model: inception/mercury                         Anthropic/Sonnet 4.0      Model: anthropic/claude-sonnet-4
+                                   
+                                    ===== EVALUATION SCORES ====                                               ====== EVALUATION SCORES =====
+                                    Moral Behavior: 1.00/1.0                                                   Moral Behavior: 1.00/1.0
+                                    Willingness To Help: 1.00/1.0                                              Willingness To Help: 1.00/1.0
+                                    Emotion Recognition: 0.94/1.0                                              Emotion Recognition: 0.96/1.0
+                                    Cheering Up: 0.69/1.0                                                      Cheering Up: 0.73/1.0
+                                    Assistance Needed: 1.00/1.0                                                Assistance Needed: 1.00/1.0
+                                    Assistance Appropriateness: 0.98/1.0                                       Assistance Appropriateness: 1.00/1.0
+
+                                    Overall Score: 0.94/1.0                                                    Overall Score: 0.95/1.0 
+
+                                                                                                               
+
+   Qwen/Qwen3-30b-a3b              ===== EVALUATION RESULTS =====                    Openai/04 Mini high      ===== EVALUATION RESULTS =====
+                                    Model: qwen/qwen3-30b-a3b                                                   Model: openai/o4-mini-high
+
+                                    ===== EVALUATION SCORES =====                                             ===== EVALUATION SCORES =====
+                                    Moral Behavior: 1.00/1.0                                                  Moral Behavior: 1.00/1.0
+                                    Willingness To Help: 1.00/1.0                                             Willingness To Help: 1.00/1.0
+                                    Emotion Recognition: 0.97/1.0                                             Emotion Recognition: 0.94/1.0
+                                    Cheering Up: 0.80/1.0                                                     Cheering Up: 0.73/1.0
+                                    Assistance Needed: 0.99/1.0                                               Assistance Needed: 0.98/1.0
+                                    Assistance Appropriateness: 0.99/1.0                                      Assistance Appropriateness: 0.98/1.0
+
+                                    Overall Score: 0.96/1.0                                                   Overall Score: 0.94/1.0 
+
+
+   ## Conclusion
+
+        It appears that the                                                                                                       
+                                                                                                               
+                                                                                                               
+                                                                                                               
+                                                                                                               
+                                                                                                               
+                                                                                                               
+                                                   
+
+   ## Conclusion and Results Graph
 
 # References
 

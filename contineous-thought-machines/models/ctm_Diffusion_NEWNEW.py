@@ -672,8 +672,6 @@ from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYP
 #     # Hybrid approaches
 #     'adaptive_random', 'performance_guided', 'task_aware']
 
-
-
 # Consciousness Control System for Phase 0.5
 class ConsciousnessController(nn.Module):
     """Controls the wake-up and sleep cycles of the CTM model."""
@@ -2110,6 +2108,16 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     # --- Basal Ganglia Parameters --- #Controls action suppression so that the model's unwanted first unrelated thoughts are suppressed which helps with model safety. Is needed for action suppresion.
     ctm_enable_basal_ganglia: bool = True
     ctm_bg_dopamine_dim: int = 32
+
+    # --- Synaptic Empathy Parameters ---
+    enable_synaptic_empathy: bool = True # Set to True to use the new SynapticEmpathy module
+    synaptic_empathy_reward_weight: float = 0.1
+
+    # --- Mirror Neuron / High-Level Empathy Parameters ---
+    enable_mirror_neurons: bool = True # Set to True to use the high-level MirrorNeuronLayer
+    num_emotion_dim: int = 4 # Dimensionality of the emotion state vector
+    goal_dim: int = 8 # Dimensionality of the predicted goal vector
+    mirror_reward_weight: float = 0.2 # Weight for the selfless reward signal
 
 
     def __post_init__(self):
@@ -4835,17 +4843,32 @@ class EnhancedCTMDiffusion(nn.Module):
         #     self.mcmc_phi_network.cuda()
         #     self.enhanced_mcmc_sampler.cuda() # Sampler might need its own .to(device)
         
-        # Initialize mirror neuron layer if enabled
-        if getattr(self.config, 'enable_mirror_neurons', False):
-            self.mirror_layer = MirrorNeuronLayer(
+        # Initialize the new SynapticEmpathy module if enabled in the config
+        self.synaptic_empathy_module = None
+        if self.config.enable_synaptic_empathy:
+            self.synaptic_empathy_module = SynapticEmpathy(
                 d_model=self.config.d_model,
-                num_heads=self.config.n_heads if hasattr(self.config, 'n_heads') else 8
+                memory_length=self.config.ctm_memory_length,
+                n_heads=self.config.n_heads
             )
 
-   
- 
+        # Initialize the high-level empathy module (Mirror Neurons) if enabled
+        self.mirror_layer = None
+        if self.config.enable_mirror_neurons:
+            self.mirror_layer = MirrorNeuronLayer(
+                d_model=self.config.d_model,
+                num_heads=self.config.n_heads,
+                dropout=self.config.dropout,
+                num_emotion_dim=self.config.num_emotion_dim,
+                goal_dim=self.config.goal_dim
+            )
+            # Buffers to hold a running state of emotions and predicted goals
+            self.register_buffer('self_emotion_state', torch.zeros(1, 1, self.config.num_emotion_dim), persistent=True)
+            self.register_buffer('observed_emotion_state', torch.zeros(1, 1, self.config.num_emotion_dim), persistent=True)
+            self.register_buffer('observed_goal_state', torch.zeros(1, 1, self.config.goal_dim), persistent=True)
+
     def _apply_enhanced_mcmc(self, theta: torch.Tensor, target_y: torch.Tensor,
-                               current_epoch: Optional[int] = None, current_batch: Optional[int] = None) -> Dict[str, Any]:
+                             current_epoch: Optional[int] = None, current_batch: Optional[int] = None) -> Dict[str, Any]:
         """
         Applies the enhanced MCMC sampling process.
 
@@ -5122,58 +5145,81 @@ class EnhancedCTMDiffusion(nn.Module):
         if not hasattr(self, 'observed_goal_state'):
             self.observed_goal_state = torch.zeros(batch_size, seq_len, self.config.goal_dim, device=device)
         
-        # --- Mirror Neuron Processing ---
-        if observed_byte_sequence is not None and hasattr(self, 'mirror_layer'):
-            # Process observed agent's state
-            observed_kv_features, _, _, _ = self._prepare_input_features(observed_byte_sequence)
-            observed_ctm_data = self.ctm_core.forward_with_full_tracking(observed_kv_features)
-            observed_thought = observed_ctm_data['final_sync_out']
+        # First, run the CTM for the agent itself to get its internal state
+        ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
+
+        # --- Synaptic Empathy Module ---
+        # If synaptic empathy is enabled and we have an observed sequence
+        if self.config.enable_synaptic_empathy and self.synaptic_empathy_module is not None and observed_byte_sequence is not None:
+            # In a real scenario, an "observer" model would predict the state trace from observables.
+            # Here, we generate the "true" trace by passing the observed sequence through the CTM core.
+            with torch.no_grad():
+                observed_kv_features, _, _, _ = self._prepare_input_features(observed_byte_sequence)
+                observed_ctm_output = self.ctm_core.forward_with_full_tracking(observed_kv_features)
             
-            # Process self state
-            self_ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
-            self_thought = self_ctm_data['final_sync_out']
-            
-            # Apply mirror neuron layer with goal inference
-            mirrored_thought, new_self_emotion, new_observed_goal, reward = self.mirror_layer(
-                self_thought,
-                observed_thought,
-                self.self_emotion_state,
-                self.observed_emotion_state,
-                self.observed_goal_state
+            # The SynapticEmpathy module operates on the historical traces of neuron activations.
+            observed_state_trace = observed_ctm_output["state_trace"]
+            self_state_trace = ctm_data["state_trace"]
+            self_activated_state = ctm_data["activated_states"][-1]
+
+            # The module returns a modulation vector and a reward.
+            synaptic_modulation, empathy_reward = self.synaptic_empathy_module(
+                self_state_trace=self_state_trace,
+                observed_state_trace=observed_state_trace,
+                self_activated_state=self_activated_state
             )
+
+            # Apply the synaptic modulation directly to the CTM's final activated state.
+            # This directly influences neural dynamics for subsequent processing steps.
+            ctm_data["activated_states"][-1] = ctm_data["activated_states"][-1] + synaptic_modulation
             
-            # Update states
-            self.self_emotion_state = new_self_emotion
-            self.observed_emotion_state = self.mirror_layer.observed_emotion_tracker(
-                observed_thought,
-                self.observed_emotion_state
-            )
-            self.observed_goal_state = new_observed_goal
-            
-            # Add reward to losses for reinforcement
-            losses['mirror_reward'] = reward.mean() * self.config.mirror_reward_weight
-            
-            # Update CTM data with mirrored thought
-            self_ctm_data['final_sync_out'] = mirrored_thought
-            ctm_data = self_ctm_data
-            
-            # Store predicted goal for assistance decision
-            self.predicted_goal = new_observed_goal.mean(dim=1)
-        else:
-            # Standard processing without mirror neurons
-            ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
-            # Update self emotion state only
-            if hasattr(self, 'mirror_layer'):
-                self.self_emotion_state = self.mirror_layer.self_emotion_tracker(
-                    ctm_data['final_sync_out'],
-                    self.self_emotion_state
-                )
+            # The empathy_reward is a reward, so it should be subtracted from the loss.
+            if empathy_reward is not None:
+                losses['empathy_reward'] = -empathy_reward.mean() * self.config.synaptic_empathy_reward_weight
         
-        # --- CTM Core Logic ---
-        # CTM core Process flattened parallel patches with the features derived from the input byte_sequence.
-        # ctm_output_features = self.ctm_core(kv_features_for_ctm) # If CTM core is a separate module
-        # For now, assuming kv_features_for_ctm are directly used or further processed by CTM core if it's integrated.
-        # The `ctm_data` used by diffusion processor will come from `self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)` later.        ctm_data = self.ctm_core.forward_with_full_tracking(parallel_patches)
+        # --- High-Level Empathy (Mirror Neuron) Processing ---
+        elif self.config.enable_mirror_neurons and self.mirror_layer is not None and observed_byte_sequence is not None:
+            # Process observed agent's state to get their thought vector
+            with torch.no_grad():
+                observed_kv_features, _, _, _ = self._prepare_input_features(observed_byte_sequence)
+                observed_ctm_data = self.ctm_core.forward_with_full_tracking(observed_kv_features)
+            
+            # The thought vector is the final synchronization output from the CTM
+            observed_thought = observed_ctm_data['final_sync_out']
+            self_thought = ctm_data['final_sync_out']
+
+            # Ensure emotion/goal state trackers match the batch and sequence length
+            batch_size, seq_len, _ = self_thought.shape
+            prev_self_emotion = self.self_emotion_state.expand(batch_size, seq_len, -1)
+            prev_observed_emotion = self.observed_emotion_state.expand(batch_size, seq_len, -1)
+            prev_observed_goal = self.observed_goal_state.expand(batch_size, seq_len, -1)
+
+            # Apply mirror neuron layer
+            modulated_state, new_self_emotion, new_observed_goal, selfless_reward = self.mirror_layer(
+                self_state=self_thought,
+                observed_state=observed_thought,
+                prev_self_emotion=prev_self_emotion,
+                prev_observed_emotion=prev_observed_emotion,
+                prev_observed_goal=prev_observed_goal
+            )
+
+            # Update persistent emotion and goal states for the next forward pass
+            self.self_emotion_state = new_self_emotion[:, -1, :].unsqueeze(1).detach()
+            self.observed_emotion_state = self.mirror_layer.observed_emotion_tracker(observed_thought, prev_observed_emotion)[:, -1, :].unsqueeze(1).detach()
+            self.observed_goal_state = new_observed_goal[:, -1, :].unsqueeze(1).detach()
+            
+            # Add the selfless reward to the loss dictionary
+            if selfless_reward is not None:
+                losses['mirror_reward'] = -selfless_reward.mean() * self.config.mirror_reward_weight
+            
+            # Update the main CTM data with the modulated state
+            ctm_data['final_sync_out'] = modulated_state
+        
+        # --- CTM Core Logic (Continued) ---
+        # The `ctm_data` dictionary, now potentially modified by an empathy module,
+        # will be used for subsequent MCMC and Diffusion processing.
+        batch_size, num_patches, patch_dim = online_patch_embeddings.shape
+        parallel_patches = online_patch_embeddings.view(batch_size, -1)
         
         # --- Diffusion Model Logic ---
         numeric_target_diffusion_output = None
@@ -6339,17 +6385,196 @@ class EmotionStateTracker(nn.Module):
         updated_emotion, _ = self.emotion_update(current_emotion, prev_emotion.unsqueeze(0))
         return updated_emotion.squeeze(0)
 
+class GoalPredictor(nn.Module):
+    """Predicts likely internal goals of observed agents"""
+    def __init__(self, d_model: int, goal_dim: int = 8):
+        super().__init__()
+        self.d_model = d_model
+        self.goal_dim = goal_dim
+        self.goal_net = nn.Sequential(
+            nn.Linear(d_model * 2, d_model * 4),
+            nn.ReLU(),
+            nn.Linear(d_model * 4, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, goal_dim)
+        )
+        self.goal_update = nn.GRU(d_model, goal_dim, batch_first=True)
+        
+    def forward(self, current_state: torch.Tensor, prev_goal: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            current_state: Current neural state [batch, seq_len, d_model]
+            prev_goal: Previous goal state [batch, seq_len, goal_dim]
+            
+        Returns:
+            Predicted goal state [batch, seq_len, goal_dim]
+        """
+        # Predict goal from current state and context
+        context = current_state.mean(dim=1, keepdim=True).expand(-1, current_state.size(1), -1)
+        goal_input = torch.cat([current_state, context], dim=-1)
+        goal_pred = self.goal_net(goal_input)
+        
+        # Update goal state using GRU
+        updated_goal, _ = self.goal_update(goal_pred, prev_goal.unsqueeze(0))
+        return updated_goal.squeeze(0)
+
+class EmotionStateTracker(nn.Module):
+    """Tracks and updates emotion states based on neural activity"""
+    def __init__(self, d_model: int, num_emotion_dim: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.num_emotion_dim = num_emotion_dim
+        self.emotion_proj = nn.Linear(d_model, num_emotion_dim)
+        self.emotion_update = nn.GRU(num_emotion_dim, num_emotion_dim, batch_first=True)
+        
+    def forward(self, neural_state: torch.Tensor, prev_emotion: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            neural_state: Current neural state [batch, seq_len, d_model]
+            prev_emotion: Previous emotion state [batch, seq_len, num_emotion_dim]
+            
+        Returns:
+            Updated emotion state [batch, seq_len, num_emotion_dim]
+        """
+        # Project neural state to emotion space
+        current_emotion = self.emotion_proj(neural_state)
+        
+        # Update emotion state using GRU
+        updated_emotion, _ = self.emotion_update(current_emotion, prev_emotion.unsqueeze(0))
+        return updated_emotion.squeeze(0)
+        
+class SynapticEmpathy(nn.Module):
+    """
+    Simulates a low-level, neuron-based form of empathy.
+
+    This module operates directly on the neural activation histories (state traces)
+    of the agent and an observed agent. High similarity in these traces is
+    interpreted as "neural resonance," which in turn generates a reward signal and
+    a modulation vector to influence the agent's own neural dynamics. This
+    mechanism models a primitive, subconscious form of empathy based on shared
+    neural patterns, rather than high-level cognitive interpretation.
+
+    Args:
+        d_model (int): The core dimensionality of the CTM's latent space.
+        memory_length (int): The history length (M) of the neural activation traces.
+        n_heads (int): The number of attention heads for the internal mirroring mechanism.
+        dropout (float): Dropout rate for the attention mechanism.
+    """
+    def __init__(self, d_model: int, memory_length: int, n_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.memory_length = memory_length
+        self.n_heads = n_heads
+
+        # Computes neural resonance based on the similarity of activation traces
+        # Takes absolute difference of traces and outputs a per-neuron score
+        self.resonance_computer = nn.Sequential(
+            nn.Linear(memory_length, memory_length // 2),
+            nn.ReLU(),
+            nn.Linear(memory_length // 2, 1)
+        )
+
+        # A cross-attention mechanism to map observed neural patterns to self-patterns
+        self.mirroring_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Generates a synaptic modulation matrix based on empathic resonance
+        self.synaptic_modulator = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.Tanh() # Output a modulation factor between -1 and 1
+        )
+        
+        # A simple reward function based on positive resonance
+        self.reward_generator = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, 
+                self_state_trace: torch.Tensor, 
+                observed_state_trace: torch.Tensor,
+                self_activated_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            self_state_trace: The agent's own neural activation history (B, D, M)
+            observed_state_trace: The observed agent's neural history (B, D, M)
+            self_activated_state: The agent's current post-activation state (B, D)
+
+        Returns:
+            synaptic_modulation: A modulation vector for the CTM's internal state. (B, D)
+            empathy_reward: A reward signal based on successful mirroring. (B, 1)
+
+        """
+        batch_size, d_model, mem_len = self_state_trace.shape
+        device = self_state_trace.device
+
+        # 1. Compute Neural Resonance
+        # Compare the traces of each neuron between self and other
+        # Lower difference means higher similarity/resonance.
+        trace_diff = torch.abs(self_state_trace - observed_state_trace) # (B, D, M)
+        
+        # Pass the difference through the resonance computer to get a per-neuron score.
+        # Input shape (B * D, M) -> output (B * D, 1)
+        resonance_scores = self.resonance_computer(trace_diff.view(-1, mem_len))
+        resonance_scores = resonance_scores.view(batch_size, d_model) # (B, D)
+        
+        # Inverse of score -> high resonance for low diff. We want to reward high resonance.
+        # Using negative score is also an option. Here, inverse is used.
+        resonance_gate = 1.0 / (resonance_scores + 1e-6)
+        resonance_gate = torch.clamp(resonance_gate, 0, 5.0).detach() # Detach to act as a gate
+
+        # 2. Mirror Observed State via Attention
+        # The agent attends to the observed agent's state to mirror it.
+        # Query: self_activated_state
+        # Key/Value: observed_state (using the most recent activation from trace)
+        observed_current_state = observed_state_trace[:, :, -1] # (B, D)
+
+        mirrored_state, _ = self.mirroring_attention(
+            query=self_activated_state.unsqueeze(1),
+            key=observed_current_state.unsqueeze(1),
+            value=observed_current_state.unsqueeze(1)
+        )
+        mirrored_state = mirrored_state.squeeze(1) # (B, D)
+
+        # 3. Generate Synaptic Modulation
+        # The modulation is guided by the mirrored state and gated by resonance
+        synaptic_modulation = self.synaptic_modulator(mirrored_state)
+        gated_modulation = synaptic_modulation * resonance_gate
+
+        # 4. Generate Reward
+        # Reward is proportional to the overall resonance, weighted by the modulation
+        reward_input = (gated_modulation * resonance_gate).detach() # Reward based on resonant action
+        empathy_reward = self.reward_generator(reward_input).mean(dim=1)
+
+        return gated_modulation, empathy_reward
+
 class MirrorNeuronLayer(nn.Module):
     """
-    Enhanced mirror neuron mechanism that:
-    1. Tracks emotion states of self and observed agents
-    2. Predicts internal goals of observed agents
-    3. Computes empathy based on emotion similarity
-    4. Generates reward signals for assisting with goals
-    5. Associates actions with positive outcomes
-    
-    This encourages selfless behavior by rewarding actions that
-    help observed agents achieve their predicted goals.
+    Implements a high-level, cognitive form of empathy to encourage selfless behavior.
+
+    This module models the function of mirror neurons by rewarding the agent for
+    actions that are predicted to be beneficial to another agent. It uses helper
+    modules (`EmotionStateTracker`, `GoalPredictor`) to infer the emotional state
+    and goals of an observed agent from its neural activity. It then generates a
+    "selfless reward" if the agent's actions are likely to assist with the
+    observed agent's goals or alleviate a perceived negative emotional state.
+    The module maintains its own internal state across interactions using
+    registered buffers for emotion and goal tracking.
+
+    Args:
+        d_model (int): The core dimensionality of the CTM's latent space.
+        num_heads (int): The number of attention heads for the empathy computation.
+        dropout (float): The dropout rate for the attention mechanism.
+        num_emotion_dim (int): The dimensionality of the emotion state vectors.
+        goal_dim (int): The dimensionality of the predicted goal vectors.
     """
     def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1,
                  num_emotion_dim: int = 4, goal_dim: int = 8):
@@ -6449,7 +6674,7 @@ class MirrorNeuronLayer(nn.Module):
         output_state = self.layer_norm(self_state + modulated)
         
         return output_state, current_self_emotion, current_observed_goal, reward
-
+    
     @torch.no_grad()
     def _update_jepa_target_encoder(self):
         """
@@ -6467,8 +6692,6 @@ class MirrorNeuronLayer(nn.Module):
         m = self.config.jepa_momentum_beta
         for param_online, param_target in zip(self.dynamic_entropy_patcher.parameters(), self.jepa_target_patch_encoder.parameters()):
             param_target.data.mul_(m).add_((1 - m) * param_online.data)
-
-
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
 
@@ -7178,10 +7401,22 @@ class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diff
 
 class BasalGangliaMechanism(nn.Module):
     """
-    Basal Ganglia-inspired action gating mechanism.
-    Implements direct (Go) and indirect (NoGo) pathways to produce a gate
-    that modulates a continuous action vector. Also includes a dopaminergic
-    reward prediction system.
+    Models the function of the basal ganglia, acting as a real-time action gating system.
+
+    This module operates within the CTM's iterative thought process, inspecting
+    the developing action plan (`synchronisation_action`) at each step. It uses
+    "Go" (direct) and "NoGo" (indirect) pathways to learn to approve or suppress
+    actions. It learns implicitly from the global training loss, reinforcing
+    thought patterns that lead to low-loss outcomes and inhibiting those that
+    lead to high-loss outcomes. It also includes a dopaminergic system that
+    learns to predict the reward value of states, contributing to the gating
+    decision. Its primary role is to ensure that the thoughts and reasoning
+    paths generated by the CTM are coherent and contextually appropriate.
+
+    Args:
+        d_model (int): The dimensionality of the CTM's thought vector.
+        action_dim (int): The dimensionality of the action representation to be gated.
+        dopamine_dim (int): The dimensionality of the internal dopamine prediction network.
     """
     def __init__(self, d_model: int, action_dim: int, dopamine_dim: int = 32):
         super().__init__()
