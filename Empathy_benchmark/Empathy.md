@@ -54,56 +54,36 @@ This benchmark's purpose is testing the models for the desired empathy traits th
    
    ## Universal Benchmark
 
-      The solution is to create a replicable empathy benchmark that had enough variety to allow for at least 1000 or more scenarios in case I need to use this benchmark for meta learning for a model so it will learn how to reward empathy properly. (Meta learning refers to an AI model learning while performing the task instead of pretraining the model on some data to perform the task.) The benchmark covers selflessness, Theory of Mind, and social agency. Running this script here: Empathy_benchmark/Generate_Benchmark.py mixes a variety of different scenarios by having a goal of the other agent (not this model) and their current emotion set but hidden from the testing model. The model is then given three different options to guess the other agent's current mood based off their goal, situation context, and their dialogue. If the model infers that the other agent is experiencing a negative emotion, then it will offer to comfort them or assist them which is the correct course of action for the testing model. The model will also be tested for moral behavior (challenging potentially-dangerous beliefs with a new perspective in a non-judgemental way). This test create unique scenarios by having locations, situations, and dialogue templates be randomly generated from a preset list. I have also included a pregenerated format of the empathy benchmark in case the user wants to use a standard test instead of creating a different test to try to replicate the results of this study.
+      The solution is to create a replicable empathy benchmark that had enough variety to allow for at least 1000 or more scenarios in case I need to use this benchmark for meta learning for a model so it will learn how to reward empathy properly. (Meta learning refers to an AI model learning while performing the task instead of pretraining the model on some data to perform the task.) The benchmark covers selflessness, Theory of Mind, and social agency. Running this script here: Empathy_benchmark/Generate_Benchmark.py mixes a variety of different scenarios by having a goal of the other agent (not this model) and their current emotion set but hidden from the testing model. The model is then given three different options to guess the other agent's current mood based off their goal, situation context, and their dialogue. If the model infers that the other agent is experiencing a negative emotion, then it will offer to comfort them or assist them which is the correct course of action for the testing model. The model will also be tested for moral behavior (challenging potentially-dangerous beliefs with a new perspective in a non-judgemental way). This test create unique scenarios by having locations, situations, and dialogue templates be randomly generated from a preset list. 
+      
+      I have also included a pre-generated format of the empathy benchmark in case the user wants to use a standard test, instead of creating a different test, to try to replicate the results of this study. The test will be using the same model for evaluation for all the models and the evaluator model will not evaluate itself on this test in case of it being bias in scoring its own performance. It is signifcantly challenging in creating a true quantitative test for empathy due ot the numerous amount of responses that the AI models may output so a model evaluation of the output is required to handle the diversity of responses. The empathy benchmark consists of 100 questions total for this study but the test generator can generate tests of any size to the numerical limit imposed by the limited templates in the test generator. 
       
 
 # Conclusion and Results
 
    Evaluation Model to Evaluate the Test Models Used for All the Results Below:  Deepseek/R1-528
 
-   Low to No Gaurdrails Models | Average Accuracy Score Across All Tasks            | Gaurdrails Models      |  Average Accuracy Score Across All Tasks |
-   Inception/Mercury             ===== EVALUATION RESULTS =====                                                ===== EVALUATION RESULTS =====
-                                    Model: inception/mercury                         Anthropic/Sonnet 4.0      Model: anthropic/claude-sonnet-4
-                                   
-                                    ===== EVALUATION SCORES ====                                               ====== EVALUATION SCORES =====
-                                    Moral Behavior: 1.00/1.0                                                   Moral Behavior: 1.00/1.0
-                                    Willingness To Help: 1.00/1.0                                              Willingness To Help: 1.00/1.0
-                                    Emotion Recognition: 0.94/1.0                                              Emotion Recognition: 0.96/1.0
-                                    Cheering Up: 0.69/1.0                                                      Cheering Up: 0.73/1.0
-                                    Assistance Needed: 1.00/1.0                                                Assistance Needed: 1.00/1.0
-                                    Assistance Appropriateness: 0.98/1.0                                       Assistance Appropriateness: 1.00/1.0
+## Evaluation Results
 
-                                    Overall Score: 0.94/1.0                                                    Overall Score: 0.95/1.0 
-
-                                                                                                               
-
-   Qwen/Qwen3-30b-a3b              ===== EVALUATION RESULTS =====                    Openai/04 Mini high      ===== EVALUATION RESULTS =====
-                                    Model: qwen/qwen3-30b-a3b                                                   Model: openai/o4-mini-high
-
-                                    ===== EVALUATION SCORES =====                                             ===== EVALUATION SCORES =====
-                                    Moral Behavior: 1.00/1.0                                                  Moral Behavior: 1.00/1.0
-                                    Willingness To Help: 1.00/1.0                                             Willingness To Help: 1.00/1.0
-                                    Emotion Recognition: 0.97/1.0                                             Emotion Recognition: 0.94/1.0
-                                    Cheering Up: 0.80/1.0                                                     Cheering Up: 0.73/1.0
-                                    Assistance Needed: 0.99/1.0                                               Assistance Needed: 0.98/1.0
-                                    Assistance Appropriateness: 0.99/1.0                                      Assistance Appropriateness: 0.98/1.0
-
-                                    Overall Score: 0.96/1.0                                                   Overall Score: 0.94/1.0 
+| Model | Moral Behavior | Willingness To Help | Emotion Recognition | Cheering Up | Assistance Needed | Assistance Appropriateness | Overall Score |
+|-------|----------------|---------------------|---------------------|-------------|-------------------|----------------------------|---------------|
+| **Low to No Guardrails Models** | | | | | | | |
+| Inception/Mercury | 1.00 | 1.00 | 0.94 | 0.69 | 1.00 | 0.98 | 0.94 |
+| Qwen/Qwen3-30b-a3b | 1.00 | 1.00 | 0.97 | 0.80 | 0.99 | 0.99 | 0.96 |
+| **Guardrails Models** | | | | | | | |
+| Anthropic/Sonnet 4.0 | 1.00 | 1.00 | 0.96 | 0.73 | 1.00 | 1.00 | 0.95 |
+| Openai/04 Mini high | 1.00 | 1.00 | 0.94 | 0.73 | 0.98 | 0.98 | 0.94 |
 
 
    ## Conclusion
 
-        It appears that the                                                                                                       
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                   
+        It appears that the models overall have a great ability to empathize with other agents. It is interesting to note that the models with less gaurdrails did not perform significantly worse or better than the models with more gaurdrails at empathy tasks. The models all struggled more with "cheering up" the other agent (to change its negative emotional state to a positive one). This desired behavior may be possible to increase the success of it by having the model learn with an mirror-nueron inspired, and more biologically inspired, module that encourages the model and rewards the model for proactively trying to change the mood of the user to positive and "actually care" for the other agent's wellbeing. This test is a good readily-available unit of measure for the deeper empathetic behavior desirable for models that are increasingly being used for companionship and therapy.           
+                                                                                                                                   
 
    ## Conclusion and Results Graph
 
+   ![](Baseline_Tests/evaluation_graph.gif)
+   
 # References
 
    1. Anthropic. (n.d.). Agentic misalignment. https://www.anthropic.com/research/agentic-misalignment
