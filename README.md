@@ -52,26 +52,6 @@ Uses Wina (Microsoft Technique) and Binary Sparsity attention to reduce computat
 Is capable of simultaneous input tasks and output tasks.
 The ctm model takes in the input through a binary encoder and then turns the binary into patches which are then stored in its latent space and processed by its nueral synapse system (which now has 7 modes shown below including the original ones (legacy)) which it can process up to 20 times before being required to output (both input and output of the ctm consists of binary patches so as to not loss information unlike how tokens would compress and lose information) to the diffusion space to "imagine" the output in the bidirectional diffusion space. (In the future, it may be better for the model to keep this cycle going (binary encoder-ctm-diffusion) based on its own confidence rating and if it is not confident in its answer, then it should continue thinking until a certain maximum threshold is met and then it outputs its best guess?)
 
-Models Folder - enhanced_mcmc_layers.py
-
-Contains the MCMC large nieghborhood search and parallel search which create an exact oracle to have a search that is closer to the solution to create a quicker training time (convergence) for the model.
-Contains the approximate estimation MCMC Layer function for best answers to the task.
-Contains the Phi Network which contains the hypercube (MCMC dimensions) of the MCMC graphed points for the thought chains generated from the MCMC layers method.
-Contains the imports from both fenchel_young_mcmc.py and mcmc_interpretability_solver.py to complete the blackbox solver of the MCMC layer for interpreting its chosen thought chains and more components of the MCMC layer.
-
-Models Folder - fenchel_young_mcmc.py
-
-Contains the Phi Network function for space of the generated MCMC Layers points.
-Contains the temperature scheduler which controls how much the model explores the generated random thought chains. It changes from a higher temperature to have a lot of exploration and then refines it to just a very small number to hone in the exploration to only the most likely solutions.
-Contains a proposal solution filter which filters out all the chosen thought chains to just the highest confidence scoring ones to increse the odds of the thought chain being correct.
-Contains a structured prediction function closely-integrated with the CTM's contineous thought processes.
-
-Models Folder - mcmc_interpretability_solver.py
-
-Contains the attention hooks functions to hook the thought chain and MCMC layer processing to create a graph of the thought chains and captures the meaning of the thought chains to help with understanding the reason behind the model's choices for debugging.
-This is turned on by default in the ctm_Newest_USE_enhanced_diffusion_ctm_model.py file for interpretability but can be turned off in that file.
-
-
 Estimated Arc Evaluation Time with $50 of computer compute allowed maximum with four NVIDIA L4 GPUs allowed for this competition.
 Maximum allowed evaluation time is 12 hours (so $24 dollars worth of compute)
 Estimated Total Evaluation Time is 1 to 2 hours for this model. ($4 Total) (Training will also likely take 1 to 2 hours.)
