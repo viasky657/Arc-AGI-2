@@ -327,8 +327,6 @@ class TopDownAttention(nn.Module):
         
         return attn_output
     
-
-
 class WINAAttention(nn.Module):
     """
     Multi-head attention with WINA sparse activation.
@@ -640,17 +638,6 @@ class SubquadraticAttention(nn.Module):
                 
         return context, returned_attn_weights
 
-# MCMC Imports
-from .fenchel_young_mcmc import (
-    MCMCConfig, DiscreteOutputSpace, BinaryHypercube, TopKPolytope,
-    TemperatureScheduler
-)
-from .enhanced_mcmc_layers import (
-    ExactOptimizationOracle, CorrectionRatioMCMC, LargeNeighborhoodSearchMCMC
-)
-from .mcmc_interpretability_solver import (
-    BlackBoxSolver # MCMCInterpretabilityHook, ReasoningChain, ThoughtStep # Not directly used in CTM class
-)
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
 # Import original CTM modules to preserve exact behavior
@@ -876,7 +863,7 @@ class PipelineParallelProcessor(nn.Module):
     def __init__(self, config: 'EnhancedCTMConfig'):
         super().__init__()
         self.config = config
-        self.pipeline_stages = 4  # CTM, MCMC, Diffusion prep, Diffusion exec
+        self.pipeline_stages = 3  # CTM, Diffusion prep, Diffusion exec
         self.overlap_enabled = True
         
         # Pipeline stage queues
@@ -913,15 +900,12 @@ class PipelineParallelProcessor(nn.Module):
         # Wait for CTM completion
         ctm_results = ctm_future.result()
         
-        # Stage 3: MCMC processing (depends on CTM)
-        mcmc_future = self.executor.submit(self._mcmc_stage, ctm_results)
-        
         # Wait for diffusion prep
         diff_prep_results = diff_prep_future.result()
         
-        # Wait for MCMC completion
-        mcmc_results = mcmc_future.result()
-        
+        # MCMC results are no longer used
+        mcmc_results = None
+
         # Stage 4: Final diffusion execution
         final_guidance = self._merge_guidance(guidance_data, ctm_results, mcmc_results)
         diffusion_output = diffusion_processor(diff_prep_results['noisy_input'],
@@ -930,7 +914,7 @@ class PipelineParallelProcessor(nn.Module):
         
         return {
             'ctm_results': ctm_results,
-            'mcmc_results': mcmc_results,
+            'mcmc_results': None,
             'diffusion_output': diffusion_output,
             'pipeline_efficiency': self._calculate_efficiency()
         }
@@ -951,17 +935,11 @@ class PipelineParallelProcessor(nn.Module):
             'timestep_embeddings': timestep_embeddings
         }
     
-    def _mcmc_stage(self, ctm_results):
-        """MCMC processing stage."""
-        # Placeholder for MCMC processing
-        return {'mcmc_refined': ctm_results.get('final_sync_out')}
-    
     def _merge_guidance(self, base_guidance, ctm_results, mcmc_results):
         """Merge guidance from different pipeline stages."""
         merged_guidance = base_guidance.copy() if base_guidance else {}
         merged_guidance.update(ctm_results)
-        if mcmc_results:
-            merged_guidance.update(mcmc_results)
+        # MCMC results are no longer merged
         return merged_guidance
     
     def _embed_timesteps(self, timesteps):
@@ -975,15 +953,13 @@ class PipelineParallelProcessor(nn.Module):
     def _sequential_forward(self, ctm_core, diffusion_processor, inputs, timesteps, guidance_data):
         """Fallback sequential processing."""
         ctm_results = ctm_core.forward_with_full_tracking(inputs)
-        mcmc_results = self._mcmc_stage(ctm_results)
-        
         noisy_input = inputs + torch.randn_like(inputs) * 0.1
-        final_guidance = self._merge_guidance(guidance_data, ctm_results, mcmc_results)
+        final_guidance = self._merge_guidance(guidance_data, ctm_results, None)
         diffusion_output = diffusion_processor(noisy_input, timesteps, final_guidance)
         
         return {
             'ctm_results': ctm_results,
-            'mcmc_results': mcmc_results,
+            'mcmc_results': None,
             'diffusion_output': diffusion_output,
             'pipeline_efficiency': {'overlap_ratio': 0.0, 'speedup_factor': 1.0}
         }
@@ -2018,6 +1994,11 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     adaptive_depth: bool = False   # Defaulting to False, can be enabled if implemented
     use_activity_plasticity: bool = True # To enable/disable plasticity updates; Needs to be set to TRUE
     ctm_use_internal_feedback: bool = True # Enable self-modulating feedback within the CTM core
+
+    # --- Bidirectional Reasoning Parameters ---
+    enable_bidirectional_reasoning: bool = True # Allows CTM to move forward/backward in its thought process
+    reasoning_step_gating_threshold: float = 0.7 # Confidence threshold for the reasoning controller to terminate
+    max_reasoning_steps: int = 15 # Max total steps in a bidirectional reasoning loop to prevent infinite loops
     
     # Sparse Attention Parameters
     sparse_attention_ratio: float = 0.1  # Keep only 10% of attention connections
@@ -2038,9 +2019,14 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     reshape_patch_sequence_to_grid: bool = True # If True, reshape patch sequence to a 2D grid for 2D PEs. Must set to true if using 2D Grid for Positional Embeddings.
     patch_grid_width: Optional[int] = None       # Desired width of the patch grid if reshaping
 
+    # --- Hierarchical Reasoning Model (HRM) Parameters ---
+    use_hrm_core: bool = False # Set to True to use the HierarchicalCTM core
+    hrm_high_level_cycles: int = 4 # N: Number of high-level cycles
+    hrm_low_level_timesteps: int = 8 # T: Number of low-level timesteps per high-level cycle
+
     # Pipeline Parallelism Parameters
     enable_pipeline_parallelism: bool = True
-    pipeline_stages: int = 4  # CTM, MCMC, Diffusion prep, Diffusion exec
+    pipeline_stages: int = 3  # CTM, Diffusion prep, Diffusion exec
     pipeline_overlap_ratio: float = 0.7  # Target overlap ratio
     
     # Adaptive Batch Sizing Parameters
@@ -2104,6 +2090,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     global_plasticity_loss_weight: float = 0.05
     local_neuron_selector_loss_weight: float = 0.1
     target_hebbian_pattern: float = 0.0 # Target for the aggregated Hebbian signal
+    local_hebbian_loss_weight: float = 0.01 # New weight for backprop-based hebbian loss
 
     # --- Basal Ganglia Parameters --- #Controls action suppression so that the model's unwanted first unrelated thoughts are suppressed which helps with model safety. Is needed for action suppresion.
     ctm_enable_basal_ganglia: bool = True
@@ -2130,8 +2117,6 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             pass
         if hasattr(self, 'ctm_dropout_nlm') and self.ctm_dropout_nlm is None and hasattr(self, 'ctm_dropout'):
             self.ctm_dropout_nlm = self.ctm_dropout
-        if hasattr(self, 'mcmc_output_space_dim') and self.mcmc_output_space_dim is None and hasattr(self, 'ctm_out_dims'):
-            self.mcmc_output_space_dim = self.ctm_out_dims
         
         if hasattr(self, 'ctm_neuron_select_type') and \
            VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
@@ -2331,9 +2316,8 @@ class OriginalCTMCore(nn.Module):
         # --- Activity-Dependent Plasticity Parameters ---
         self.use_activity_plasticity = getattr(config, 'use_activity_plasticity', True)
         self.plasticity_learning_rate = getattr(config, 'ctm_plasticity_learning_rate', 1e-4)
-        if self.use_activity_plasticity:
-            self.plastic_synapses = nn.Linear(self.d_model, self.d_model, bias=False)
-            nn.init.zeros_(self.plastic_synapses.weight) # Start with no plastic influence
+        self.plastic_synapses = nn.Linear(self.d_model, self.d_model, bias=False)
+        nn.init.zeros_(self.plastic_synapses.weight) # Start with no plastic influence
         
         self.register_buffer('last_state_trace', torch.zeros((1, self.d_model, self.memory_length)), persistent=False)
 
@@ -2424,6 +2408,14 @@ class OriginalCTMCore(nn.Module):
             )
         else:
             self.internal_feedback_module = None
+
+        # --- Bidirectional Reasoning Controller ---
+        self.enable_bidirectional_reasoning = getattr(config, 'enable_bidirectional_reasoning', False)
+        if self.enable_bidirectional_reasoning:
+            self.reasoning_controller = BidirectionalReasoningController(
+                d_model=self.d_model,
+                sync_dim=self.synch_representation_size_out # Use output sync for reasoning control
+            )
 
         self.use_basal_ganglia = getattr(config, 'ctm_enable_basal_ganglia', True)
         if self.use_basal_ganglia and self.synch_representation_size_action > 0:
@@ -2856,145 +2848,6 @@ class OriginalCTMCore(nn.Module):
             
         return total_pc_loss
 
-    def apply_activity_plasticity(self, diffusion_loss: torch.Tensor, ce_loss: torch.Tensor, mcmc_loss: torch.Tensor, learning_rate_gradient: float = 1e-4):
-        """
-        Updates all weights within the CTM core using a combination of global gradient plasticity
-        and local Hebbian updates. This method acts as the sole optimizer for the CTM core,
-        bypassing the standard torch optimizer to prevent inplace modification errors.
-        """
-        if not self.use_activity_plasticity or not self.training:
-            return
-
-        with torch.no_grad():
-            # 1. Global Gradient Plasticity: Update all parameters using their gradients
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    # Apply gradient-based update directly to the data tensor
-                    param.data.add_(param.grad, alpha=-learning_rate_gradient)
-
-            # 2. Local Hebbian Plasticity for 'plastic_synapses'
-            # This provides a more specific, biologically-inspired update rule for these synapses,
-            # which is modulated by the overall success (global_loss).
-            # --- Enhanced Stability: Clamp individual losses to prevent extreme values ---
-            clamped_diffusion_loss = torch.clamp(diffusion_loss, -5.0, 5.0)
-            clamped_ce_loss = torch.clamp(ce_loss, -5.0, 5.0)
-            clamped_mcmc_loss = torch.clamp(mcmc_loss.detach(), -5.0, 5.0)
-            
-            plasticity_loss = clamped_diffusion_loss - clamped_ce_loss - clamped_mcmc_loss
-            # Use tanh for smoother, bounded learning signal instead of hard clamp
-            learning_signal = torch.tanh(plasticity_loss / 2.0)  # Normalize by 2.0 for gentler scaling
-            
-            if torch.isnan(learning_signal) or torch.isinf(learning_signal):
-                print(f"[Plasticity Warning] Learning signal is NaN or Inf. Skipping Hebbian update for this step.")
-                return
-
-            # --- DEBUGGING: Log the learning signal to monitor for volatility ---
-            print(f"[Plasticity] Learning Signal (from neg-loss): {learning_signal.item():.4f}")
-            state_trace = self.last_state_trace
-
-            if state_trace is not None and state_trace.numel() > 0 and hasattr(self, 'plastic_synapses'):
-                # The existing Hebbian logic is sound, we just ensure it operates on .data
-                eligible_indices = torch.unique(torch.cat([
-                    self.action_neuron_indices_left, self.action_neuron_indices_right,
-                    self.out_neuron_indices_left, self.out_neuron_indices_right
-                ]))
-                eligible_traces = state_trace[:, eligible_indices, :]
-                
-                modulation_scores = torch.ones(len(eligible_indices), device=state_trace.device)
-                if self.biological_selector is not None and self.neuron_select_type.startswith('bio_'):
-                    selector_activations = eligible_traces.mean(dim=-1)
-                    _, metadata = self.biological_selector.select_neurons(
-                        activations=selector_activations.mean(dim=0).unsqueeze(0),
-                        top_k=len(eligible_indices), layer_name="plasticity_update"
-                    )
-                    sel_type = self.neuron_select_type.replace('bio_', '')
-                    score_key_map = {
-                        'hebbian': 'hebbian_scores', 'plasticity': 'plasticity_scores', 'competitive': 'competition_scores',
-                        'homeostatic': 'homeostatic_scores', 'evolutionary': 'fitness_scores', 'stdp': 'stdp_scores',
-                        'criticality': 'criticality_scores', 'multi_objective': 'combined_scores',
-                    }
-                    score_key = score_key_map.get(sel_type)
-                    if score_key and score_key in metadata:
-                        scores = metadata[score_key].detach()
-                        scores = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
-                        modulation_scores = scores
-
-                st_batch_mean = eligible_traces.mean(dim=0)
-                st_centered = st_batch_mean - st_batch_mean.mean(dim=1, keepdim=True)
-                
-                # More stable correlation calculation
-                stds = torch.std(st_centered, dim=1, keepdim=True)
-                stds.clamp_min_(1e-6) # Prevent division by zero or very small numbers
-                st_normalized = st_centered / stds
-                
-                memory_len = st_normalized.shape[1]
-                # Divisor is memory_len - 1 for sample correlation
-                divisor = memory_len - 1 if memory_len > 1 else 1
-                
-                local_hebbian_trace = torch.matmul(st_normalized, st_normalized.T) / divisor
-                
-                # Final clamping and handling of any residual NaNs/Infs
-                local_hebbian_trace = torch.nan_to_num(local_hebbian_trace, nan=0.0)
-                local_hebbian_trace = torch.clamp(local_hebbian_trace, -1.0, 1.0)
-                
-                modulation_matrix = torch.outer(modulation_scores, modulation_scores)
-                modulated_hebbian_trace = local_hebbian_trace * modulation_matrix
-
-                delta_W = torch.zeros_like(self.plastic_synapses.weight)
-                update_values = self.plasticity_learning_rate * modulated_hebbian_trace * learning_signal
-                
-                row_indices, col_indices = torch.meshgrid(eligible_indices, eligible_indices, indexing='ij')
-                delta_W[row_indices, col_indices] = update_values
-
-                # Apply the Hebbian update directly to the data tensor
-                self.plastic_synapses.weight.data.add_(delta_W)
-
-            # 3. CRITICAL STEP: Zero out gradients for the CTM core after use.
-            # This prevents the external optimizer from trying to apply updates again,
-            # which would cause the inplace modification error.
-            for param in self.parameters():
-                param.grad = None
-
-    def get_local_hebbian_signal(self, state_trace: torch.Tensor) -> torch.Tensor:
-        """
-        Computes the local Hebbian signal (correlation matrix) from a state trace.
-        Mirrors the logic from apply_activity_plasticity.
-        """
-        if not self.use_activity_plasticity:
-            return torch.tensor(0.0, device=self.start_activated_state.device)
-
-        eligible_indices = torch.unique(torch.cat([
-            self.action_neuron_indices_left, self.action_neuron_indices_right,
-            self.out_neuron_indices_left, self.out_neuron_indices_right
-        ]))
-        eligible_traces = state_trace[:, eligible_indices, :]
-        
-        st_batch_mean = eligible_traces.mean(dim=0)
-        st_centered = st_batch_mean - st_batch_mean.mean(dim=1, keepdim=True)
-        
-        stds = torch.std(st_centered, dim=1, keepdim=True)
-        stds.clamp_min_(1e-6)
-        st_normalized = st_centered / stds
-        
-        memory_len = st_normalized.shape[1]
-        divisor = memory_len - 1 if memory_len > 1 else 1
-        
-        local_hebbian_trace = torch.matmul(st_normalized, st_normalized.T) / divisor
-        local_hebbian_trace = torch.nan_to_num(local_hebbian_trace, nan=0.0)
-        local_hebbian_trace = torch.clamp(local_hebbian_trace, -1.0, 1.0)
-        
-        return local_hebbian_trace
-
-    def get_local_neuron_selector_loss(self) -> torch.Tensor:
-        """
-        Computes the loss from the neuron selector.
-        This is a placeholder for a more complex implementation where the selector
-        might have its own loss function (e.g., to encourage sparsity or diversity).
-        """
-        if self.biological_selector and hasattr(self.biological_selector, 'compute_loss'):
-             # Assuming the selector has a compute_loss method
-            return self.biological_selector.compute_loss()
-        return torch.tensor(0.0, device=self.start_activated_state.device)
 
     def forward_with_full_tracking(self, kv_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -3013,136 +2866,107 @@ class OriginalCTMCore(nn.Module):
         B = kv_features.size(0)
         device = kv_features.device
         
-        # Initialize tracking
+        # Initialize tracking dictionaries and lists
         tracking_data = {
-            'sync_out_history': [],
-            'sync_action_history': [],
-            'activated_states': [],
-            'state_traces': [],
-            'attention_weights': [],
-            'pc_losses': [],
-            'dopamine_errors': []
+            'sync_out_history': [], 'sync_action_history': [], 'activated_states': [], 'state_traces': [],
+            'attention_weights': [], 'pc_losses': [], 'dopamine_errors': [], 'plastic_adjustments': []
         }
-        
+        full_state_history = []
+
         # Initialize recurrent state
         state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1)
         activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1)
         
-        # Storage for outputs
-        predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
-        certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
-        
         # Initialize synch values
         decay_alpha_action, decay_beta_action = None, None
         decay_alpha_out, decay_beta_out = None, None
-        
-        # Clamp decay parameters
-        if hasattr(self, 'decay_params_action'):
-            self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
-        self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
-        
-        # Compute learned weighting
-        r_action = (torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1) 
-                   if hasattr(self, 'decay_params_action') else None)
+        r_action = (torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1) if hasattr(self, 'decay_params_action') else None)
         r_out = torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
-        
-        # Initialize output synchronization
-        _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
-            activated_state, None, None, r_out, synch_type='out'
-        )
-        
-        # Recurrent loop with full tracking
-        for stepi in range(self.iterations):
-            
-            # Calculate synchronisation for input data interaction
-            if hasattr(self, 'decay_params_action'):
-                synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
-                    activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action'
-                )
 
-                # --- Basal Ganglia Gating ---
-                if self.basal_ganglia is not None:
-                    action_gate, dopamine_error = self.basal_ganglia(
-                        thought_vector=activated_state,
-                        context=activated_state,
-                        reward_signal=None
-                    )
+        # Initial loop parameters
+        step_pointer = 0
+        total_steps_taken = 0
+        max_steps = self.config.max_reasoning_steps if self.enable_bidirectional_reasoning else self.iterations
+
+        # --- DYNAMIC BIDIRECTIONAL REASONING LOOP ---
+        while total_steps_taken < max_steps:
+            # Store the current state before processing the step
+            full_state_history.append({
+                'state_trace': state_trace, 'activated_state': activated_state, 'decay_alpha_action': decay_alpha_action,
+                'decay_beta_action': decay_beta_action, 'decay_alpha_out': decay_alpha_out, 'decay_beta_out': decay_beta_out
+            })
+
+            # --- Main CTM Step Logic ---
+            if r_action is not None:
+                synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, 'action')
+                if self.basal_ganglia:
+                    action_gate, dopamine_error = self.basal_ganglia(activated_state, activated_state, None)
                     synchronisation_action = synchronisation_action * action_gate
                     tracking_data['dopamine_errors'].append(dopamine_error)
-
                 tracking_data['sync_action_history'].append(synchronisation_action.clone())
-                
-                # Interact with data via attention
-                if self.q_proj is not None and self.attention is not None:
+                if self.attention:
                     q = self.q_proj(synchronisation_action).unsqueeze(1)
-                    attn_out, attn_weights = self.attention(q, kv_features, kv_features, 
-                                                           average_attn_weights=False, need_weights=True)
-                    attn_out = attn_out.squeeze(1)
-                    pre_synapse_input = torch.cat((attn_out, activated_state), dim=-1)
+                    attn_out, attn_weights = self.attention(q, kv_features, kv_features, average_attn_weights=False, need_weights=True)
+                    pre_synapse_input = torch.cat((attn_out.squeeze(1), activated_state), dim=-1)
                     tracking_data['attention_weights'].append(attn_weights.clone())
                 else:
                     pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
             else:
-                if self.q_proj is not None and self.attention is not None:
-                    q = activated_state.unsqueeze(1)
-                    attn_out, attn_weights = self.attention(q, kv_features, kv_features,
-                                                           average_attn_weights=False, need_weights=True)
-                    attn_out = attn_out.squeeze(1)
-                    pre_synapse_input = torch.cat((attn_out, activated_state), dim=-1)
-                    tracking_data['attention_weights'].append(attn_weights.clone())
-                else:
-                    pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
-            
+                 pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
 
-            # Apply synapses
             state = self.synapses(pre_synapse_input)
-
-            # --- Apply Activity-Dependent Plasticity ---
             if self.use_activity_plasticity:
                 plastic_adjustment = self.plastic_synapses(activated_state)
                 state = state + plastic_adjustment
-            
-            # Update state trace
+                tracking_data['plastic_adjustments'].append(plastic_adjustment.clone())
+
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
-            tracking_data['state_traces'].append(state_trace.clone())
-            
-            # Apply neuron-level models
             activated_state = self.trace_processor(state_trace)
-
-            # --- Apply Internal CTM Feedback (Self-Modulation) ---
-            if self.use_internal_feedback and self.internal_feedback_module is not None:
-                feedback_signal = self.internal_feedback_module(
-                    diffusion_state=activated_state.unsqueeze(1),
-                    ctm_thought_vector=activated_state
-                )
-                activated_state = activated_state + feedback_signal.squeeze(1)
-
-            tracking_data['activated_states'].append(activated_state.clone())
-
-            # --- Predictive Coding Loss ---
+            if self.use_internal_feedback:
+                feedback = self.internal_feedback_module(activated_state.unsqueeze(1), activated_state)
+                activated_state = activated_state + feedback.squeeze(1)
+            
             if self.use_predictive_coding:
-                pc_loss = self.compute_predictive_coding_loss(activated_state)
-                tracking_data['pc_losses'].append(pc_loss)
+                tracking_data['pc_losses'].append(self.compute_predictive_coding_loss(activated_state))
             
-            # Calculate synchronisation for output predictions
-            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
-                activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out'
-            )
-            tracking_data['sync_out_history'].append(synchronisation_out.clone())
+            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, 'out')
             
-            # Get predictions and certainties
-            current_prediction = self.output_projector(synchronisation_out)
-            current_certainty = self.compute_certainty(current_prediction)
-            
-            predictions[..., stepi] = current_prediction
-            certainties[..., stepi] = current_certainty
-        
-        # Store final state trace for plasticity update
-        self.last_state_trace = state_trace.detach()
+            # --- Reasoning Control ---
+            if self.enable_bidirectional_reasoning:
+                step_delta, term_prob = self.reasoning_controller(activated_state, synchronisation_out)
+                
+                # Check for termination
+                if (term_prob > self.config.reasoning_step_gating_threshold).all():
+                    break
+                
+                # Update step pointer
+                step_pointer = step_pointer + int(step_delta.mean().item())
+                step_pointer = max(0, min(step_pointer, len(full_state_history) - 1)) # Clamp pointer
 
-        # --- Compute Hebbian and Neuron Selector Signals/Losses for this pass ---
-        local_hebbian_signal = self.get_local_hebbian_signal(state_trace.detach())
-        local_neuron_selector_loss = self.get_local_neuron_selector_loss()
+                # If moving backward, restore state from history
+                if step_delta.mean().item() < 0:
+                    restored_state = full_state_history[step_pointer]
+                    state_trace, activated_state = restored_state['state_trace'], restored_state['activated_state']
+                    decay_alpha_action, decay_beta_action = restored_state['decay_alpha_action'], restored_state['decay_beta_action']
+                    decay_alpha_out, decay_beta_out = restored_state['decay_alpha_out'], restored_state['decay_beta_out']
+            else:
+                 step_pointer += 1 # Default linear progression
+
+            total_steps_taken += 1
+            if not self.enable_bidirectional_reasoning and total_steps_taken >= self.iterations:
+                break
+
+        # Collect final results from the last valid state
+        final_state_data = full_state_history[-1]
+        final_sync_out, _, _ = self.compute_synchronisation(final_state_data['activated_state'], final_state_data['decay_alpha_out'], final_state_data['decay_beta_out'], r_out, 'out')
+        predictions = self.output_projector(final_sync_out)
+        certainties = self.compute_certainty(predictions)
+        
+        self.last_state_trace = final_state_data['state_trace'].detach()
+
+        # Reshape predictions and certainties to be compatible with downstream logic
+        final_predictions = predictions.unsqueeze(-1)
+        final_certainties = certainties.unsqueeze(-1)
 
         return {
             'predictions': predictions,
@@ -3150,10 +2974,58 @@ class OriginalCTMCore(nn.Module):
             'final_sync_out': synchronisation_out,
             'predictive_coding_loss': torch.stack(tracking_data['pc_losses']).mean() if tracking_data['pc_losses'] else torch.tensor(0.0, device=device),
             'dopamine_loss': torch.stack(tracking_data['dopamine_errors']).mean() if tracking_data['dopamine_errors'] else torch.tensor(0.0, device=device),
-            'local_hebbian_signal': local_hebbian_signal, # Pass signal to main model
-            'local_neuron_selector_loss': local_neuron_selector_loss, # Pass loss to main model
             **tracking_data
         }
+
+@torch.jit.script
+class BidirectionalReasoningController(nn.Module):
+    """
+    A JIT-compiled controller that decides the direction of the CTM's reasoning process.
+    It can decide to move forward, backward, or terminate the thought process
+    based on the current state's confidence/coherence.
+    """
+    def __init__(self, d_model: int, sync_dim: int):
+        super().__init__()
+        self.d_model = d_model
+        self.sync_dim = sync_dim
+        # Input features are the activated state and the synchronization output
+        controller_input_dim = d_model + sync_dim
+
+        self.reasoning_gate = nn.Sequential(
+            nn.Linear(controller_input_dim, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 3), # Logits for [BACKWARD, STAY, FORWARD]
+        )
+        
+        self.termination_gate = nn.Sequential(
+            nn.Linear(controller_input_dim, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, activated_state: torch.Tensor, sync_out: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            activated_state: The CTM's current activated state (B, d_model)
+            sync_out: The CTM's current synchronization output (B, sync_dim)
+        
+        Returns:
+            step_delta: A tensor with values in {-1, 0, 1} indicating the step direction.
+            termination_prob: A scalar tensor (0-1) indicating the probability of terminating.
+        """
+        controller_input = torch.cat([activated_state, sync_out], dim=-1)
+
+        direction_logits = self.reasoning_gate(controller_input)
+        # Gumbel-Softmax for sampling a discrete action (backward, stay, forward)
+        direction_samples = F.gumbel_softmax(direction_logits, tau=1.0, hard=True)  # (B, 3)
+        # Convert one-hot samples to step delta: [-1, 0, 1]
+        step_values = torch.tensor([-1.0, 0.0, 1.0], device=activated_state.device)
+        step_delta = torch.sum(direction_samples * step_values.view(1, 3), dim=1) # (B,)
+         # Decide termination
+        termination_prob = self.termination_gate(controller_input).squeeze(-1)# (B,)
+        
+        return step_delta, termination_prob
 
 class FeedbackModule(nn.Module):
     """
@@ -3265,11 +3137,14 @@ class CTMControlledDiffusionProcessor(nn.Module):
                 nn.ReLU()
             )
             
-        # Add top-down attention
-        self.top_down_attention = TopDownAttention(
-            embed_dim=config.d_model,
-            num_heads=config.n_heads
-        )
+        # Add top-down attention only if not using the HRM core, as HRM provides its own top-down control.
+        if not self.config.use_hrm_core:
+            self.top_down_attention = TopDownAttention(
+                embed_dim=config.d_model,
+                num_heads=config.n_heads
+            )
+        else:
+            self.top_down_attention = None
         
         # Replace WINA sparsifier with meta version
         self.wina_sparsifier = MetaWINASparsifier(
@@ -3337,7 +3212,8 @@ class CTMControlledDiffusionProcessor(nn.Module):
         self.task_aware_hipa = FrequencyDomainAwareAttention(
             embed_dim=self.target_noise_dim, # Changed to target_noise_dim
             num_heads=8,
-            task_analyzer=task_analyzer # Pass the task_analyzer instance
+            task_analyzer=task_analyzer, # Pass the task_analyzer instance
+            config=config # Pass the main config
         )
 
         # Initialize Integration Flow + HiPA Sampler for ultra-fast generation
@@ -4278,8 +4154,14 @@ class EnhancedCTMDiffusion(nn.Module):
         # Mixed precision trainer
         self.mixed_precision_trainer = MixedPrecisionTrainer(self, config)
 
-        # Core CTM
-        self.ctm_core = OriginalCTMCore(config)
+        # Core CTM: Conditionally instantiate either Original or Hierarchical core
+        if config.use_hrm_core:
+            from .ctm_HRM import HierarchicalCTM
+            self.ctm_core = HierarchicalCTM(config)
+            print("INFO: Using HierarchicalCTM (HRM) core.")
+        else:
+            self.ctm_core = OriginalCTMCore(config)
+            print("INFO: Using OriginalCTMCore.")
         
         # Enhanced diffusion processor
         # actual_noisy_input_dim is now config.unet_input_feature_dim
@@ -4347,16 +4229,6 @@ class EnhancedCTMDiffusion(nn.Module):
         audio_output_dtype_str: str = "float32" # Data type of raw audio samples ("float32", "int16")
         audio_output_item_size: int = 4 # Automatically set in __post_init__ based on audio_output_dtype_str
 
-        # Enhanced MCMC Parameters
-        enable_enhanced_mcmc: bool = False
-        mcmc_config: Optional[MCMCConfig] = None # MCMCConfig from .fenchel_young_mcmc
-        mcmc_output_space_type: str = 'binary_hypercube' # e.g., 'binary_hypercube', 'top_k_polytope'
-        mcmc_output_space_dim: Optional[int] = None # Dimension of MCMC output space, defaults to ctm_out_dims
-        use_large_neighborhood_search: bool = True
-        lns_frequency: int = 10
-        lns_neighborhood_size: int = 20
-        enable_blackbox_solver: bool = True # For MCMC-based interpretability
-        mcmc_phi_network_hidden_dim: int = 128
         # Positional Embedding Initialization
         self.positional_embedding = None
         if config.positional_embedding_type:
@@ -4373,24 +4245,10 @@ class EnhancedCTMDiffusion(nn.Module):
             else:
                 print(f"Warning: Unknown positional_embedding_type: {config.positional_embedding_type}. No positional embedding will be used.")
 
-        # Store MCMC configuration from EnhancedCTMConfig
-        self.enable_enhanced_mcmc = getattr(config, 'enable_enhanced_mcmc', False)
-        self.mcmc_config_params = getattr(config, 'mcmc_config', None) # Renamed to avoid conflict if MCMCConfig class is also self.mcmc_config
-        self.mcmc_output_space_type = getattr(config, 'mcmc_output_space_type', 'binary_hypercube')
-        self.mcmc_output_space_dim_config = getattr(config, 'mcmc_output_space_dim', None) # Renamed
-        self.use_large_neighborhood_search = getattr(config, 'use_large_neighborhood_search', True)
-        self.lns_frequency = getattr(config, 'lns_frequency', 10)
-        self.lns_neighborhood_size = getattr(config, 'lns_neighborhood_size', 20)
-        self.enable_blackbox_solver = getattr(config, 'enable_blackbox_solver', False)
-        self.mcmc_phi_network_hidden_dim = getattr(config, 'mcmc_phi_network_hidden_dim', 128)
-
-        if self.enable_enhanced_mcmc:
-            self._initialize_enhanced_mcmc()
-        else:
-            self.enhanced_mcmc_sampler = None
-            self.mcmc_phi_network = None
-            self.mcmc_output_space = None
-            self.blackbox_solver = None
+        self.enhanced_mcmc_sampler = None
+        self.mcmc_phi_network = None
+        self.mcmc_output_space = None
+        self.blackbox_solver = None
 
         # Projection layer for sampling path: from ctm_input_dim to unet_input_feature_dim
         self.sampling_kv_to_unet_input_proj = nn.Linear(config.ctm_input_dim, config.unet_input_feature_dim)
@@ -4576,7 +4434,7 @@ class EnhancedCTMDiffusion(nn.Module):
             return {
                 'ctm_core_data': pipeline_results.get('ctm_results'),
                 'diffusion_output': pipeline_results.get('diffusion_output'),
-                'mcmc_results': pipeline_results.get('mcmc_results'),
+                'mcmc_results': None,
                 'pipeline_efficiency': pipeline_results.get('pipeline_efficiency'),
                 'final_output': pipeline_results.get('diffusion_output')
             }
@@ -4662,6 +4520,12 @@ class EnhancedCTMDiffusion(nn.Module):
 
         inferred_task_latent = self.task_inference_module(inference_module_input)
         hipa_control_signal = self.hipa_control_module(inferred_task_latent)
+
+        # Per-sample heuristic to disable HiPA for text-like sequences
+        for i in range(batch_size):
+            if byte_sequence[i].shape[0] % 250 == 0 and byte_sequence[i].shape[0] > 0:
+                if hipa_control_signal[i] > 0:
+                    hipa_control_signal[i] = 0.0
 
         # The main input_encoder processes the sequence of raw_features
         # raw_features is (batch, num_patches_or_seq, feature_dim)
@@ -4756,195 +4620,7 @@ class EnhancedCTMDiffusion(nn.Module):
         """Get current GPU memory usage."""
         return self.mixed_precision_trainer.get_memory_usage()
 
-    def _initialize_enhanced_mcmc(self):
-        """Initializes the enhanced MCMC components."""
-        if not self.config.enable_enhanced_mcmc: # Use self.config consistently
-            return
 
-        # Determine MCMC output dimension
-        if self.config.mcmc_output_space_dim is None: # Corrected attribute name
-            mcmc_dim = self.config.out_dims if self.config.out_dims is not None else self.config.d_model
-        else:
-            mcmc_dim = self.config.mcmc_output_space_dim
-        
-        if mcmc_dim is None: # Still None, raise error
-            raise ValueError("MCMC output space dimension could not be determined. "
-                             "Please set mcmc_output_space_dim in EnhancedCTMConfig or ensure "
-                             "config.out_dims or config.d_model is set.")
-
-        # 1. Create MCMC Output Space
-        if self.config.mcmc_output_space_type == 'binary_hypercube':
-            self.mcmc_output_space = BinaryHypercube(dimension=mcmc_dim)
-        elif self.config.mcmc_output_space_type == 'top_k_polytope':
-            k_val = min(mcmc_dim // 2, 5)
-            if k_val == 0 and mcmc_dim > 0: k_val = 1
-            if k_val == 0 and mcmc_dim == 0: # Should be caught by TopKPolytope's __init__ too
-                 raise ValueError("Dimension for TopKPolytope must be greater than 0 to set k.")
-            self.mcmc_output_space = TopKPolytope(dimension=mcmc_dim, k=k_val)
-        else:
-            raise ValueError(f"Unsupported MCMC output space type: {self.config.mcmc_output_space_type}")
-
-        # 2. Create Phi Network (Energy function component)
-        self.mcmc_phi_network = nn.Sequential(
-            nn.Linear(mcmc_dim, self.config.mcmc_phi_network_hidden_dim), # Use self.config
-            nn.ReLU(),
-            nn.Linear(self.config.mcmc_phi_network_hidden_dim, self.config.mcmc_phi_network_hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.config.mcmc_phi_network_hidden_dim // 2, 1)
-        )
-
-        # 3. Create BlackBox Solver (Optional, for interpretability)
-        # This BlackBoxSolver wraps the mcmc_phi_network.
-        if self.config.enable_blackbox_solver:
-            self.blackbox_solver_instance = BlackBoxSolver( # Renamed to avoid conflict
-                self.mcmc_phi_network,
-                input_example=torch.randn(1, mcmc_dim)
-            )
-            phi_for_mcmc_samplers = self.blackbox_solver_instance
-        else:
-            self.blackbox_solver_instance = None
-            phi_for_mcmc_samplers = self.mcmc_phi_network
-        
-        # 4. Create MCMC Sampler
-        current_mcmc_config_params = self.config.mcmc_config # Use self.config
-        if current_mcmc_config_params is None:
-            print("Warning: MCMCConfig not provided to EnhancedCTMDiffusion. Using default MCMCConfig.")
-            current_mcmc_config_params = MCMCConfig()
-
-        if self.config.use_large_neighborhood_search:
-            # The ExactOptimizationOracle for LNS will use the potentially blackboxed phi.
-            exact_oracle_for_lns = ExactOptimizationOracle(
-                output_space=self.mcmc_output_space,
-                phi_network=phi_for_mcmc_samplers
-            )
-            self.enhanced_mcmc_sampler = LargeNeighborhoodSearchMCMC(
-                output_space=self.mcmc_output_space,
-                config=current_mcmc_config_params,
-                phi_network=phi_for_mcmc_samplers,
-                exact_oracle=exact_oracle_for_lns,
-                lns_frequency=self.config.lns_frequency,
-                lns_neighborhood_size=self.config.lns_neighborhood_size
-            )
-        else:
-            self.enhanced_mcmc_sampler = CorrectionRatioMCMC(
-                output_space=self.mcmc_output_space,
-                config=current_mcmc_config_params,
-                phi_network=phi_for_mcmc_samplers
-            )
-        
-        # Device handling should be done by the main model's .to(device) call
-        # which should iterate over submodules.
-        
-        # Move MCMC components to the correct device if model is on GPU
-        # This should ideally happen when the main model is moved to a device.
-        # For now, we assume it will be handled by the main model's .to(device) call.
-        # Example:
-        # if next(self.parameters()).is_cuda:
-        #     self.mcmc_phi_network.cuda()
-        #     self.enhanced_mcmc_sampler.cuda() # Sampler might need its own .to(device)
-        
-        # Initialize the new SynapticEmpathy module if enabled in the config
-        self.synaptic_empathy_module = None
-        if self.config.enable_synaptic_empathy:
-            self.synaptic_empathy_module = SynapticEmpathy(
-                d_model=self.config.d_model,
-                memory_length=self.config.ctm_memory_length,
-                n_heads=self.config.n_heads
-            )
-
-        # Initialize the high-level empathy module (Mirror Neurons) if enabled
-        self.mirror_layer = None
-        if self.config.enable_mirror_neurons:
-            self.mirror_layer = MirrorNeuronLayer(
-                d_model=self.config.d_model,
-                num_heads=self.config.n_heads,
-                dropout=self.config.dropout,
-                num_emotion_dim=self.config.num_emotion_dim,
-                goal_dim=self.config.goal_dim
-            )
-            # Buffers to hold a running state of emotions and predicted goals
-            self.register_buffer('self_emotion_state', torch.zeros(1, 1, self.config.num_emotion_dim), persistent=True)
-            self.register_buffer('observed_emotion_state', torch.zeros(1, 1, self.config.num_emotion_dim), persistent=True)
-            self.register_buffer('observed_goal_state', torch.zeros(1, 1, self.config.goal_dim), persistent=True)
-
-    def _apply_enhanced_mcmc(self, theta: torch.Tensor, target_y: torch.Tensor,
-                             current_epoch: Optional[int] = None, current_batch: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Applies the enhanced MCMC sampling process.
-
-        Args:
-            theta: The logits (or parameters) from the CTM core for the MCMC energy function.
-                   Shape: (batch_size, mcmc_output_space_dim)
-            target_y: The ground truth discrete structures for the MCMC Fenchel-Young loss.
-                      Shape: (batch_size, mcmc_output_space_dim)
-            current_epoch: Optional current epoch for LNS scheduling or other diagnostics.
-            current_batch: Optional current batch for LNS scheduling or other diagnostics.
-
-        Returns:
-            A dictionary containing MCMC results.
-        """
-        if not self.config.enable_enhanced_mcmc or self.enhanced_mcmc_sampler is None:
-            return {
-                'mcmc_loss': torch.tensor(0.0, device=theta.device),
-                'mcmc_expectation': target_y.clone(), # Return target if MCMC is off
-                'mcmc_raw_samples': None, # Or perhaps an empty list
-                'mcmc_acceptance_rate': 0.0, # From overall stats
-                'mcmc_avg_acceptance_term_pk': 0.0, # From overall stats
-                'mcmc_stats': {},
-                'solver_diagnostics': None # Or an empty list
-            }
-        # Determine if LNS should be used for this specific call to the sampler
-        use_lns_for_this_sampler_call = False
-        if self.config.use_large_neighborhood_search and isinstance(self.enhanced_mcmc_sampler, LargeNeighborhoodSearchMCMC):
-            # LNS frequency is now handled inside LargeNeighborhoodSearchMCMC's sample_chain_corrected,
-            # but we still need to tell the sampler's forward method that LNS is generally enabled for it.
-            # The `use_large_neighborhood_step` in `sample_chain_corrected` controls per-step LNS.
-            # The `use_large_neighborhood` in `forward` of the sampler can be a general toggle.
-            use_lns_for_this_sampler_call = True # Indicates LNSMCMC is the active type
-
-        # The `forward` method of CorrectionRatioMCMC (and its subclass LargeNeighborhoodSearchMCMC)
-        # now takes `use_large_neighborhood` as an argument.
-        mcmc_output_dict = self.enhanced_mcmc_sampler(
-            theta=theta, 
-            target=target_y, 
-            use_large_neighborhood=use_lns_for_this_sampler_call
-            # current_epoch and current_batch are not directly used by sampler.forward,
-            # but could be passed into mcmc_stats if needed for external logging.
-        )
-        
-        # Extract results from the dictionary returned by the sampler's forward method
-        mcmc_loss = mcmc_output_dict.get('loss', torch.tensor(0.0, device=theta.device))
-        mcmc_expectation = mcmc_output_dict.get('expectation', target_y.clone())
-        
-        # Sampler's forward method should return a 'mcmc_stats' dictionary
-        # which itself contains 'num_samples', 'avg_acceptance_rate', 'avg_acceptance_term_pk', etc.
-        detailed_mcmc_stats = mcmc_output_dict.get('mcmc_stats', {})
-        
-        mcmc_raw_samples = detailed_mcmc_stats.get('raw_samples', None) # Assuming sampler might provide this
-        mcmc_acceptance_rate = detailed_mcmc_stats.get('avg_acceptance_rate', 0.0)
-        mcmc_avg_pk = detailed_mcmc_stats.get('avg_acceptance_term_pk', 0.0)
-
-
-        # Solver diagnostics would be collected if an interpretability hook is attached
-        # to the blackbox_solver_instance. The sampler itself doesn't directly return this
-        # unless we modify it to aggregate from its internal exact_oracle.
-        solver_diagnostics = []
-        if self.config.enable_blackbox_solver and \
-           isinstance(self.enhanced_mcmc_sampler, LargeNeighborhoodSearchMCMC) and \
-           self.enhanced_mcmc_sampler.exact_oracle is not None:
-            # Access diagnostics if the LNS sampler stores them from its oracle
-            solver_diagnostics = self.enhanced_mcmc_sampler.exact_oracle.get_solver_state().get('optimization_history', [])
-
-
-        return {
-            'mcmc_loss': mcmc_loss,
-            'mcmc_expectation': mcmc_expectation,
-            'mcmc_raw_samples': mcmc_raw_samples,
-            'mcmc_acceptance_rate': mcmc_acceptance_rate,
-            'mcmc_avg_acceptance_term_pk': mcmc_avg_pk,
-            'mcmc_stats': detailed_mcmc_stats, # Pass through all stats from sampler
-            'solver_diagnostics': solver_diagnostics
-        }
 
     # def _expand_task_embedding(self, new_size: int): # Obsolete
         """
@@ -4968,7 +4644,7 @@ class EnhancedCTMDiffusion(nn.Module):
     
     def forward(self, byte_sequence: torch.Tensor, target_diffusion_output: Optional[torch.Tensor] = None,
                 mode: str = 'ctm_controlled_diffusion', timestep: Optional[torch.Tensor] = None,
-                target_mcmc_output: Optional[torch.Tensor] = None, current_epoch: int = 0,
+                current_epoch: int = 0,
                 current_batch: int = 0, task_name: Optional[str] = None,
                 observed_byte_sequence: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         
@@ -4981,14 +4657,11 @@ class EnhancedCTMDiffusion(nn.Module):
             target_diffusion_output (Optional[torch.Tensor]): The target clean data (x_0) for diffusion loss.
                                                               Required if training with diffusion.
                                                               Shape: (batch_size, sequence_length, output_feature_dim)
-            mode (str): Operation mode. Options: 'ctm_controlled_diffusion', 'ctm_only', 'diffusion_only', 'mcmc_only'
+            mode (str): Operation mode. Options: 'ctm_controlled_diffusion', 'ctm_only', 'diffusion_only'
                        'ctm_only' runs CTM core.
-                       'mcmc_only' runs CTM core then MCMC.
                        'diffusion_only' runs diffusion processor (needs appropriate 'inputs' as noisy data).
-                       'ctm_controlled_diffusion' runs CTM, then MCMC (if enabled), then diffusion.
+                       'ctm_controlled_diffusion' runs CTM, then diffusion.
             timestep (Optional[torch.Tensor]): Current diffusion timestep (if applicable for diffusion modes)
-            target_mcmc_output (Optional[torch.Tensor]): Ground truth for MCMC Fenchel-Young loss.
-                                                        Shape: (batch_size, mcmc_output_space_dim)
             current_epoch (int): Current training epoch.
             current_batch (int): Current training batch in the epoch.
             observed_byte_sequence (Optional[torch.Tensor]): Observed agent's byte sequence for mirror neuron processing.
@@ -5021,69 +4694,19 @@ class EnhancedCTMDiffusion(nn.Module):
         # Initialize layer output for first layer
         layer_output = None
         
-        # Process through CTM core with new features
-        for layer_idx in range(self.config.num_layers):
-            # Get current layer input
-            if layer_idx == 0:
-                layer_input = kv_features_for_ctm
-            else:
-                layer_input = layer_output
-                
-            # Apply recurrent connection
-            hidden_states[f"layer_{layer_idx}"] = self.recurrent_cells[f"layer_{layer_idx}"](
-                layer_input.reshape(batch_size, -1),  # Flatten spatial/temporal dims
-                hidden_states[f"layer_{layer_idx}"]
-            )
-            # Reshape back to original dimensions
-            recurrent_output = hidden_states[f"layer_{layer_idx}"].view(layer_input.shape)
-            
-            # Apply feedback from higher layers if available
-            if f"layer_{layer_idx}" in self.feedback_modules and layer_idx < self.config.num_layers - 1:
-                # Get feedback from next layer (if exists)
-                next_layer_output = ctm_data.get(f"layer_{layer_idx+1}_output", None)
-                if next_layer_output is not None:
-                    recurrent_output = self.feedback_modules[f"layer_{layer_idx}"](
-                        next_layer_output.mean(dim=1),  # Pool higher layer output
-                        recurrent_output
-                    )
-                
-            # Compute predictive coding error
-            if f"layer_{layer_idx}" in self.predictive_coders and layer_idx > 0:
-                prediction = self.predictive_coders[f"layer_{layer_idx}"](recurrent_output)
-                error = prediction - layer_input  # Compare with original input
-                predictive_errors[f"layer_{layer_idx}"] = error
-                # Use error to modulate processing
-                recurrent_output = recurrent_output + error
-                
-            # Apply top-down attention using final thought vector at last layer
-            if layer_idx == self.config.num_layers - 1:
-                thought_vector = recurrent_output.mean(dim=1)  # (B, d_model)
-                recurrent_output = self.top_down_attention(recurrent_output, thought_vector)
-                
-            # Store layer output for feedback and diagnostics
-            ctm_data[f"layer_{layer_idx}_output"] = recurrent_output
-            layer_output = recurrent_output
-            
-        # Update WINA sparsifier with meta-learning control
-        if 'thought_vector' in locals():
-            control_input = torch.cat([
-                thought_vector,
-                torch.tensor([current_epoch/100.0, current_batch/1000.0], device=device).expand(batch_size, 2)
-            ], dim=1)
-            self.wina_sparsifier.control_input = control_input
+        # Prepare input features for CTM core (with entropy aux loss)
+        kv_features_for_ctm, inferred_task_latent, hipa_control_signal, entropy_aux_loss = \
+            self._prepare_input_features(byte_sequence)
+        losses['entropy_model_aux_loss'] = entropy_aux_loss * self.config.entropy_model_loss_weight
         
+        # Process through CTM core with full tracking
+        ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
 
         losses['jepa_loss'] = torch.tensor(0.0, device=device)
         # The aux loss from dynamic_entropy_patcher (online JEPA encoder) is handled by _prepare_input_features
         # No separate jepa_context_aux_loss or jepa_target_aux_loss needed here for now.
 
-        # Prepare input features using the online encoder (dynamic_entropy_patcher)
-        # This also gives us the online_patch_embeddings (kv_features_for_ctm) and their original byte indices.
-        # kv_features_for_ctm, current_inferred_latent, current_hipa_signal, entropy_aux_loss are computed once
-        kv_features_for_ctm, current_inferred_latent, current_hipa_signal, entropy_aux_loss = \
-            self._prepare_input_features(byte_sequence)
-        
-        losses['entropy_model_aux_loss'] = entropy_aux_loss * self.config.entropy_model_loss_weight
+        # Use the already prepared input features for JEPA
         online_patch_embeddings = kv_features_for_ctm # Shape: (B, S_patches, D_embed)
 
         
@@ -5254,7 +4877,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 noisy_input=noisy_input,
                 timestep=timestep,
                 ctm_data=ctm_data_flat,
-                hipa_control_signal=current_hipa_signal
+                hipa_control_signal=hipa_control_signal
             )
             
             # Compute loss on flattened outputs
@@ -5308,7 +4931,7 @@ class EnhancedCTMDiffusion(nn.Module):
                     noisy_input=noisy_input_for_diffusion_processor,
                     timestep=timestep,
                     ctm_data=ctm_data_for_diffusion_conditioning,
-                    hipa_control_signal=current_hipa_signal # Pass HIPA signal
+                    hipa_control_signal=hipa_control_signal # Pass HIPA signal
                 )
 
                 if isinstance(prediction_output_tuple, tuple): # If it returns (prediction, guidance_info)
@@ -5344,11 +4967,41 @@ class EnhancedCTMDiffusion(nn.Module):
         else:
             losses['diffusion_loss'] = torch.tensor(0.0, device=byte_sequence.device)
 
+        # --- Hebbian Plasticity Loss ---
+        hebbian_plasticity_loss = torch.tensor(0.0, device=device)
+        if self.config.use_activity_plasticity and self.training and 'plastic_adjustments' in ctm_data:
+            plastic_adjustments = ctm_data['plastic_adjustments']
+            activated_states = ctm_data['activated_states']
+            
+            if len(plastic_adjustments) > 1 and len(activated_states) > 1:
+                for i in range(len(plastic_adjustments) - 1):
+                    # Get the plastic adjustment at step t and activated state at step t+1
+                    current_plastic_adj = plastic_adjustments[i]
+                    next_activated_state = activated_states[i+1].detach() # Detach to treat as target
 
-        total_loss = torch.tensor(0.0, device=byte_sequence.device)
-        for loss_name, loss_val in losses.items():
-            if loss_val is not None:
-                total_loss += loss_val
+                    # Identify neurons that fired at step t+1
+                    firing_mask = (next_activated_state > 0.1).float()
+
+                    # Calculate cosine similarity for all neurons
+                    # The goal is to make the plastic adjustment at 't' predict the activation at 't+1'
+                    similarity = F.cosine_similarity(current_plastic_adj, next_activated_state, dim=-1)
+
+                    # Only consider the similarity for neurons that actually fired
+                    masked_similarity = similarity * firing_mask.mean(dim=-1)
+                    
+                    # We want to maximize this similarity, so we minimize its negative
+                    hebbian_plasticity_loss -= masked_similarity.mean()
+
+                # Average the loss over the number of steps
+                hebbian_plasticity_loss /= (len(plastic_adjustments) -1)
+
+
+        losses['hebbian_plasticity_loss'] = hebbian_plasticity_loss * self.config.local_hebbian_loss_weight
+
+        if 'diffusion_loss' in losses and losses['diffusion_loss'] is not None:
+             learning_signal = -losses['diffusion_loss'].detach() # Make it positive for good performance
+             losses['hebbian_plasticity_loss'] = losses['hebbian_plasticity_loss'] * learning_signal
+
 
         # Continue with the rest of the function logic
         # For inference, the output would be generated by a sampling loop using the diffusion model,
@@ -5361,7 +5014,6 @@ class EnhancedCTMDiffusion(nn.Module):
         output_dict = {
             'ctm_core_data': None,
             'ctm_internal_loss': torch.tensor(0.0, device=device),
-            'mcmc_results': None,
             'mcmc_loss': torch.tensor(0.0, device=device),
             'diffusion_output': None,
             'diffusion_loss': torch.tensor(0.0, device=device), # Placeholder, actual loss computed in training script
@@ -5374,38 +5026,13 @@ class EnhancedCTMDiffusion(nn.Module):
         # --- 1. CTM Core Processing (Common for most modes) ---
         ctm_data = None
         theta_candidate_from_ctm = None
-        if mode in ['ctm_only', 'mcmc_only', 'ctm_controlled_diffusion']:
+        if mode in ['ctm_only', 'ctm_controlled_diffusion']:
             # Use the kv_features_for_ctm computed earlier in the function
             ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
             output_dict['ctm_core_data'] = ctm_data
             theta_candidate_from_ctm = ctm_data['final_sync_out']
         
-        # --- 2. Enhanced MCMC Processing ---
-        mcmc_expectation = None
-        if self.enable_enhanced_mcmc and mode in ['mcmc_only', 'ctm_controlled_diffusion']:
-            if theta_candidate_from_ctm is None:
-                raise ValueError("CTM core output (theta_candidate_from_ctm) is needed for MCMC but is None.")
-            if target_mcmc_output is None:
-                raise ValueError("target_mcmc_output must be provided for MCMC loss calculation in modes '{}'.".format(mode))
-
-            if not hasattr(self, 'ctm_to_mcmc_theta_proj'):
-                if self.mcmc_output_space is None: self._initialize_enhanced_mcmc()
-                self.ctm_to_mcmc_theta_proj = nn.Linear(
-                    theta_candidate_from_ctm.shape[-1], self.mcmc_output_space.dimension
-                ).to(device)
-            
-            theta_for_mcmc = self.ctm_to_mcmc_theta_proj(theta_candidate_from_ctm)
-            
-            mcmc_results_dict = self._apply_enhanced_mcmc(
-                theta_for_mcmc, target_mcmc_output, current_epoch, current_batch
-            )
-            output_dict['mcmc_results'] = mcmc_results_dict
-            output_dict['mcmc_loss'] = mcmc_results_dict.get('mcmc_loss', torch.tensor(0.0, device=device))
-            mcmc_expectation = mcmc_results_dict.get('mcmc_expectation')
-
-        # Determine the representation to use post-CTM/MCMC
-        # If MCMC ran, its expectation is preferred, otherwise direct CTM output.
-        final_ctm_representation = mcmc_expectation if mcmc_expectation is not None else theta_candidate_from_ctm
+        final_ctm_representation = theta_candidate_from_ctm
 
 
         # --- 3. Mode-Specific Outputs & Diffusion ---
@@ -5521,7 +5148,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 noisy_input=diffusion_input_arg, # Corrected argument name
                 timestep=effective_timestep,
                 ctm_data=guidance_data_for_diffusion,
-                hipa_control_signal=current_hipa_signal # Pass the signal
+                hipa_control_signal=hipa_control_signal # Pass the signal
             )
             if isinstance(diffusion_call_output, tuple): # Assuming (prediction, guidance_info)
                 noise_pred_or_x0 = diffusion_call_output[0]
@@ -5543,7 +5170,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 noisy_input=kv_features_for_ctm, # This is the initial x_t (e.g. noise)
                 timestep=timestep,
                 ctm_data=simplified_ctm_data_for_diffusion_only,
-                hipa_control_signal=current_hipa_signal # Pass the signal
+                hipa_control_signal=hipa_control_signal # Pass the signal
             )
             if isinstance(diffusion_call_output, tuple):
                 noise_pred_or_x0 = diffusion_call_output[0]
@@ -5568,29 +5195,6 @@ class EnhancedCTMDiffusion(nn.Module):
             if loss_name not in output_dict:
                 output_dict[loss_name] = loss_val
         
-        # Update total_loss to include all losses
-        total_loss_combined = total_loss + output_dict['ctm_internal_loss'] + output_dict['mcmc_loss']
-        output_dict['total_loss'] = total_loss_combined
-        
-        # Prepare the final 'losses' dictionary for return.
-        # It should contain all individual loss components.
-        # The 'losses' variable (from the first part of the function) already has some (e.g., diffusion_loss, ewc_loss).
-        # Add ctm_internal_loss and mcmc_loss to it if they were computed in the second part and exist in output_dict.
-        if 'ctm_internal_loss' in output_dict and output_dict['ctm_internal_loss'] is not None:
-            losses['ctm_internal_loss'] = output_dict['ctm_internal_loss']
-        if 'mcmc_loss' in output_dict and output_dict['mcmc_loss'] is not None:
-            losses['mcmc_loss'] = output_dict['mcmc_loss']
-        
-        # The total loss to return is total_loss_combined (calculated around line 3027 using 'total_loss' from Part 1 and new losses).
-        # The dictionary of all losses to return is the now augmented 'losses' variable.
-        # Add all losses to output_dict for consistency
-        for loss_name, loss_val in losses.items():
-            if loss_name not in output_dict:
-                output_dict[loss_name] = loss_val
-        
-        # Update the total loss in output_dict
-        output_dict['total_loss'] = total_loss_combined
-        
         # Re-aggregate total_loss in output_dict to include all components
         # Start with diffusion_loss which should be in output_dict from earlier processing
         current_total_loss = output_dict.get('diffusion_loss', torch.tensor(0.0, device=device))
@@ -5611,22 +5215,8 @@ class EnhancedCTMDiffusion(nn.Module):
             output_dict['dopamine_loss'] = dopamine_loss
             current_total_loss += dopamine_loss * 0.1 # Add with some weight
 
-    # --- Global Plasticity Loss ---
-        if self.use_global_plasticity_loss and 'ctm_core_data' in output_dict and output_dict['ctm_core_data']:
-            local_hebbian_signal = output_dict['ctm_core_data'].get('local_hebbian_signal')
-            if local_hebbian_signal is not None:
-                aggregated_hebbian_signal = torch.mean(local_hebbian_signal)
-                target_pattern = torch.tensor(self.target_hebbian_pattern, device=aggregated_hebbian_signal.device, dtype=aggregated_hebbian_signal.dtype)
-                global_plasticity_loss = F.mse_loss(aggregated_hebbian_signal, target_pattern)
-                output_dict['global_plasticity_loss'] = global_plasticity_loss * self.global_plasticity_loss_weight
-                current_total_loss += output_dict['global_plasticity_loss']
-
-        # --- Local Neuron Selector Loss ---
-        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and output_dict['ctm_core_data'].get('local_neuron_selector_loss') is not None:
-            local_selector_loss = output_dict['ctm_core_data']['local_neuron_selector_loss']
-            output_dict['local_neuron_selector_loss'] = local_selector_loss * self.local_neuron_selector_loss_weight
-            current_total_loss += output_dict['local_neuron_selector_loss']
-
+        if 'hebbian_plasticity_loss' in output_dict and output_dict['hebbian_plasticity_loss'] is not None:
+            current_total_loss += output_dict['hebbian_plasticity_loss']
         output_dict['total_loss'] = current_total_loss
 
         # Convert final_output to bytes if it's audio from diffusion modes
@@ -5641,16 +5231,19 @@ class EnhancedCTMDiffusion(nn.Module):
                     print(f"Warning: Could not convert final_output to bytes in forward method: {e}")
                     # Keep numeric output if conversion fails
         
-        # --- FIX: Elevate ctm_core_data to top-level dictionary ---
-        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data']:
-            # The training script relies on 'predictions' and 'final_sync_out' being in the top-level dictionary.
-            # This ensures they are present, preventing the fallback to zeros.
-            ctm_data = output_dict['ctm_core_data']
-            if 'predictions' in ctm_data:
-                output_dict['predictions'] = ctm_data['predictions']
-            if 'final_sync_out' in ctm_data:
-                output_dict['final_sync_out'] = ctm_data['final_sync_out']
-        # --- End of FIX ---
+        # Simplified prediction mechanism using meta-learning
+        # Instead of elevating ctm_core_data, use direct outputs from synapse network
+        if 'predictions' not in output_dict and 'final_sync_out' not in output_dict:
+            # Generate predictions directly from synapse network
+            if hasattr(self, 'synapse_network') and 'activated_states' in output_dict:
+                # Use the last activated state for prediction
+                last_state = output_dict['activated_states'][-1]
+                output_dict['predictions'] = self.synapse_network(last_state)
+                output_dict['final_sync_out'] = last_state.mean(dim=1)
+            else:
+                # Fallback to zeros if no synapse network available
+                output_dict['predictions'] = torch.zeros_like(input)
+                output_dict['final_sync_out'] = torch.zeros(input.size(0), self.config.d_model, device=input.device)
 
         return output_dict
     
@@ -5705,66 +5298,20 @@ class EnhancedCTMDiffusion(nn.Module):
         else:
             pb = timesteps_to_iterate
 
-        # Initialize thought history for bidirectional adjustment
-        thought_history = []
-
         for i, t_tensor in enumerate(pb):
             current_timestep_batched = t_tensor.expand(batch_size) if t_tensor.ndim == 0 else t_tensor
             if current_timestep_batched.ndim == 0 :
                  current_timestep_batched = current_timestep_batched.repeat(batch_size)
 
             # CTM core processes the current diffusion state `x` (x_t).
+            # The `forward_with_full_tracking` method now contains the bidirectional reasoning loop.
             ctm_input_features_for_core_step = x.detach()
             ctm_data_guidance = self.ctm_core.forward_with_full_tracking(ctm_input_features_for_core_step)
-
-            # Store current thought for potential adjustment
-            current_thought = ctm_data_guidance.get('final_sync_out')
-            if current_thought is not None:
-                thought_history.append(current_thought.detach().clone())
-
-            # Check confidence and adjust thought if needed
+            
+            # Optional: store certainty for logging
             if 'certainties' in ctm_data_guidance and ctm_data_guidance['certainties'] is not None:
-                # Get average certainty for the current step
                 current_certainty = ctm_data_guidance['certainties'][:, 0, -1].mean().item()
                 sampling_info['certainty_history'].append(current_certainty)
-                # Refine thought if confidence is below threshold and we have a previous thought
-                min_confidence = getattr(self.config, 'min_confidence_threshold', 0.6)
-                max_adjustments = getattr(self.config, 'max_thought_adjustments', 10)
-                
-                # Check if we've exceeded max adjustments
-                if len(sampling_info['thought_adjustments']) >= max_adjustments:
-                    if not hasattr(self, '_final_thought_committed'):
-                        print(f"  🛑 Max adjustments reached ({max_adjustments}). Committing to final thought.")
-                        self._final_thought_committed = True
-                # Only adjust if below confidence threshold and under max adjustments
-                elif current_certainty < min_confidence and thought_history:
-                    # Determine adjustment direction based on certainty trend
-                    direction = "backward"
-                    if len(thought_history) > 1 and current_certainty < sampling_info['certainty_history'][-2]:
-                        direction = "forward"
-                    
-                    # Get the thought to adjust (current by default)
-                    thought_to_adjust = thought_history[-1]
-                    
-                    # For backward adjustment, use previous thought
-                    if direction == "backward" and len(thought_history) > 1:
-                        thought_to_adjust = thought_history[-2]
-                    
-                    # Blend thoughts: 70% adjusted thought + 30% current thought
-                    adjusted_thought = 0.7 * thought_to_adjust + 0.3 * current_thought
-                    
-                    # Update guidance data with adjusted thought
-                    ctm_data_guidance['final_sync_out'] = adjusted_thought
-                    
-                    # Update thought history
-                    thought_history[-1] = adjusted_thought.detach().clone()
-                    
-                    sampling_info['thought_adjustments'].append({
-                        'step': i,
-                        'direction': direction,
-                        'certainty': current_certainty
-                    })
-                    print(f"  🔄 Thought adjusted {direction} at step {i} (certainty: {current_certainty:.2f})")
 
             if enable_early_stopping and i > self.config.early_stop_min_steps and hasattr(self.diffusion, 'should_early_stop'):
                 should_stop_flags, stop_reason_details_dict = self.diffusion.should_early_stop(ctm_data_guidance, i, len(timesteps_to_iterate))
@@ -5799,66 +5346,61 @@ class EnhancedCTMDiffusion(nn.Module):
         x_bytes = batched_numeric_tensor_to_bytes(x, source_dtype=np.float32)
         return x_bytes, sampling_info
     
-    def get_loss_with_ctm_guidance(self, x_start: torch.Tensor,
-                                   inferred_task_latent: torch.Tensor,
-                                   hipa_control_signal: torch.Tensor
-                                   ) -> Tuple[torch.Tensor, Dict]:
+    def get_loss_with_ctm_guidance(self, x_start: torch.Tensor, task_id: int = 0) -> Tuple[torch.Tensor, Dict]:
         """
         Compute diffusion loss with CTM guidance and return detailed metrics.
         """
         device = x_start.device
         batch_size = x_start.size(0)
         
-        timesteps = torch.randint(0, self.diffusion.scheduler.num_train_timesteps, (batch_size,), device=device).long()
+        # Sample random timesteps
+        timesteps = torch.randint(0, len(self.diffusion.betas), (batch_size,), device=device)
+        
+        # Sample noise
         noise = torch.randn_like(x_start)
+        
+        # Add noise to clean data
         noisy_x = self.diffusion.add_noise(x_start, noise, timesteps)
         
-        # Prepare CTM input features using x_start or noisy_x depending on CTM's role
-        # For guidance, CTM often processes something related to the current state or target.
-        # This part needs to align with how ctm_data is generated for diffusion's forward.
-        # Let's assume kv_features are derived from noisy_x for consistency with how diffusion might be conditioned.
-        # This is a placeholder; a more sophisticated approach might use x_start for CTM's "thought process".
-        # The main forward pass derives kv_features from byte_sequence. Here we have x_start (clean data).
-        # We need a consistent way to get kv_features for CTM.
-        # For now, let's assume a dummy or simplified kv_feature generation for this specific loss function.
-        # This function seems to be more of a diagnostic or specialized training loop.
+        # Predict noise with CTM control
+        predicted_noise, ctm_data = self.forward(noisy_x, timesteps, task_id, mode='ctm_controlled_diffusion')
         
-        # Simplified: if CTM conditions on noisy_x directly (after some encoding)
-        # This is highly dependent on the architecture.
-        # For now, let's assume ctm_data is generated based on noisy_x.
-        # This part is complex as `self.forward` expects byte_sequence.
-        # This method might need to be re-thought or use a different path to get CTM data.
-        # For now, creating dummy ctm_data.
-        ctm_input_for_loss_calc = self.input_encoder(self.byte_embedding(torch.randint(0,256, (batch_size, noisy_x.shape[1] if noisy_x.dim() > 2 else 128), device=device).long()))
-        ctm_data_for_loss = self.ctm_core.forward_with_full_tracking(ctm_input_for_loss_calc)
-
-
-        # Predict noise with CTM control, passing hipa_control_signal
-        predicted_noise_output = self.diffusion(noisy_x, timesteps, ctm_data_for_loss, hipa_control_signal=hipa_control_signal)
-        if isinstance(predicted_noise_output, tuple):
-            predicted_noise = predicted_noise_output[0]
-        else:
-            predicted_noise = predicted_noise_output
-
+        # Main diffusion loss
         diffusion_loss = nn.functional.mse_loss(predicted_noise, noise)
         
+        # Additional CTM-based losses for better integration
         additional_losses = {}
-        # Add CTM internal losses if ctm_data_for_loss is properly generated and has them
-        if hasattr(self.ctm_core, 'compute_internal_loss') and callable(self.ctm_core.compute_internal_loss):
-            ctm_internal_loss_val = self.ctm_core.compute_internal_loss([ctm_data_for_loss], ctm_input_for_loss_calc)
-            if isinstance(ctm_internal_loss_val, dict): additional_losses.update(ctm_internal_loss_val)
-            elif torch.is_tensor(ctm_internal_loss_val): additional_losses['ctm_internal_objective'] = ctm_internal_loss_val
-            
-        total_loss = diffusion_loss
-        for al_val in additional_losses.values():
-            if torch.is_tensor(al_val): total_loss += al_val.mean()
         
-
+        # Certainty consistency loss (encourage consistent certainty)
+        if 'certainties' in ctm_data:
+            certainty_var = torch.var(ctm_data['certainties'], dim=-1).mean()
+            additional_losses['certainty_consistency'] = certainty_var * 0.1
+        
+        # Synchronization stability loss
+        if 'sync_out_history' in ctm_data and len(ctm_data['sync_out_history']) > 1:
+            sync_diffs = []
+            for i in range(1, len(ctm_data['sync_out_history'])):
+                diff = torch.mse_loss(ctm_data['sync_out_history'][i], ctm_data['sync_out_history'][i-1])
+                sync_diffs.append(diff)
+            sync_stability_loss = torch.stack(sync_diffs).mean()
+            additional_losses['sync_stability'] = sync_stability_loss * 0.05
+        
+        # Total loss
+        total_loss = diffusion_loss + sum(additional_losses.values())
+        
+        # FIX: Ensure CTM data contains final_sync_out for consistent ARC head input
+        if 'final_sync_out' not in ctm_data and 'predictions' in ctm_data:
+            # If final_sync_out is missing but predictions exist, use predictions
+            # but note: predictions may be 64D while ARC head expects 512D
+            # This is a fallback and may cause issues if predictions dimension doesn't match
+            ctm_data['final_sync_out'] = ctm_data['predictions']
+            print ("Predictions dimensions were used instead of final_sync_out: ERROR")
+        
         return total_loss, {
             'diffusion_loss': diffusion_loss,
             'total_loss': total_loss,
             **additional_losses,
-            'ctm_data': ctm_data_for_loss # For diagnostics
+            'ctm_data': ctm_data
         }
     
     def ultra_fast_integration_flow_generation(self, shape: Tuple[int, ...],
@@ -5932,156 +5474,6 @@ class EnhancedCTMDiffusion(nn.Module):
         # Convert to byte tensor
         generated_samples_bytes = batched_numeric_tensor_to_bytes(generated_samples, source_dtype=np.float32)
         return generated_samples_bytes, generation_info
-    
-    def get_loss_with_ctm_guidance(self, x_start: torch.Tensor, task_id: int = 0) -> Tuple[torch.Tensor, Dict]:
-        """
-        Compute diffusion loss with CTM guidance and return detailed metrics.
-        """
-        device = x_start.device
-        batch_size = x_start.size(0)
-        
-        # Sample random timesteps
-        timesteps = torch.randint(0, len(self.diffusion.betas), (batch_size,), device=device)
-        
-        # Sample noise
-        noise = torch.randn_like(x_start)
-        
-        # Add noise to clean data
-        noisy_x = self.diffusion.add_noise(x_start, noise, timesteps)
-        
-        # Predict noise with CTM control
-        predicted_noise, ctm_data = self.forward(noisy_x, timesteps, task_id, mode='ctm_controlled_diffusion')
-        
-        # Main diffusion loss
-        diffusion_loss = nn.functional.mse_loss(predicted_noise, noise)
-        
-        # Additional CTM-based losses for better integration
-        additional_losses = {}
-        
-        # Certainty consistency loss (encourage consistent certainty)
-        if 'certainties' in ctm_data:
-            certainty_var = torch.var(ctm_data['certainties'], dim=-1).mean()
-            additional_losses['certainty_consistency'] = certainty_var * 0.1
-        
-        # Synchronization stability loss
-        if 'sync_out_history' in ctm_data and len(ctm_data['sync_out_history']) > 1:
-            sync_diffs = []
-            for i in range(1, len(ctm_data['sync_out_history'])):
-                diff = torch.mse_loss(ctm_data['sync_out_history'][i], ctm_data['sync_out_history'][i-1])
-                sync_diffs.append(diff)
-            sync_stability_loss = torch.stack(sync_diffs).mean()
-            additional_losses['sync_stability'] = sync_stability_loss * 0.05
-        
-        # Total loss
-        total_loss = diffusion_loss + sum(additional_losses.values())
-        
-        # FIX: Ensure CTM data contains final_sync_out for consistent ARC head input
-        if 'final_sync_out' not in ctm_data and 'predictions' in ctm_data:
-            # If final_sync_out is missing but predictions exist, use predictions
-            # but note: predictions may be 64D while ARC head expects 512D
-            # This is a fallback and may cause issues if predictions dimension doesn't match
-            ctm_data['final_sync_out'] = ctm_data['predictions']
-            print ("Predictions dimensions were used instead of final_sync_out: ERROR")
-        
-        return total_loss, {
-            'diffusion_loss': diffusion_loss,
-            'total_loss': total_loss,
-            **additional_losses,
-            'ctm_data': ctm_data
-        }
-    
-    def ultra_fast_integration_flow_generation(self, shape: Tuple[int, ...],
-                                             task_id: int = 0,
-                                             text_condition: Optional[torch.Tensor] = None,
-                                             enable_hipa: bool = True) -> Tuple[torch.Tensor, Dict]:
-        """
-        Ultra-fast one-step generation using Integration Flow + Task-Aware HiPA.
-        
-        This method combines:
-        1. CTM deep thought processing
-        2. Integration Flow one-step generation
-        3. Task-Aware HiPA frequency enhancement
-        4. Intelligent modality detection
-        
-        Returns:
-            generated_samples: Generated data
-            generation_info: Dictionary with generation statistics and modality info
-        """
-        device = next(self.parameters()).device
-        
-        generation_info = {
-            'method': 'integration_flow_one_step',
-            'hipa_applied': False,
-            'modality_detected': 'unknown',
-            'generation_time': 0.0,
-            'ctm_iterations': self.config.iterations
-        }
-        
-        import time
-        start_time = time.time()
-        
-        try:
-            # Step 1: Generate input features for CTM processing
-            dummy_input = torch.randn((shape[0], self.config.d_input), device=device)
-            kv_features = self.compute_features(dummy_input)
-            
-            # Step 2: Get full CTM context with deep thought processing
-            ctm_data = self.ctm_core.forward_with_full_tracking(kv_features)
-            
-            # Step 3: Use CTM-controlled diffusion processor for ultra-fast generation
-            generated_samples = self.diffusion.integration_flow_one_step_generation(
-                shape=shape,
-                ctm_data=ctm_data,
-                task_id=task_id,
-                device=device
-            )
-            
-            # Step 4: Apply additional Task-Aware HiPA if enabled
-            if enable_hipa and self.diffusion.enable_task_aware_hipa:
-                enhanced_samples, modality_config = self.diffusion.task_aware_hipa(
-                    generated_samples, task_id=task_id
-                )
-                
-                generation_info['hipa_applied'] = modality_config['use_hipa']
-                generation_info['modality_detected'] = modality_config['modality']
-                generation_info['enhancement_strength'] = modality_config['enhancement_strength']
-                
-                if modality_config['use_hipa']:
-                    generated_samples = enhanced_samples
-                    generation_info['frequency_enhancement'] = {
-                        'fft_dims': modality_config['fft_dims'],
-                        'freq_threshold': modality_config['freq_threshold']
-                    }
-            
-            generation_info['generation_time'] = time.time() - start_time
-            generation_info['success'] = True
-            
-            # Step 5: Quality analysis
-            generation_info['quality_metrics'] = {
-                'finite_values': torch.isfinite(generated_samples).all().item(),
-                'value_range': [generated_samples.min().item(), generated_samples.max().item()],
-                'std_dev': generated_samples.std().item(),
-                'mean': generated_samples.mean().item()
-            }
-            
-            # Step 6: CTM analysis
-            if 'certainties' in ctm_data:
-                final_certainty = ctm_data['certainties'][:, 0, -1].mean().item()
-                generation_info['ctm_certainty'] = final_certainty
-                generation_info['high_confidence'] = final_certainty > 0.8
-            
-            return generated_samples, generation_info
-            
-        except Exception as e:
-            generation_info['success'] = False
-            generation_info['error'] = str(e)
-            generation_info['generation_time'] = time.time() - start_time
-            
-            print(f"Warning: Ultra-fast Integration Flow generation failed: {e}")
-            
-            # Fallback to simple random generation
-            fallback_samples = torch.randn(shape, device=device)
-            return fallback_samples, generation_info
     
     def benchmark_generation_methods(self, shape: Tuple[int, ...],
                                    task_id: int = 0,
@@ -6392,6 +5784,7 @@ class GoalPredictor(nn.Module):
         self.d_model = d_model
         self.goal_dim = goal_dim
         self.goal_net = nn.Sequential(
+   
             nn.Linear(d_model * 2, d_model * 4),
             nn.ReLU(),
             nn.Linear(d_model * 4, d_model * 2),
@@ -6399,6 +5792,7 @@ class GoalPredictor(nn.Module):
             nn.Linear(d_model * 2, goal_dim)
         )
         self.goal_update = nn.GRU(d_model, goal_dim, batch_first=True)
+
         
     def forward(self, current_state: torch.Tensor, prev_goal: torch.Tensor) -> torch.Tensor:
         """
@@ -6696,46 +6090,13 @@ class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
 
     def __init__(self, embed_dim=512, num_heads=8, task_analyzer: 'TaskAnalyzer' = None,
-                 theta_range: Tuple[float, float] = (4.0, 8.0),
-                 beta_range: Tuple[float, float] = (13.0, 30.0),
-                 gamma_range: Tuple[float, float] = (30.0, 100.0),
-                 theta_boost: float = 1.5,
-                 gamma_boost: float = 1.7,
-                 beta_boost: float = 1.2,
-                 max_theta_boost: float = 2.5,
-                 max_gamma_boost: float = 3.0,
-                 max_beta_boost: float = 1.5,
-                 theta_gamma_coupling_strength: float = 0.5,
-                 default_sample_rate: int = 16000):
+                 config: Optional[EnhancedCTMConfig] = None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.task_analyzer = task_analyzer
-
-        # Wave Oscillations that Encourage Creative Thinking
-        self.theta_range = theta_range
-        self.beta_range = beta_range
-        self.gamma_range = gamma_range
-        
-        # Static and dynamic boost parameters
-        self.theta_boost = theta_boost
-        self.gamma_boost = gamma_boost
-        self.beta_boost = beta_boost
-        self.max_theta_boost = max_theta_boost
-        self.max_gamma_boost = max_gamma_boost
-        self.max_beta_boost = max_beta_boost
-        
-        self.theta_gamma_coupling_strength = theta_gamma_coupling_strength
-        self.default_sample_rate = default_sample_rate
-
-        # Add creativity controller to dynamically adjust boost factors based on the thought vector.
-        self.creativity_controller = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, 3),
-            nn.Sigmoid()
-        )
+        self.config = config
 
         # Multi-head attention for frequency-aware processing
         self.freq_attention = nn.MultiheadAttention(
@@ -6750,59 +6111,6 @@ class FrequencyDomainAwareAttention(nn.Module):
             nn.LayerNorm(embed_dim)
         )
 
-    def apply_frequency_enhancement(self, x, modality_config, theta_boost, gamma_boost, beta_boost):
-        """Apply frequency enhancement based on detected modality."""
-        if not modality_config.get('use_hipa', False):
-            return x # Skip enhancement for text/discrete tasks
-
-        original_shape = x.shape
-        
-        try:
-            # Apply FFT on specified dimensions
-            fft_dims = modality_config.get('fft_dims', [])
-            if not fft_dims:
-                return x
-
-            sample_rate = modality_config.get('sample_rate', self.default_sample_rate)
-            # Compute FFT
-            x_fft = torch.fft.fftn(x, dim=fft_dims)
-            # Generate frequency coordinates
-            freq_mask = torch.ones_like(x_fft.real)
-            
-            # Apply theta-gamma coupling
-            coupled_gamma_boost = gamma_boost * (1.0 + (theta_boost - 1.0) * self.theta_gamma_coupling_strength)
-
-            for dim in fft_dims:
-                size = x.shape[dim]
-                freqs = torch.fft.fftfreq(size, d=1.0/sample_rate, device=x.device)
-
-                mask_shape = [1] * x.dim()
-                mask_shape[dim] = size
-                
-                # Create masks for theta, beta, and gamma bands
-                mask_theta = (torch.abs(freqs) >= self.theta_range[0]) & (torch.abs(freqs) <= self.theta_range[1])
-                mask_beta = (torch.abs(freqs) >= self.beta_range[0]) & (torch.abs(freqs) <= self.beta_range[1])
-                mask_gamma = (torch.abs(freqs) >= self.gamma_range[0]) & (torch.abs(freqs) <= self.gamma_range[1])
-
-                # Update frequency mask with boost factors
-                mask_theta = mask_theta.view(*mask_shape)
-                mask_beta = mask_beta.view(*mask_shape)
-                mask_gamma = mask_gamma.view(*mask_shape)
-                
-                freq_mask = freq_mask * (1.0 + (theta_boost - 1.0) * mask_theta.float() +
-                                          (coupled_gamma_boost - 1.0) * mask_gamma.float() +
-                                          (beta_boost - 1.0) * mask_beta.float())
-
-            x_fft_enhanced = x_fft * freq_mask
-            x_enhanced = torch.fft.ifftn(x_fft_enhanced, dim=fft_dims).real
-            return x_enhanced
-            
-        except Exception as e:
-            print(f"Warning: Frequency enhancement failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return x
-
     def forward(self, x: torch.Tensor, hipa_control_signal: Optional[torch.Tensor] = None, context_hints: Optional[Dict] = None) -> Tuple[torch.Tensor, Dict]:
         """
         Forward pass with dynamically controlled frequency enhancement.
@@ -6813,47 +6121,8 @@ class FrequencyDomainAwareAttention(nn.Module):
 
         modality_config = self.task_analyzer.detect_modality(x, task_id=None, context_hints=context_hints)
 
-        current_theta_boost = self.theta_boost
-        current_gamma_boost = self.gamma_boost
-        current_beta_boost = self.beta_boost
-        
-        thought_vector = None
-        if context_hints and 'ctm_data' in context_hints and context_hints['ctm_data']:
-            ctm_data = context_hints['ctm_data']
-            if 'final_sync_out' in ctm_data and ctm_data['final_sync_out'] is not None:
-                thought_vector_candidate = ctm_data['final_sync_out']
-                if thought_vector_candidate.dim() > 2:
-                    thought_vector = thought_vector_candidate.mean(dim=1)
-                else:
-                    thought_vector = thought_vector_candidate
-            elif 'activated_states' in ctm_data and ctm_data['activated_states']:
-                thought_vector = ctm_data['activated_states'][-1].mean(dim=1)
-
-        if thought_vector is not None:
-            if thought_vector.shape[-1] == self.embed_dim:
-                dynamic_boost_ratios = self.creativity_controller(thought_vector)
-                d_theta, d_gamma, d_beta = dynamic_boost_ratios.chunk(3, dim=-1)
-                
-                reshape_dims = [-1] + [1] * (x.dim() - 1)
-                d_theta = d_theta.view(*reshape_dims)
-                d_gamma = d_gamma.view(*reshape_dims)
-                d_beta = d_beta.view(*reshape_dims)
-                
-                current_theta_boost = 1.0 + d_theta * (self.max_theta_boost - 1.0)
-                current_gamma_boost = 1.0 + d_gamma * (self.max_gamma_boost - 1.0)
-                current_beta_boost = 1.0 + d_beta * (self.max_beta_boost - 1.0)
-            else:
-                 print(f"Warning: Thought vector dim ({thought_vector.shape[-1]}) mismatches creativity_controller input dim ({self.embed_dim}). Using static boosts.")
-
         x_processed = x
-        if modality_config.get('use_hipa', False):
-            if hipa_control_signal is not None:
-                control = hipa_control_signal.view(batch_size, 1, 1)
-                x_enhanced_by_modality = self.apply_frequency_enhancement(x, modality_config, current_theta_boost, current_gamma_boost, current_beta_boost)
-                x_processed = control * x_enhanced_by_modality + (1 - control) * x
-            else:
-                x_processed = self.apply_frequency_enhancement(x, modality_config, current_theta_boost, current_gamma_boost, current_beta_boost)
-
+       
         # This implies freq_attention is a standard MHA. The "frequency aware" part was in apply_frequency_enhancement.
         # So, we apply MHA on x_processed.
 

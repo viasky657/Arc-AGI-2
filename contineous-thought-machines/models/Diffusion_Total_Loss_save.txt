@@ -1,0 +1,154 @@
+ # Update total_loss to include all losses
+        total_loss_combined = total_loss + output_dict['ctm_internal_loss'] + output_dict['mcmc_loss']
+        output_dict['total_loss'] = total_loss_combined
+        
+        # Prepare the final 'losses' dictionary for return.
+        # It should contain all individual loss components.
+        # The 'losses' variable (from the first part of the function) already has some (e.g., diffusion_loss, ewc_loss).
+        # Add ctm_internal_loss and mcmc_loss to it if they were computed in the second part and exist in output_dict.
+        if 'ctm_internal_loss' in output_dict and output_dict['ctm_internal_loss'] is not None:
+            losses['ctm_internal_loss'] = output_dict['ctm_internal_loss']
+        if 'mcmc_loss' in output_dict and output_dict['mcmc_loss'] is not None:
+            losses['mcmc_loss'] = output_dict['mcmc_loss']
+        
+        # The total loss to return is total_loss_combined (calculated around line 3027 using 'total_loss' from Part 1 and new losses).
+        # The dictionary of all losses to return is the now augmented 'losses' variable.
+        # Add all losses to output_dict for consistency
+        for loss_name, loss_val in losses.items():
+            if loss_name not in output_dict:
+                output_dict[loss_name] = loss_val
+        
+        # Update the total loss in output_dict
+        output_dict['total_loss'] = total_loss_combined
+
+
+         # Initialize tracking
+        tracking_data = {
+            'sync_out_history': [],
+            'sync_action_history': [],
+            'activated_states': [],
+            'state_traces': [],
+            'attention_weights': [],
+            'pc_losses': [],
+            'dopamine_errors': [],
+            'plastic_adjustments': []
+        }
+        
+        # Initialize recurrent state
+        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1)
+        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1)
+        
+        # Storage for outputs
+        predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
+        certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+        
+        # Initialize synch values
+        decay_alpha_action, decay_beta_action = None, None
+        decay_alpha_out, decay_beta_out = None, None
+        
+        # Clamp decay parameters
+        if hasattr(self, 'decay_params_action'):
+            self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)
+        self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
+        
+        # Compute learned weighting
+        r_action = (torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1) 
+                   if hasattr(self, 'decay_params_action') else None)
+        r_out = torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
+        
+        # Initialize output synchronization
+        _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
+            activated_state, None, None, r_out, synch_type='out'
+        )
+        
+        # Recurrent loop with full tracking
+        for stepi in range(self.iterations):
+            
+            # Calculate synchronisation for input data interaction
+            if hasattr(self, 'decay_params_action'):
+                synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
+                    activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action'
+                )
+
+                # --- Basal Ganglia Gating ---
+                if self.basal_ganglia is not None:
+                    action_gate, dopamine_error = self.basal_ganglia(
+                        thought_vector=activated_state,
+                        context=activated_state,
+                        reward_signal=None
+                    )
+                    synchronisation_action = synchronisation_action * action_gate
+                    tracking_data['dopamine_errors'].append(dopamine_error)
+
+                tracking_data['sync_action_history'].append(synchronisation_action.clone())
+                
+                # Interact with data via attention
+                if self.q_proj is not None and self.attention is not None:
+                    q = self.q_proj(synchronisation_action).unsqueeze(1)
+                    attn_out, attn_weights = self.attention(q, kv_features, kv_features, 
+                                                           average_attn_weights=False, need_weights=True)
+                    attn_out = attn_out.squeeze(1)
+                    pre_synapse_input = torch.cat((attn_out, activated_state), dim=-1)
+                    tracking_data['attention_weights'].append(attn_weights.clone())
+                else:
+                    pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
+            else:
+                if self.q_proj is not None and self.attention is not None:
+                    q = activated_state.unsqueeze(1)
+                    attn_out, attn_weights = self.attention(q, kv_features, kv_features,
+                                                           average_attn_weights=False, need_weights=True)
+                    attn_out = attn_out.squeeze(1)
+                    pre_synapse_input = torch.cat((attn_out, activated_state), dim=-1)
+                    tracking_data['attention_weights'].append(attn_weights.clone())
+                else:
+                    pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
+            
+
+            # Apply synapses
+            state = self.synapses(pre_synapse_input)
+
+            # --- Apply Activity-Dependent Plasticity ---
+            if self.use_activity_plasticity:
+                plastic_adjustment = self.plastic_synapses(activated_state)
+                state = state + plastic_adjustment
+                tracking_data['plastic_adjustments'].append(plastic_adjustment.clone())
+                tracking_data['plastic_adjustments'].append(plastic_adjustment.clone())
+                
+            
+            # Update state trace
+            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            tracking_data['state_traces'].append(state_trace.clone())
+            
+            # Apply neuron-level models
+            activated_state = self.trace_processor(state_trace)
+
+            # --- Apply Internal CTM Feedback (Self-Modulation) ---
+            if self.use_internal_feedback and self.internal_feedback_module is not None:
+                feedback_signal = self.internal_feedback_module(
+                    diffusion_state=activated_state.unsqueeze(1),
+                    ctm_thought_vector=activated_state
+                )
+                activated_state = activated_state + feedback_signal.squeeze(1)
+
+            tracking_data['activated_states'].append(activated_state.clone())
+
+            # --- Predictive Coding Loss ---
+            if self.use_predictive_coding:
+                pc_loss = self.compute_predictive_coding_loss(activated_state)
+                tracking_data['pc_losses'].append(pc_loss)
+            
+            # Calculate synchronisation for output predictions
+            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
+                activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out'
+            )
+            tracking_data['sync_out_history'].append(synchronisation_out.clone())
+            
+            # Get predictions and certainties
+            current_prediction = self.output_projector(synchronisation_out)
+            current_certainty = self.compute_certainty(current_prediction)
+            
+            predictions[..., stepi] = current_prediction
+            certainties[..., stepi] = current_certainty
+        
+        # Store final state trace for plasticity update
+        self.last_state_trace = state_trace.detach()

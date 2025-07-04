@@ -202,8 +202,7 @@ class TaskAnalyzer:
                 if filename.endswith((".xyz", ".ply", ".obj", ".glb", ".pts")): # Common point cloud extensions
                     config = self.modality_heuristics["Point Cloud"].copy(); config['modality'] = "Point Cloud"; config['detection_source'] = 'hint_filename_pointcloud'; return config
 
-
-        # 2. Tensor Shape and dtype Analysis
+# 2. Tensor Shape and dtype Analysis
         b = x.shape[0]
         dims = x.shape[1:]
         dtype = x.dtype
