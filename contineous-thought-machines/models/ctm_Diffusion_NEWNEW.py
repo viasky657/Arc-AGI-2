@@ -282,51 +282,6 @@ class MetaWINASparsifier(WINASparsifier):
         return output
 
 
-class TopDownAttention(nn.Module):
-    """
-    Dedicated top-down attention module for modulation by high-level goals or consciousness.
-    Uses the current thought vector as query and current activations as keys/values.
-    """
-    def __init__(self, embed_dim, num_heads, dropout=0.1):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x, thought_vector):
-        # x: current activations (B, seq_len, embed_dim)
-        # thought_vector: high-level state (B, embed_dim)
-        
-        # Project thought vector to get query
-        q = self.q_proj(thought_vector)  # (B, embed_dim)
-        # Expand query to match sequence length
-        q = q.unsqueeze(1).expand(-1, x.size(1), -1)  # (B, seq_len, embed_dim)
-        
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        
-        # Reshape for multi-head attention
-        q = q.view(q.size(0), q.size(1), self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(k.size(0), k.size(1), self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(v.size(0), v.size(1), self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Scaled dot-product attention
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        attn_output = torch.matmul(attn_weights, v)  # (B, num_heads, seq_len, head_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.embed_dim)
-        attn_output = self.out_proj(attn_output)
-        
-        return attn_output
-    
 class WINAAttention(nn.Module):
     """
     Multi-head attention with WINA sparse activation.
@@ -2086,10 +2041,6 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     jepa_num_target_blocks: int = 1 # Number of target blocks to predict
 
     # --- Global Plasticity Loss Parameters ---
-    use_global_plasticity_loss: bool = True
-    global_plasticity_loss_weight: float = 0.05
-    local_neuron_selector_loss_weight: float = 0.1
-    target_hebbian_pattern: float = 0.0 # Target for the aggregated Hebbian signal
     local_hebbian_loss_weight: float = 0.01 # New weight for backprop-based hebbian loss
 
     # --- Basal Ganglia Parameters --- #Controls action suppression so that the model's unwanted first unrelated thoughts are suppressed which helps with model safety. Is needed for action suppresion.
@@ -2106,6 +2057,9 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     goal_dim: int = 8 # Dimensionality of the predicted goal vector
     mirror_reward_weight: float = 0.2 # Weight for the selfless reward signal
 
+
+    # --- Confidence Thresholding Parameters ---
+    confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
 
     def __post_init__(self):
         # Validate output dimensions
@@ -2961,6 +2915,12 @@ class OriginalCTMCore(nn.Module):
         final_sync_out, _, _ = self.compute_synchronisation(final_state_data['activated_state'], final_state_data['decay_alpha_out'], final_state_data['decay_beta_out'], r_out, 'out')
         predictions = self.output_projector(final_sync_out)
         certainties = self.compute_certainty(predictions)
+
+        # Confidence Thresholding
+        abstain_mask = torch.zeros(B, dtype=torch.bool, device=device)
+        if self.config.confidence_threshold > 0:
+            confidence_scores = certainties[:, 1]  # Shape: (B,)
+            abstain_mask = confidence_scores < self.config.confidence_threshold
         
         self.last_state_trace = final_state_data['state_trace'].detach()
 
@@ -2971,6 +2931,7 @@ class OriginalCTMCore(nn.Module):
         return {
             'predictions': predictions,
             'certainties': certainties,
+            'abstained': abstain_mask.unsqueeze(-1),
             'final_sync_out': synchronisation_out,
             'predictive_coding_loss': torch.stack(tracking_data['pc_losses']).mean() if tracking_data['pc_losses'] else torch.tensor(0.0, device=device),
             'dopamine_loss': torch.stack(tracking_data['dopamine_errors']).mean() if tracking_data['dopamine_errors'] else torch.tensor(0.0, device=device),
@@ -3137,14 +3098,6 @@ class CTMControlledDiffusionProcessor(nn.Module):
                 nn.ReLU()
             )
             
-        # Add top-down attention only if not using the HRM core, as HRM provides its own top-down control.
-        if not self.config.use_hrm_core:
-            self.top_down_attention = TopDownAttention(
-                embed_dim=config.d_model,
-                num_heads=config.n_heads
-            )
-        else:
-            self.top_down_attention = None
         
         # Replace WINA sparsifier with meta version
         self.wina_sparsifier = MetaWINASparsifier(
@@ -3536,6 +3489,19 @@ class CTMControlledDiffusionProcessor(nn.Module):
                         projected_sync = self.sync_to_noise_proj(sync_guidance)
                         integration_correction = projected_sync * self.integration_flow_strength
                         current_noise = current_noise - integration_correction
+
+            # Handle abstention based on confidence threshold
+            if 'abstained' in ctm_data and ctm_data['abstained'].any():
+                abstained_mask = ctm_data['abstained'].squeeze(-1) # Shape (B,)
+                
+                # Reshape mask for broadcasting to noise tensor shape
+                while abstained_mask.dim() < current_noise.dim():
+                    abstained_mask = abstained_mask.unsqueeze(-1)
+                
+                # Where abstained, use the base (unconditioned) noise prediction.
+                # Otherwise, use the CTM-guided prediction.
+                final_noise = torch.where(abstained_mask, base_noise_pred, current_noise)
+                return final_noise
             
             return current_noise
         
@@ -4075,11 +4041,6 @@ class EnhancedCTMDiffusion(nn.Module):
         self.config = config
         self.device_container = nn.Parameter(torch.empty(0)) # Helper to get device
 
-        # --- Global Plasticity Loss Parameters ---
-        self.use_global_plasticity_loss = getattr(config, 'use_global_plasticity_loss', True)
-        self.global_plasticity_loss_weight = getattr(config, 'global_plasticity_loss_weight', 0.05)
-        self.local_neuron_selector_loss_weight = getattr(config, 'local_neuron_selector_loss_weight', 0.1)
-        self.target_hebbian_pattern = getattr(config, 'target_hebbian_pattern', 0.0)
  
         # Placeholder for TaskAnalyzer instantiation.
         # Ensure TaskAnalyzer is imported (e.g., from .utils import TaskAnalyzer)

@@ -243,10 +243,17 @@ class HierarchicalCTM(OriginalCTMCore):
         # 6. Project output from the final H-synchronisation
         predictions = self.output_projector(synchronisation_out)
         certainties = self.compute_certainty(predictions)
+        
+        # Confidence Thresholding
+        abstain_mask = torch.zeros(b, dtype=torch.bool, device=device)
+        if self.config.confidence_threshold > 0:
+            confidence_scores = certainties[:, 1]  # Shape: (B,)
+            abstain_mask = confidence_scores < self.config.confidence_threshold
 
         return {
-            'predictions': predictions.unsqueeze(-1), 
+            'predictions': predictions.unsqueeze(-1),
             'certainties': certainties.unsqueeze(-1),
+            'abstained': abstain_mask.unsqueeze(-1),
             'final_sync_out': synchronisation_out,
             'activated_states': zH_history,
         }
