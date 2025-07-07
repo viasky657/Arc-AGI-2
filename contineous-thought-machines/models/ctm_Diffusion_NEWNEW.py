@@ -1011,7 +1011,6 @@ class AdaptiveBatchSampler:
         """Get current batch size."""
         return self.current_batch_size
 
-
 class SmartDataSampler:
     """
     Intelligent data sampling system for prioritizing informative binary patterns.
@@ -2988,65 +2987,6 @@ class BidirectionalReasoningController(nn.Module):
         
         return step_delta, termination_prob
 
-class FeedbackModule(nn.Module):
-    """
-    A biologically-inspired feedback module for meta-learning.
-    It uses cross-attention to allow a lower layer to dynamically query
-    a higher layer for relevant information, which is then gated and used
-    to modulate the lower layer's state.
-    """
-    def __init__(self, d_model: int, n_heads: int):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        
-        self.gate = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.Sigmoid()
-        )
-        
-        self.feedback_attention = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            batch_first=True
-        )
-        
-        self.final_norm = nn.LayerNorm(d_model)
-
-    def forward(self, higher_level_output_pooled: torch.Tensor, lower_level_state_seq: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            higher_level_output_pooled: Output from a higher layer, pooled. (B, D)
-            lower_level_state_seq: State of the lower layer. (B, S, D)
-            
-        Returns:
-            The modulated lower-level state sequence. (B, S, D)
-        """
-        seq_len = lower_level_state_seq.size(1)
-        
-        higher_level_expanded = higher_level_output_pooled.unsqueeze(1)
-
-        # The lower layer queries the higher layer for relevant information
-        # Query: lower_level_state_seq
-        # Key/Value: higher_level_expanded
-        attn_output, _ = self.feedback_attention(
-            query=lower_level_state_seq,
-            key=higher_level_expanded,
-            value=higher_level_expanded
-        )
-        
-        # Calculate a gate value based on the higher-level input and the lower-level state
-        gate_input = torch.cat([
-            higher_level_expanded.expand(-1, seq_len, -1),
-            lower_level_state_seq
-        ], dim=-1)
-        gate_value = self.gate(gate_input)
-        
-        # Apply the gate to the attention output
-        feedback_modulation = attn_output * gate_value
-        
-        # Directly modulate the lower level state and normalize
-        return self.final_norm(lower_level_state_seq + feedback_modulation)
 
 class CTMControlledDiffusionProcessor(nn.Module):
     """
@@ -3080,14 +3020,6 @@ class CTMControlledDiffusionProcessor(nn.Module):
             self.recurrent_cells[f"layer_{layer}"] = nn.GRUCell(
                 input_size=config.d_model,
                 hidden_size=config.d_model
-            )
-            
-        # Add feedback modules
-        self.feedback_modules = nn.ModuleDict()
-        for layer in range(config.num_layers - 1):
-            self.feedback_modules[f"layer_{layer}"] = FeedbackModule(
-                d_model=config.d_model,
-                n_heads=config.n_heads
             )
             
         # Add predictive coding modules
@@ -5546,9 +5478,6 @@ class EnhancedCTMDiffusion(nn.Module):
         
         return benchmark_results
 
-
-
-
 # Configuration helpers
     def iterative_generation(self, condition: torch.Tensor, num_steps: int = 3) -> torch.Tensor:
         """
@@ -5573,6 +5502,85 @@ class EnhancedCTMDiffusion(nn.Module):
             output = output + refinement
             
         return output
+
+    def _jepa_create_masked_patch_views(self,
+                                        online_patch_embeddings: torch.Tensor,
+                                        target_patch_embeddings: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            """
+            Creates context and target representations from sequences of patch embeddings for JEPA.
+            Masking is applied at the patch sequence level. This version aims to select
+            one context block and one target block per sample.
+
+            Args:
+                online_patch_embeddings: (B, S_patches, D_embed) from the online encoder.
+                target_patch_embeddings: (B, S_patches, D_embed) from the target encoder.
+
+            Returns:
+                Tuple of (context_representation, actual_target_representation), or (None, None) if masking fails.
+                context_representation: (B, D_embed) - selected context patch from online encoder.
+                actual_target_representation: (B, num_target_blocks, D_embed) - selected target patches from target encoder.
+            """
+            B, S_patches, D_embed = online_patch_embeddings.shape
+            device = online_patch_embeddings.device
+
+            if S_patches < 2: # Need at least one patch for context and one for target
+                return None, None
+
+            batch_context_reps = []
+            batch_target_reps = []
+
+            for b_idx in range(B):
+                # 1. Determine context block size
+                context_scale = random.uniform(self.config.jepa_context_scale_min, self.config.jepa_context_scale_max)
+                num_context_patches = max(1, int(S_patches * context_scale))
+                # Ensure there's enough space for at least num_target_blocks patches left after context
+                num_context_patches = min(num_context_patches, S_patches - self.config.jepa_num_target_blocks)
+
+                if num_context_patches <= 0: # Not enough patches to form a context and have targets
+                    continue
+
+                # 2. Select context block
+                # Ensure there's enough space for context block and target blocks
+                if S_patches < num_context_patches + self.config.jepa_num_target_blocks:
+                    continue
+
+                all_indices = torch.arange(S_patches, device=device)
+                
+                # Randomly select start for context block
+                # Max start index for context ensures that context_block + target_blocks fit
+                max_context_start_idx = S_patches - num_context_patches - self.config.jepa_num_target_blocks
+                if max_context_start_idx < 0: # Should be caught by S_patches check above, but for safety
+                    continue
+                
+                context_start_idx = random.randint(0, max_context_start_idx)
+                context_indices = all_indices[context_start_idx : context_start_idx + num_context_patches]
+                context_block_embeddings = online_patch_embeddings[b_idx, context_indices, :] # (num_context_patches, D_embed)
+                context_rep = context_block_embeddings.mean(dim=0) # (D_embed) - Average context patches
+
+                # 3. Select target blocks (non-overlapping with context)
+                # Create a mask for available target indices
+                available_target_mask = torch.ones(S_patches, dtype=torch.bool, device=device)
+                available_target_mask[context_indices] = False # Mask out context indices
+                
+                potential_target_indices = all_indices[available_target_mask]
+
+                if len(potential_target_indices) < self.config.jepa_num_target_blocks:
+                    continue # Not enough non-overlapping patches left for the required number of target blocks
+                
+                # Shuffle potential target indices and select
+                shuffled_potential_target_indices = potential_target_indices[torch.randperm(len(potential_target_indices), device=device)]
+                actual_target_indices = shuffled_potential_target_indices[:self.config.jepa_num_target_blocks]
+                
+                selected_target_patches = target_patch_embeddings[b_idx, actual_target_indices, :] # (num_target_blocks, D_embed)
+                target_rep = selected_target_patches # Keep as distinct blocks, shape (num_target_blocks, D_embed)
+
+                batch_context_reps.append(context_rep) # List of (D_embed)
+                batch_target_reps.append(target_rep)   # List of (num_target_blocks, D_embed)
+
+            if not batch_context_reps or not batch_target_reps:
+                return None, None
+
+            return torch.stack(batch_context_reps), torch.stack(batch_target_reps)
 
 def create_enhanced_config_for_text_generation(vocab_size: int) -> EnhancedCTMConfig:
     """Create enhanced configuration for text generation with strong CTM control"""
@@ -5601,84 +5609,6 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
     return config
 
 
-def _jepa_create_masked_patch_views(self,
-                                      online_patch_embeddings: torch.Tensor,
-                                      target_patch_embeddings: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-        Creates context and target representations from sequences of patch embeddings for JEPA.
-        Masking is applied at the patch sequence level. This version aims to select
-        one context block and one target block per sample.
-
-        Args:
-            online_patch_embeddings: (B, S_patches, D_embed) from the online encoder.
-            target_patch_embeddings: (B, S_patches, D_embed) from the target encoder.
-
-        Returns:
-            Tuple of (context_representation, actual_target_representation), or (None, None) if masking fails.
-            context_representation: (B, D_embed) - selected context patch from online encoder.
-            actual_target_representation: (B, num_target_blocks, D_embed) - selected target patches from target encoder.
-        """
-        B, S_patches, D_embed = online_patch_embeddings.shape
-        device = online_patch_embeddings.device
-
-        if S_patches < 2: # Need at least one patch for context and one for target
-            return None, None
-
-        batch_context_reps = []
-        batch_target_reps = []
-
-        for b_idx in range(B):
-            # 1. Determine context block size
-            context_scale = random.uniform(self.config.jepa_context_scale_min, self.config.jepa_context_scale_max)
-            num_context_patches = max(1, int(S_patches * context_scale))
-            # Ensure there's enough space for at least num_target_blocks patches left after context
-            num_context_patches = min(num_context_patches, S_patches - self.config.jepa_num_target_blocks)
-
-            if num_context_patches <= 0: # Not enough patches to form a context and have targets
-                continue
-
-            # 2. Select context block
-            # Ensure there's enough space for context block and target blocks
-            if S_patches < num_context_patches + self.config.jepa_num_target_blocks:
-                continue
-
-            all_indices = torch.arange(S_patches, device=device)
-            
-            # Randomly select start for context block
-            # Max start index for context ensures that context_block + target_blocks fit
-            max_context_start_idx = S_patches - num_context_patches - self.config.jepa_num_target_blocks
-            if max_context_start_idx < 0: # Should be caught by S_patches check above, but for safety
-                continue
-            
-            context_start_idx = random.randint(0, max_context_start_idx)
-            context_indices = all_indices[context_start_idx : context_start_idx + num_context_patches]
-            context_block_embeddings = online_patch_embeddings[b_idx, context_indices, :] # (num_context_patches, D_embed)
-            context_rep = context_block_embeddings.mean(dim=0) # (D_embed) - Average context patches
-
-            # 3. Select target blocks (non-overlapping with context)
-            # Create a mask for available target indices
-            available_target_mask = torch.ones(S_patches, dtype=torch.bool, device=device)
-            available_target_mask[context_indices] = False # Mask out context indices
-            
-            potential_target_indices = all_indices[available_target_mask]
-
-            if len(potential_target_indices) < self.config.jepa_num_target_blocks:
-                continue # Not enough non-overlapping patches left for the required number of target blocks
-            
-            # Shuffle potential target indices and select
-            shuffled_potential_target_indices = potential_target_indices[torch.randperm(len(potential_target_indices), device=device)]
-            actual_target_indices = shuffled_potential_target_indices[:self.config.jepa_num_target_blocks]
-            
-            selected_target_patches = target_patch_embeddings[b_idx, actual_target_indices, :] # (num_target_blocks, D_embed)
-            target_rep = selected_target_patches # Keep as distinct blocks, shape (num_target_blocks, D_embed)
-
-            batch_context_reps.append(context_rep) # List of (D_embed)
-            batch_target_reps.append(target_rep)   # List of (num_target_blocks, D_embed)
-
-        if not batch_context_reps or not batch_target_reps:
-            return None, None
-
-        return torch.stack(batch_context_reps), torch.stack(batch_target_reps)
 
 class GoalPredictor(nn.Module):
     """Predicts likely internal goals of observed agents"""
@@ -5737,66 +5667,10 @@ class EmotionStateTracker(nn.Module):
         # Update emotion state using GRU
         updated_emotion, _ = self.emotion_update(current_emotion, prev_emotion.unsqueeze(0))
         return updated_emotion.squeeze(0)
+    
 
-class GoalPredictor(nn.Module):
-    """Predicts likely internal goals of observed agents"""
-    def __init__(self, d_model: int, goal_dim: int = 8):
-        super().__init__()
-        self.d_model = d_model
-        self.goal_dim = goal_dim
-        self.goal_net = nn.Sequential(
-   
-            nn.Linear(d_model * 2, d_model * 4),
-            nn.ReLU(),
-            nn.Linear(d_model * 4, d_model * 2),
-            nn.ReLU(),
-            nn.Linear(d_model * 2, goal_dim)
-        )
-        self.goal_update = nn.GRU(d_model, goal_dim, batch_first=True)
 
-        
-    def forward(self, current_state: torch.Tensor, prev_goal: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            current_state: Current neural state [batch, seq_len, d_model]
-            prev_goal: Previous goal state [batch, seq_len, goal_dim]
-            
-        Returns:
-            Predicted goal state [batch, seq_len, goal_dim]
-        """
-        # Predict goal from current state and context
-        context = current_state.mean(dim=1, keepdim=True).expand(-1, current_state.size(1), -1)
-        goal_input = torch.cat([current_state, context], dim=-1)
-        goal_pred = self.goal_net(goal_input)
-        
-        # Update goal state using GRU
-        updated_goal, _ = self.goal_update(goal_pred, prev_goal.unsqueeze(0))
-        return updated_goal.squeeze(0)
 
-class EmotionStateTracker(nn.Module):
-    """Tracks and updates emotion states based on neural activity"""
-    def __init__(self, d_model: int, num_emotion_dim: int = 4):
-        super().__init__()
-        self.d_model = d_model
-        self.num_emotion_dim = num_emotion_dim
-        self.emotion_proj = nn.Linear(d_model, num_emotion_dim)
-        self.emotion_update = nn.GRU(num_emotion_dim, num_emotion_dim, batch_first=True)
-        
-    def forward(self, neural_state: torch.Tensor, prev_emotion: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            neural_state: Current neural state [batch, seq_len, d_model]
-            prev_emotion: Previous emotion state [batch, seq_len, num_emotion_dim]
-            
-        Returns:
-            Updated emotion state [batch, seq_len, num_emotion_dim]
-        """
-        # Project neural state to emotion space
-        current_emotion = self.emotion_proj(neural_state)
-        
-        # Update emotion state using GRU
-        updated_emotion, _ = self.emotion_update(current_emotion, prev_emotion.unsqueeze(0))
-        return updated_emotion.squeeze(0)
         
 class SynapticEmpathy(nn.Module):
     """
@@ -6047,6 +5921,7 @@ class MirrorNeuronLayer(nn.Module):
         m = self.config.jepa_momentum_beta
         for param_online, param_target in zip(self.dynamic_entropy_patcher.parameters(), self.jepa_target_patch_encoder.parameters()):
             param_target.data.mul_(m).add_((1 - m) * param_online.data)
+            
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
 
