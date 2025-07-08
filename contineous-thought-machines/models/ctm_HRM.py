@@ -32,6 +32,8 @@ from .ctm_Diffusion_NEWNEW import (
     SubquadraticAttention, BinarySparseAttention
 )
 from .utils import compute_normalized_entropy
+from .long_term_memory import LongTermMemory
+from .program_synthesizer import ProgramSynthesizer
 
 class HRM_L_Module(nn.Module):
     """The Low-Level, fast-updating CTM-based recurrent module for the HR-CTM."""
@@ -112,27 +114,58 @@ class HRM_H_Module(nn.Module):
         self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
         # Project zL to match d_model for attention
-        self.zl_proj = nn.Linear(config.d_model, config.d_model) # Assuming zL has d_model
-
-    def forward(self, zH: torch.Tensor, zL: torch.Tensor) -> torch.Tensor:
+        self.zl_proj = nn.Linear(config.d_model, config.d_model)  # Assuming zL has d_model
+        patcher_config = {
+            'embedding_dim': config.patch_embedding_dim,
+            'patch_cnn_channels': config.patch_encoder_cnn_channels,
+            'patching_mode': config.entropy_patcher_threshold_type,
+            'global_threshold': config.entropy_patcher_global_threshold,
+            'relative_threshold': config.entropy_patcher_relative_threshold,
+            'min_patch_size': config.entropy_patcher_min_patch_size,
+            'max_patch_size': config.entropy_patcher_max_patch_size,
+            'entropy_byte_vocab_size': config.entropy_model_byte_vocab_size,
+            'entropy_embedding_dim': config.entropy_model_embedding_dim,
+            'entropy_hidden_dim': config.entropy_model_hidden_dim,
+            'entropy_num_layers': config.entropy_model_num_layers,
+            'entropy_dropout': config.entropy_model_dropout
+        }
+        self.program_synthesizer = ProgramSynthesizer(
+            d_model=config.d_model,
+            n_heads=config.program_synth_n_heads,
+            n_layers=config.program_synth_n_layers,
+            d_ff=config.program_synth_d_ff,
+            dropout=config.dropout,
+            max_gen_len=config.max_sequence_length, # Or a more specific config
+            patcher_config=patcher_config
+        )
+        
+    def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             zH (torch.Tensor): Current high-level state.
             zL (torch.Tensor): Final low-level state from the L-cycle.
+            retrieved_memory (torch.Tensor): Memory retrieved from the LTM.
         Returns:
-            torch.Tensor: Next high-level state.
+            Tuple[torch.Tensor, torch.Tensor]: Next high-level state and synthesized program.
         """
-         # The query is the current high-level state
+        # The query is the current high-level state
         q = zH
-        # The key/value is the information from the completed low-level cycle
-        kv = self.zl_proj(zL)
+        # The key/value is the information from the completed low-level cycle and retrieved memory
+        # The retrieved_memory is now a single contextualized vector from the LTM's attention mechanism
+        kv = self.zl_proj(zL) + retrieved_memory.squeeze(0) # Squeeze to remove the batch dim of 1
         # Attention step
         attn_output = self.attn(q, kv, kv)
         zH = self.norm1(zH + attn_output)
         # MLP step
         mlp_output = self.mlp(zH)
         zH = self.norm2(zH + mlp_output)
-        return zH
+        
+        # Synthesize a program using the new synthesizer
+        encoded_patches, patch_indices, entropy_aux_loss = self.program_synthesizer(zH)
+        
+        # The 'program' is now the sequence of encoded patches.
+        # The other outputs might be used for loss calculation or debugging.
+        return zH, encoded_patches, patch_indices, entropy_aux_loss
 
 class HierarchicalCTM(OriginalCTMCore):
     """
@@ -144,6 +177,7 @@ class HierarchicalCTM(OriginalCTMCore):
         # as we are building a different structure.
         super(OriginalCTMCore, self).__init__()
         self.config = config
+        self.replay_batch_size = getattr(config, 'replay_batch_size', 4)
         self.d_model = config.ctm_d_model
         self.d_input = config.ctm_input_dim
         self.memory_length = config.ctm_memory_length
@@ -161,6 +195,7 @@ class HierarchicalCTM(OriginalCTMCore):
         # --- Instantiate HRM Modules ---
         self.l_module = HRM_L_Module(config, self)
         self.h_module = HRM_H_Module(config)
+        self.ltm = LongTermMemory(config.d_model, config.ltm_size)
         
         # --- Input/Output Layers ---
         self.input_encoder = nn.Linear(config.ctm_input_dim, self.d_input)
@@ -194,7 +229,7 @@ class HierarchicalCTM(OriginalCTMCore):
         b, s, _ = x.shape
         device = x.device
 
-        # 1. Project input 
+        # 1. Project input
         x_context = self.input_encoder(x)
         
         # 2. Initialize states
@@ -210,6 +245,8 @@ class HierarchicalCTM(OriginalCTMCore):
 
         # Store history of high-level states for final representation
         zH_history = []
+        programs = []
+        total_entropy_loss = torch.tensor(0.0, device=device)
 
         # 4. Hierarchical recurrent loop
         for n in range(self.config.hrm_high_level_cycles):
@@ -227,9 +264,30 @@ class HierarchicalCTM(OriginalCTMCore):
                     activated_zL, zL_trace, zH, x_context, sync_action
                 )
             
+            # Calculate surprise
+            surprise = compute_normalized_entropy(activated_zL.unsqueeze(1)).mean()
+            
+            # Store zH in LTM if surprising
+            if surprise > self.config.ltm_surprise_threshold:
+                self.ltm.add_to_memory(zH.squeeze(0), surprise)
+
+            # Retrieve from LTM
+            retrieved_memory = self.ltm.retrieve_from_memory(zH.squeeze(0))
+
             # End of low-level cycle, update high-level state using the final L-state
-            zH = self.h_module(zH, activated_zL)
+            zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, activated_zL, retrieved_memory)
             zH_history.append(zH)
+            # The 'programs' list now stores the patch embeddings
+            programs.append(encoded_patches)
+            total_entropy_loss += entropy_aux_loss
+
+            # Replay from LTM
+            replayed_memory = self.ltm.replay_memory(batch_size=self.replay_batch_size)
+            if replayed_memory is not None:
+                # Process replayed memory through H-module to make it a compatible state
+                # Here we might need a simplified pass or assumption
+                # For now, let's assume replayed memory can be treated as a zH-like state
+                zH_history.append(replayed_memory.mean(dim=0, keepdim=True).expand(b, -1))
 
         # 5. Compute final output synchronisation from the history of H-states
         # This treats the H-module's evolution as the final 'trace' for output
@@ -256,4 +314,6 @@ class HierarchicalCTM(OriginalCTMCore):
             'abstained': abstain_mask.unsqueeze(-1),
             'final_sync_out': synchronisation_out,
             'activated_states': zH_history,
+            'programs': programs,
+            'entropy_aux_loss': total_entropy_loss
         }

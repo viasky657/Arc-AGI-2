@@ -1977,6 +1977,14 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     use_hrm_core: bool = False # Set to True to use the HierarchicalCTM core
     hrm_high_level_cycles: int = 4 # N: Number of high-level cycles
     hrm_low_level_timesteps: int = 8 # T: Number of low-level timesteps per high-level cycle
+    program_vocab_size: int = 1024 # Vocabulary size for the program synthesizer
+    program_synth_n_heads: int = 4
+    program_synth_n_layers: int = 3
+    program_synth_d_ff: int = 1024
+    ltm_size: int = 2048 # Size of the long-term memory
+    ltm_surprise_threshold: float = 0.6 # Surprise threshold for storing in LTM
+    replay_batch_size: int = 4 # Batch size for memory replay
+    replay_policy: str = "surprise_weighted_replay" # "simple_replay", "surprise_weighted_replay", "usefulness_replay"
 
     # Pipeline Parallelism Parameters
     enable_pipeline_parallelism: bool = True
@@ -4924,6 +4932,8 @@ class EnhancedCTMDiffusion(nn.Module):
             ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
             output_dict['ctm_core_data'] = ctm_data
             theta_candidate_from_ctm = ctm_data['final_sync_out']
+            if self.config.use_hrm_core:
+                output_dict['programs'] = ctm_data.get('programs')
         
         final_ctm_representation = theta_candidate_from_ctm
 
