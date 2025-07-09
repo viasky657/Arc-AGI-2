@@ -543,7 +543,9 @@ config_arc_diffusion = EnhancedCTMConfig(
     vocab_size=None,
     output_audio_bytes=False,
     unet_input_feature_dim=MAX_SEQUENCE_LENGTH // 4, # Calculated based on float32 audio
-    local_hebbian_loss_weight=0.01
+    local_hebbian_loss_weight=0.01,
+    enable_consciousness_controller=True,
+    consciousness_max_attention_steps=100
 )
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
     

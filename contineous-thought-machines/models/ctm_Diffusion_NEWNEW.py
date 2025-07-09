@@ -2068,9 +2068,13 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
 
     # --- Confidence Thresholding Parameters ---
     confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
+ 
+    # --- Consciousness Controller Parameters ---
+    enable_consciousness_controller: bool = True
+    consciousness_max_attention_steps: int = 100
 
-    def __post_init__(self):
-        # Validate output dimensions
+     def __post_init__(self):
+         # Validate output dimensions
         if len(self.output_dims) != self.num_outputs:
             raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")
 
@@ -4165,6 +4169,16 @@ class EnhancedCTMDiffusion(nn.Module):
         
         # Initialize new optimization components
         self._initialize_optimization_components()
+
+        # Consciousness Controller
+        if self.config.enable_consciousness_controller:
+            self.consciousness_controller = ConsciousnessController(
+                model_dim=config.d_model,
+                max_attention_steps=config.consciousness_max_attention_steps
+            )
+        else:
+            self.consciousness_controller = None
+        self.consciousness_step = 0
     
     def _initialize_optimization_components(self):
         """Initialize the new optimization components."""
@@ -4433,6 +4447,10 @@ class EnhancedCTMDiffusion(nn.Module):
         # raw_features is (batch, num_patches_or_seq, feature_dim)
         encoded_features = self.input_encoder(raw_features) # Output: (batch, num_patches_or_seq, ctm_input_dim)
 
+        # Apply consciousness modulation
+        if self.consciousness_controller and self.consciousness_controller.consciousness_state != 'sleeping':
+             encoded_features = self.consciousness_controller.apply_consciousness_to_features(encoded_features)
+
         # Apply positional embedding if configured
         if self.positional_embedding is not None and encoded_features.shape[1] > 0:
             if self.config.reshape_patch_sequence_to_grid and \
@@ -4543,6 +4561,22 @@ class EnhancedCTMDiffusion(nn.Module):
         """
         kv_features_for_ctm = x
         return kv_features_for_ctm
+
+    def wake_up(self):
+        """Gradually wake up the model's attention."""
+        if self.consciousness_controller:
+            self.consciousness_step = 0
+            for i in range(self.consciousness_controller.max_attention_steps):
+                self.consciousness_controller.wake_up(i)
+            print("Model is fully awake.")
+
+    def sleep_down(self):
+        """Gradually put the model's attention to sleep."""
+        if self.consciousness_controller:
+            self.consciousness_step = 0
+            for i in range(self.consciousness_controller.max_attention_steps):
+                self.consciousness_controller.sleep_down(i)
+            print("Model is fully asleep.")
     
     def forward(self, byte_sequence: torch.Tensor, target_diffusion_output: Optional[torch.Tensor] = None,
                 mode: str = 'ctm_controlled_diffusion', timestep: Optional[torch.Tensor] = None,

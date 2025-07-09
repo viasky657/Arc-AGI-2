@@ -199,6 +199,8 @@ else:
     
     for epoch in range(NUM_EPOCHS_ARC):
         ctm_model_arc.train()
+        if hasattr(ctm_model_arc, 'wake_up'):
+            ctm_model_arc.wake_up()
 
         total_epoch_loss = 0
         
@@ -293,5 +295,8 @@ else:
                     save_file(unwrapped_model.state_dict(), os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{epoch+1}.safetensors"))
                 
                 print(f"✓ Checkpoint saved for epoch {epoch+1} to {CHECKPOINT_DIR_ARC}")
+
+        if hasattr(ctm_model_arc, 'sleep_down'):
+            ctm_model_arc.sleep_down()
 
     print("\n🎉 ARC-AGI-2 Meta-Learning Training Phase Completed!")

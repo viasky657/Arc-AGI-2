@@ -405,8 +405,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             if not self.use_dynamic_entropy_patcher:
                 print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
 
-
-config_arc_diffusion = EnhancedCTMConfig()
+config_arc_diffusion = EnhancedCTMConfig(
+    enable_consciousness_controller=True,
+    consciousness_max_attention_steps=100
+)
 
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
 
@@ -493,6 +495,8 @@ else:
             print(f"⚠️ CTM Checkpoint not found at {ctm_checkpoint_path_eval}.")
 
         ctm_model_arc.eval()
+        if hasattr(ctm_model_arc, 'wake_up'):
+            ctm_model_arc.wake_up()
         total_tasks = 0
         solved_tasks = 0
 
@@ -595,6 +599,9 @@ else:
                 f.write(summary)
         else:
             print("\nARC-AGI-2 Evaluation: No tasks were evaluated.")
+        
+        if hasattr(ctm_model_arc, 'sleep_down'):
+            ctm_model_arc.sleep_down()
             
     except FileNotFoundError as e:
         print(f"❌ Checkpoint file not found: {e}. Please ensure paths are correct.")   
