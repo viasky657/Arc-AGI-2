@@ -32,6 +32,7 @@ import random
 import copy # For JEPA target encoder deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import queue
+from .realtime_voice_module import RealtimeVoiceStreamer
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler #Need to install with pip
 import numpy as np
 
@@ -5932,6 +5933,13 @@ class MirrorNeuronLayer(nn.Module):
         for param_online, param_target in zip(self.dynamic_entropy_patcher.parameters(), self.jepa_target_patch_encoder.parameters()):
             param_target.data.mul_(m).add_((1 - m) * param_online.data)
             
+    def start_realtime_voice_streaming(self, duration=10):
+        """
+        Starts the real-time voice streaming session.
+        """
+        streamer = RealtimeVoiceStreamer(self, self.config)
+        streamer.run(duration=duration)
+        
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
 

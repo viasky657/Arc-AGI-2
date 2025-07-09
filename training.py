@@ -4,8 +4,13 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+from torch.cuda.amp import autocast, GradScaler
 import glob
 import json
+from dataclasses import dataclass, field
+from typing import List, Optional, Any
+import math
 
 CUDA_LAUNCH_BLOCKING=1 #Diagnose cuda errors. 
 # --- FIX: Define NUM_ARC_SYMBOLS globally for DataLoader workers ---
@@ -18,6 +23,13 @@ print(f"🚀 STARTING PHASE 4: ARC-AGI-2 Meta-Learning Training")
 print(f"   Epochs: {NUM_EPOCHS_ARC}, Batch Size: {ARC_BATCH_SIZE}, Task ID: {ARC_TASK_ID}")
 print(f"   Device: {device if not accelerator_arc else accelerator_arc.device}")
 print("="*60 + "\n")
+
+# --- Training Configuration ---
+USE_MIXED_PRECISION = torch.cuda.is_available()
+autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+GRADIENT_ACCUMULATION_STEPS = 4
+MAX_GRAD_NORM = 1.0
+scaler = torch.amp.GradScaler('cuda',enabled=USE_MIXED_PRECISION)
 
 # --- Context: 2D Grid Padding (from original code) ---
 def pad_grid(grid_list, max_dims, pad_value):
@@ -179,270 +191,107 @@ def get_rank_debug():
     print(f"[DEBUG] Rank {rank} out of {world_size} total ranks")
     return rank, world_size
 
-# --- MCMC Plasticity Loss Normalization Factor ---
-# Scale MCMC loss to prevent overpowering other loss components
-MCMC_LOSS_SCALE = 0.01  # Scale factor for MCMC loss
-MAX_MCMC_LOSS_FOR_PLASTICITY = 1000  # Increased cap to allow larger raw loss values
 
-if not all([ctm_model_arc, arc_output_head, optimizer_arc, arc_train_loader, arc_criterion]):
+if not all([ctm_model_arc, optimizer_arc, arc_train_loader]):
     print("⚠️ Skipping ARC-AGI-2 training due to missing components.")
 else:
-    # Record original global plasticity weight for scheduling
-    orig_global_plasticity_loss_weight = ctm_model_arc.global_plasticity_loss_weight
-    orig_local_selector_loss_weight = ctm_model_arc.local_neuron_selector_loss_weight
-    # Initialize surrogate model
-    from dgm.alpha_mcmc_evolution import GodelMachineJudge, JudgedNeuralSurrogate
-    judge = GodelMachineJudge()
-    surrogate_func_instance = JudgedNeuralSurrogate(judge)
-
+    print("✓ All components ready for ARC training.")
+    
     for epoch in range(NUM_EPOCHS_ARC):
+        ctm_model_arc.train()
 
-        if epoch < 10: # Linear ramp-up of global plasticity weight over first 10 epochs
-            ramp_factor = (epoch + 1) / 10.0
-            ctm_model_arc.global_plasticity_loss_weight = orig_global_plasticity_loss_weight * ramp_factor
-        else: # Full weight training for the global plasticity weight
-            ctm_model_arc.global_plasticity_loss_weight = orig_global_plasticity_loss_weight
-            ctm_model_arc.train()
-            arc_output_head.train()
-            if ctm_mcmc_integration_arc: ctm_mcmc_integration_arc.train()
+        total_epoch_loss = 0
+        
+        progress_bar = tqdm(enumerate(arc_train_loader), total=len(arc_train_loader), desc=f"ARC Epoch {epoch + 1}")
 
-            total_arc_loss = 0
-            processed_batches = 0
-
-        total_arc_loss = 0
-        processed_batches = 0
-        for batch_idx, batch_data in enumerate(arc_train_loader):
+        for batch_idx, batch_data in progress_bar:
             if not batch_data or batch_data['input_byte_sequences'].numel() == 0:
                 print(f"Skipping empty batch {batch_idx}")
                 continue
 
-            # Get data from the updated collate_fn
-            input_bytes = batch_data['input_byte_sequences'].to(device if not accelerator_arc else accelerator_arc.device)
-            target_bytes_for_diffusion = batch_data['target_byte_sequences_for_diffusion'].to(device if not accelerator_arc else accelerator_arc.device)
-            original_target_grids_for_ce = batch_data['original_target_grids_for_ce_loss'].to(device if not accelerator_arc else accelerator_arc.device)
-
+            input_bytes = batch_data['input_byte_sequences'].to(accelerator_arc.device if accelerator_arc else device)
+            target_bytes_for_diffusion = batch_data['target_byte_sequences_for_diffusion'].to(accelerator_arc.device if accelerator_arc else device)
+            
             current_batch_size = input_bytes.size(0)
 
             optimizer_arc.zero_grad()
+            
+            autocast_context = accelerator_arc.autocast() if accelerator_arc else autocast(enabled=USE_MIXED_PRECISION, dtype=autocast_dtype)
 
-            with autocast(enabled=USE_MIXED_PRECISION, dtype=autocast_dtype) if not accelerator_arc else accelerator_arc.autocast():
-                # Forward pass through EnhancedCTMDiffusion
+            with autocast_context:
                 model_output_dict = ctm_model_arc(
                     byte_sequence=input_bytes,
                     target_diffusion_output=target_bytes_for_diffusion,
                     mode='ctm_controlled_diffusion',
-                    timestep=torch.randint(0, config_arc_diffusion.diffusion_steps, (current_batch_size,), device=input_bytes.device).long(),
-                    target_mcmc_output=None,
-                    task_name="ARC_AGI_2",
-                    current_epoch=epoch
+                    timestep=torch.randint(0, config_arc_diffusion.diffusion_steps, (current_batch_size,), device=input_bytes.device).long()
                 )
-                # Ensure both predictions and final_sync_out are always available at top level
-                if 'ctm_core_data' in model_output_dict:
-                    ctm_core = model_output_dict['ctm_core_data']
-                    if 'predictions' in ctm_core and 'predictions' not in model_output_dict:
-                        model_output_dict['predictions'] = ctm_core['predictions']
-                    if 'final_sync_out' in ctm_core and 'final_sync_out' not in model_output_dict:
-                        model_output_dict['final_sync_out'] = ctm_core['final_sync_out']
 
-                # Retrieve CTM output components including all model-internal losses and signals
-                diffusion_loss = model_output_dict.get('diffusion_loss', torch.tensor(0.0, device=input_bytes.device))
-                predictions = model_output_dict.get('predictions', None)
-                certainties = model_output_dict.get('certainties', None)
-                final_sync_out = model_output_dict.get('final_sync_out', None)
-                predictive_coding_loss = model_output_dict.get('predictive_coding_loss', torch.tensor(0.0, device=input_bytes.device))
-                local_hebbian_signal = model_output_dict.get('local_hebbian_signal', torch.tensor(0.0, device=input_bytes.device))
-                local_neuron_selector_loss_model = model_output_dict.get('local_neuron_selector_loss', torch.tensor(0.0, device=input_bytes.device))
-                global_plasticity_loss = model_output_dict.get('global_plasticity_loss', torch.tensor(0.0, device=input_bytes.device))
-                # Initialize total loss for the optimizer with the model's computed total_loss
-                total_loss = model_output_dict.get('total_loss', diffusion_loss)
-                
-                # --- Get CTM core output for auxiliary heads ---
-                # Always use final_sync_out for consistent 512-dim features for ARC head
-                ctm_backbone_output = None
-                if model_output_dict and 'final_sync_out' in model_output_dict:
-                    ctm_backbone_output = model_output_dict['final_sync_out']
-                    if ctm_backbone_output.ndim > 2:
-                        ctm_backbone_output = ctm_backbone_output.mean(dim=1)
-                    print(f"  [TRAINING] Using final_sync_out with shape: {ctm_backbone_output.shape}")
-                else:
-                    print("Warning: final_sync_out not found in model output. Using zeros for auxiliary head inputs.")
-                    ctm_backbone_output = torch.zeros(current_batch_size, config_arc_diffusion.ctm_out_dims, device=input_bytes.device)
-                
-                # --- Calculate and add auxiliary losses to the total_loss for the optimizer ---
-                ce_loss = torch.tensor(0.0, device=input_bytes.device)
-                if arc_output_head and ctm_backbone_output is not None:
-                    if ctm_backbone_output.ndim > 2:
-                        ctm_features_for_head = ctm_backbone_output.mean(dim=1)
-                    else:
-                        ctm_features_for_head = ctm_backbone_output
-                    
-                    # Check if features match ARC head expectations, use final_sync_out if needed
-                    if ctm_features_for_head.shape[-1] != arc_output_head.in_features:
-                        print(f"  [TRAINING] Feature dimension mismatch for ARC head! Expected {arc_output_head.in_features}, got {ctm_features_for_head.shape[-1]}")
-                        if model_output_dict and 'final_sync_out' in model_output_dict:
-                            alt_features = model_output_dict['final_sync_out']
-                            if alt_features.ndim > 2:
-                                alt_features = alt_features.mean(dim=1)
-                            if alt_features.shape[-1] == arc_output_head.in_features:
-                                ctm_features_for_head = alt_features
-                                print(f"  [TRAINING] Using final_sync_out for ARC head with shape: {ctm_features_for_head.shape}")
-                    
-                    predicted_logits = arc_output_head(torch.tanh(ctm_features_for_head))
-                    predicted_logits_reshaped = predicted_logits.view(current_batch_size * ARC_INPUT_FLAT_DIM, NUM_ARC_SYMBOLS)
-                    target_grids_reshaped = original_target_grids_for_ce.view(current_batch_size * ARC_INPUT_FLAT_DIM)
-                    ce_loss = arc_criterion(predicted_logits_reshaped, target_grids_reshaped)
-                    total_loss = total_loss + ce_loss
+                total_loss = model_output_dict.get('total_loss', torch.tensor(0.0, device=input_bytes.device))
 
-                mcmc_loss_val = torch.tensor(0.0, device=input_bytes.device)
-                norm_mcmc_loss_for_plasticity = torch.tensor(0.0, device=input_bytes.device)
-                if ctm_mcmc_integration_arc and ctm_backbone_output is not None:
-                    target_grids_for_mcmc = (original_target_grids_for_ce > 0).float()
-                    # Apply y-normalization for MCMC target
-                    y_mean = target_grids_for_mcmc.mean()
-                    y_std = target_grids_for_mcmc.std()
-                    normalized_target_y = (target_grids_for_mcmc - y_mean) / (y_std + 1e-8)
-
-                    mcmc_input_features = ctm_backbone_output.detach()
-                    if mcmc_input_features.ndim > 2:
-                        mcmc_input_features = mcmc_input_features.mean(dim=1)
-
-                    mcmc_loss_val, _, _ = ctm_mcmc_integration_arc(x=mcmc_input_features, target_y=normalized_target_y)
-                    
-                    # --- STABILITY FIX: Clamp MCMC loss to prevent explosion ---
-                    # Apply scaling and clamping to MCMC loss
-                    mcmc_loss_val = mcmc_loss_val * MCMC_LOSS_SCALE
-                    mcmc_loss_val = torch.clamp(mcmc_loss_val, -MAX_MCMC_LOSS_FOR_PLASTICITY, MAX_MCMC_LOSS_FOR_PLASTICITY)
-                    total_loss = total_loss + mcmc_loss_val
-                    
-                    # --- STABILITY FIX: MCMC loss normalization for plasticity ---
-                    # Use the scaled loss for plasticity calculations
-                    mcmc_for_plasticity = mcmc_loss_val.detach()
-                    # Apply tanh to bound the plasticity signal between -1 and 1
-                    norm_mcmc_loss_for_plasticity = torch.tanh(mcmc_for_plasticity)
-
-                    # --- Dynamic scaling with bounds ---
-                    abs_hebbian_mean = local_hebbian_signal.abs().mean()
-                    # Clamp the denominator to prevent division by very small numbers
-                    abs_hebbian_mean_clamped = torch.clamp(abs_hebbian_mean, min=1e-4, max=10.0)
-                    dyn_lambda = torch.clamp(orig_local_selector_loss_weight / abs_hebbian_mean_clamped, min=0.01, max=10.0)
-                    dynamic_hebbian_loss = dyn_lambda * abs_hebbian_mean_clamped
-                    total_loss = total_loss + dynamic_hebbian_loss
-
-            # --- Enhanced NaN/Inf Check and Loss Debugging ---
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 print(f"[NaN or Inf Loss Detected] at Epoch {epoch+1}, Batch {batch_idx+1}. Skipping backward pass.")
-                print(f"  - Diffusion Loss: {diffusion_loss.item() if torch.isfinite(diffusion_loss) else 'NaN/Inf'}")
-                print(f"  - CE Loss: {ce_loss.item() if torch.isfinite(ce_loss) else 'NaN/Inf'}")
-                print(f"  - MCMC Loss: {mcmc_loss_val.item() if torch.isfinite(mcmc_loss_val) else 'NaN/Inf'}")
-                print(f"  - Dynamic Hebbian Loss: {dynamic_hebbian_loss.item() if torch.isfinite(dynamic_hebbian_loss) else 'NaN/Inf'}")
-                continue # Skip to the next batch
+                continue
 
-            # --- Enhanced Loss Monitoring ---
-            if (batch_idx + 1) % 10 == 0:  # Print every 10 batches instead of every batch
-                print(f"[Losses] Diff: {diffusion_loss.item():.4f}, CE: {ce_loss.item():.4f}, MCMC: {mcmc_loss_val.item():.4f}, Dyn_Heb: {dynamic_hebbian_loss.item():.4f}, Total: {total_loss.item():.4f}")
-                
-                # --- MCMC Loss Monitoring ---
-                if abs(mcmc_loss_val.item()) > 5.0:  # Alert if MCMC loss is getting large
-                    print(f"[WARNING] Large MCMC loss detected: {mcmc_loss_val.item():.4f}")
-
-            if scaler:
+            if accelerator_arc:
+                accelerator_arc.backward(total_loss)
+                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                   if accelerator_arc.sync_gradients:
+                       accelerator_arc.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
+                   optimizer_arc.step()
+                   optimizer_arc.zero_grad()
+            else:
                 scaler.scale(total_loss).backward()
                 if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                     scaler.unscale_(optimizer_arc)
-                    
-                    # --- Enhanced Gradient Clipping ---
-                    total_norm = torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                    if total_norm > MAX_GRAD_NORM * 2:  # Alert if gradients are very large
-                        print(f"[WARNING] Large gradient norm detected: {total_norm:.4f}")
-                    
-                    # --- Activity-Dependent Plasticity with Enhanced Stability ---
-                    unwrapped_model = ctm_model_arc
-                    # Enhanced plasticity call with clamped losses
-                    clamped_diffusion_loss = torch.clamp(diffusion_loss, -10.0, 10.0)
-                    clamped_ce_loss = torch.clamp(ce_loss, -10.0, 10.0)
-                    unwrapped_model.ctm_core.apply_activity_plasticity(clamped_diffusion_loss, clamped_ce_loss, norm_mcmc_loss_for_plasticity)
+                    torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
                     scaler.step(optimizer_arc)
                     scaler.update()
-                    optimizer_arc.zero_grad(set_to_none=True)
-            elif accelerator_arc:
-                accelerator_arc.backward(total_loss)
-                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                   # --- Enhanced Gradient Clipping for Accelerator ---
-                   total_norm = torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                   if total_norm > MAX_GRAD_NORM * 2:
-                       print(f"[WARNING] Large gradient norm detected (accelerator): {total_norm:.4f}")
-                   
-                   # --- Activity-Dependent Plasticity with Enhanced Stability ---
-                   unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
-                   clamped_diffusion_loss = torch.clamp(diffusion_loss, -10.0, 10.0)
-                   clamped_ce_loss = torch.clamp(ce_loss, -10.0, 10.0)
-                   unwrapped_model.ctm_core.apply_activity_plasticity(clamped_diffusion_loss, clamped_ce_loss, norm_mcmc_loss_for_plasticity)
-                   optimizer_arc.step()
-                   optimizer_arc.zero_grad()
-            else:
-               total_loss.backward()
-               if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                   # --- Enhanced Gradient Clipping ---
-                   total_norm = torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
-                   if total_norm > MAX_GRAD_NORM * 2:
-                       print(f"[WARNING] Large gradient norm detected: {total_norm:.4f}")
-                   
-                   # --- Activity-Dependent Plasticity with Enhanced Stability ---
-                   clamped_diffusion_loss = torch.clamp(diffusion_loss, -10.0, 10.0)
-                   clamped_ce_loss = torch.clamp(ce_loss, -10.0, 10.0)
-                   ctm_model_arc.ctm_core.apply_activity_plasticity(clamped_diffusion_loss, clamped_ce_loss, norm_mcmc_loss_for_plasticity)
-                   optimizer_arc.step()
-                   optimizer_arc.zero_grad()
-            
-            total_arc_loss += total_loss.item()
-            processed_batches += 1
+                    optimizer_arc.zero_grad()
 
-            if (batch_idx + 1) % 50 == 0:
-                print(f"  Epoch [{epoch+1}/{NUM_EPOCHS_ARC}], Batch [{batch_idx+1}/{len(arc_train_loader)}], Loss: {total_loss.item():.4f}")
-                
-                # Periodic self-modification
-                if epoch > 10:  # After initial training
-                    self_modify(ctm_model_arc, surrogate_func_instance)
-        
-        avg_epoch_loss = total_arc_loss / processed_batches if processed_batches > 0 else 0
+            total_epoch_loss += total_loss.item()
+            progress_bar.set_postfix({
+                'loss': total_loss.item(),
+                'avg_loss': total_epoch_loss / (batch_idx + 1)
+            })
+
+        avg_epoch_loss = total_epoch_loss / len(arc_train_loader) if len(arc_train_loader) > 0 else 0
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS_ARC}] completed. Average Loss: {avg_epoch_loss:.4f}")
-        print(f"  GPU Memory: {metadata.get('gpu_memory', 0):.2f} GB, RAM: {metadata.get('ram_usage', 0):.2f} GB")
+
+        # --- Evaluation Step ---
+        ctm_model_arc.eval()
+        total_eval_loss = 0
+        with torch.no_grad():
+            for eval_batch_data in arc_eval_loader:
+                input_bytes = eval_batch_data['input_byte_sequences'].to(accelerator_arc.device if accelerator_arc else device)
+                target_bytes = eval_batch_data['target_byte_sequences_for_diffusion'].to(accelerator_arc.device if accelerator_arc else device)
+                
+                with autocast_context:
+                    eval_output = ctm_model_arc(
+                        byte_sequence=input_bytes,
+                        target_diffusion_output=target_bytes,
+                        mode='ctm_controlled_diffusion',
+                        timestep=torch.randint(0, config_arc_diffusion.diffusion_steps, (input_bytes.size(0),), device=input_bytes.device).long()
+                    )
+                    eval_loss = eval_output.get('total_loss', torch.tensor(0.0, device=input_bytes.device))
+                total_eval_loss += eval_loss.item()
         
-        # MCMC evaluation at epoch end
-        model_state = ModelState(ctm_model_arc.get_code_representation())
-        candidate_score = surrogate_func_instance.predict(model_state)
-        if candidate_score > VALUE_THRESHOLD:
-            print(f"High-scoring model candidate ({candidate_score:.3f}), running full evaluation")
-            true_score = model_state.evaluate_true_performance()
-            surrogate_func_instance.update(model_state, true_score)
-            print(f"True evaluation score: {true_score:.3f}")
+        avg_eval_loss = total_eval_loss / len(arc_eval_loader) if len(arc_eval_loader) > 0 else 0
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS_ARC}] Evaluation Loss: {avg_eval_loss:.4f}")
 
-        # === SAVE ONLY ON RANK 0 ===
-        rank, world_size = get_rank_debug()
-        if rank == 0 and CHECKPOINT_DIR_ARC and (epoch+1 in [5, 20]):
-            model_to_save_ctm = accelerator_arc.unwrap_model(ctm_model_arc) if accelerator_arc else ctm_model_arc
-            model_to_save_head = accelerator_arc.unwrap_model(arc_output_head) if accelerator_arc else arc_output_head
-
-            # Check if DeepSpeed is used and the model is wrapped
-            if hasattr(model_to_save_ctm, 'zero_optimization') and hasattr(model_to_save_ctm, 'module'):
-                print("✓ Using DeepSpeed consolidated state_dict for CTM model")
-                ctm_state_dict = model_to_save_ctm._zero3_consolidated_16bit_state_dict()
-            else:
-                ctm_state_dict = model_to_save_ctm.state_dict()
-
-            if hasattr(model_to_save_head, 'zero_optimization') and hasattr(model_to_save_head, 'module'):
-                print("✓ Using DeepSpeed consolidated state_dict for ARC head")
-                head_state_dict = model_to_save_head._zero3_consolidated_16bit_state_dict()
-            else:
-                head_state_dict = model_to_save_head.state_dict()
-
-            # Save model weights with safetensors
-            save_file(ctm_state_dict, os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{epoch+1}.safetensors"))
-            save_file(head_state_dict, os.path.join(CHECKPOINT_DIR_ARC, f"arc_output_head_epoch_{epoch+1}.safetensors"))
-
-            # Save optimizer (use torch.save, not supported by safetensors)
-            torch.save(optimizer_arc.state_dict(), os.path.join(CHECKPOINT_DIR_ARC, f"optimizer_arc_epoch_{epoch+1}.pt"))
-
-            print(f"✓ Checkpoint saved for epoch {epoch+1} on rank {rank} to {CHECKPOINT_DIR_ARC}")
+        # --- Checkpointing ---
+        if accelerator_arc and accelerator_arc.is_main_process:
+            if (epoch + 1) % 5 == 0: # Save every 5 epochs
+                accelerator_arc.wait_for_everyone()
+                unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
+                
+                # --- DeepSpeed Check ---
+                if hasattr(accelerator_arc.state, 'deepspeed_plugin') and accelerator_arc.state.deepspeed_plugin is not None:
+                    # DeepSpeed handles checkpointing via accelerator.save_state
+                    accelerator_arc.save_state(os.path.join(CHECKPOINT_DIR_ARC, f"epoch_{epoch+1}"))
+                else:
+                    # For other setups, save with safetensors on rank 0
+                    save_file(unwrapped_model.state_dict(), os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{epoch+1}.safetensors"))
+                
+                print(f"✓ Checkpoint saved for epoch {epoch+1} to {CHECKPOINT_DIR_ARC}")
 
     print("\n🎉 ARC-AGI-2 Meta-Learning Training Phase Completed!")

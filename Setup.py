@@ -154,31 +154,11 @@ ARC_OUTPUT_HEAD_DIM = ARC_INPUT_FLAT_DIM * NUM_ARC_SYMBOLS
 ARC_TASK_ID = 3
 print(f"ARC Output Head Dim: {ARC_OUTPUT_HEAD_DIM}")
 
-ctm_model_arc, arc_output_head, optimizer_arc, ctm_mcmc_integration_arc, accelerator_arc = None, None, None, None, None
+ctm_model_arc, optimizer_arc, accelerator_arc = None, None, None
 
 print("\n-----------------------------------------------------------------------------")
 print("Initializing Configuration and Model for ARC with EnhancedCTMDiffusion")
 print("-----------------------------------------------------------------------------")
-
-'''
-You do not need to add any of the variables again from the ctm_Diffusion_NEWNEW.py file to your config_arc_diffusion in the Arc_AGI_2_Final.ipynb file. All the parameters you listed are already explicitly defined when config_arc_diffusion is created (between lines 2200 and 2378 approximately).
-
-The EnhancedCTMConfig class in ctm_Diffusion_NEWNEW.py provides default values for its fields. When you create an instance like config_arc_diffusion, any parameters you explicitly set will override these defaults. Since all the parameters in your list are already set in your notebook, those are the values that will be used for training.
-
-For example:
-
-attention_type is set to "subquadratic" on line 2260.
-positional_embedding_type is set to 'multi-learnable-fourier' on line 2276.
-enable_pipeline_parallelism is set to True on line 2288.
-And so on for all the other parameters you mentioned.
-If you wish to change any of these settings, you should modify their values directly in the existing config_arc_diffusion definition within your Arc_AGI_2_Final.ipynb file.
-'''
-
-# Define EnhancedCTMConfig for ARC with EnhancedCTMDiffusion
-# Assuming EnhancedCTMConfig is a defined class and MAX_SEQUENCE_LENGTH is a defined variable
-# For example:
-# from your_model_library import EnhancedCTMConfig
-# MAX_SEQUENCE_LENGTH = 8192
 
 # From contineous-thought-machines/models/constants.py
 VALID_NEURON_SELECT_TYPES = [
@@ -198,6 +178,7 @@ VALID_POSITIONAL_EMBEDDING_TYPES = [
 # From contineous-thought-machines/models/ctm_Diffusion_NEWNEW.py
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Union, Any, List
+import math
 
 @dataclass
 class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency in the target file
@@ -280,13 +261,18 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     adaptive_scheduling: bool = True  # CTM-adaptive diffusion timestep scheduling
     iterative_refinement: bool = True # Iterative CTM-diffusion refinement for sampling
     
-
-    
     # Training Efficiency
     mixed_precision: bool = True
     gradient_checkpointing: bool = True
     sparse_attention: bool = True  # Now implemented with BinarySparseAttention
     adaptive_depth: bool = False   # Defaulting to False, can be enabled if implemented
+    use_activity_plasticity: bool = True # To enable/disable plasticity updates; Needs to be set to TRUE
+    ctm_use_internal_feedback: bool = True # Enable self-modulating feedback within the CTM core
+
+    # --- Bidirectional Reasoning Parameters ---
+    enable_bidirectional_reasoning: bool = True # Allows CTM to move forward/backward in its thought process
+    reasoning_step_gating_threshold: float = 0.7 # Confidence threshold for the reasoning controller to terminate
+    max_reasoning_steps: int = 15 # Max total steps in a bidirectional reasoning loop to prevent infinite loops
     
     # Sparse Attention Parameters
     sparse_attention_ratio: float = 0.1  # Keep only 10% of attention connections
@@ -307,9 +293,22 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     reshape_patch_sequence_to_grid: bool = True # If True, reshape patch sequence to a 2D grid for 2D PEs. Must set to true if using 2D Grid for Positional Embeddings.
     patch_grid_width: Optional[int] = None       # Desired width of the patch grid if reshaping
 
+    # --- Hierarchical Reasoning Model (HRM) Parameters ---
+    use_hrm_core: bool = False # Set to True to use the HierarchicalCTM core
+    hrm_high_level_cycles: int = 4 # N: Number of high-level cycles
+    hrm_low_level_timesteps: int = 8 # T: Number of low-level timesteps per high-level cycle
+    program_vocab_size: int = 1024 # Vocabulary size for the program synthesizer
+    program_synth_n_heads: int = 4
+    program_synth_n_layers: int = 3
+    program_synth_d_ff: int = 1024
+    ltm_size: int = 2048 # Size of the long-term memory
+    ltm_surprise_threshold: float = 0.6 # Surprise threshold for storing in LTM
+    replay_batch_size: int = 4 # Batch size for memory replay
+    replay_policy: str = "surprise_weighted_replay" # "simple_replay", "surprise_weighted_replay", "usefulness_replay"
+
     # Pipeline Parallelism Parameters
     enable_pipeline_parallelism: bool = True
-    pipeline_stages: int = 4  # CTM, MCMC, Diffusion prep, Diffusion exec
+    pipeline_stages: int = 3  # CTM, Diffusion prep, Diffusion exec
     pipeline_overlap_ratio: float = 0.7  # Target overlap ratio
     
     # Adaptive Batch Sizing Parameters
@@ -369,12 +368,25 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     jepa_num_target_blocks: int = 1 # Number of target blocks to predict
 
     # --- Global Plasticity Loss Parameters ---
-    use_global_plasticity_loss: bool = True
-    global_plasticity_loss_weight: float = 0.05
-    local_neuron_selector_loss_weight: float = 0.1
-    target_hebbian_pattern: float = 0.0  # Target for the aggregated Hebbian signal
+    local_hebbian_loss_weight: float = 0.01 # New weight for backprop-based hebbian loss
 
-    # --- Knowledge Store Parameters ---
+    # --- Basal Ganglia Parameters --- #Controls action suppression so that the model's unwanted first unrelated thoughts are suppressed which helps with model safety. Is needed for action suppresion.
+    ctm_enable_basal_ganglia: bool = True
+    ctm_bg_dopamine_dim: int = 32
+
+    # --- Synaptic Empathy Parameters ---
+    enable_synaptic_empathy: bool = True # Set to True to use the new SynapticEmpathy module
+    synaptic_empathy_reward_weight: float = 0.1
+
+    # --- Mirror Neuron / High-Level Empathy Parameters ---
+    enable_mirror_neurons: bool = True # Set to True to use the high-level MirrorNeuronLayer
+    num_emotion_dim: int = 4 # Dimensionality of the emotion state vector
+    goal_dim: int = 8 # Dimensionality of the predicted goal vector
+    mirror_reward_weight: float = 0.2 # Weight for the selfless reward signal
+
+
+    # --- Confidence Thresholding Parameters ---
+    confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
 
     def __post_init__(self):
         # Validate output dimensions
@@ -386,8 +398,6 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             pass
         if hasattr(self, 'ctm_dropout_nlm') and self.ctm_dropout_nlm is None and hasattr(self, 'ctm_dropout'):
             self.ctm_dropout_nlm = self.ctm_dropout
-        if hasattr(self, 'mcmc_output_space_dim') and self.mcmc_output_space_dim is None and hasattr(self, 'ctm_out_dims'):
-            self.mcmc_output_space_dim = self.ctm_out_dims
         
         if hasattr(self, 'ctm_neuron_select_type') and \
            VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
@@ -532,70 +542,28 @@ config_arc_diffusion = EnhancedCTMConfig(
     ctm_diffusion_coupling_strength=0.8,
     vocab_size=None,
     output_audio_bytes=False,
-    unet_input_feature_dim=8192,
-
-     # --- Global Plasticity Loss Parameters ---
-    use_global_plasticity_loss= True,
-    global_plasticity_loss_weight = 0.05,
-    local_neuron_selector_loss_weight = 0.1,
-    target_hebbian_pattern = 0.0 # Target for the aggregated Hebbian signal
+    unet_input_feature_dim=MAX_SEQUENCE_LENGTH // 4, # Calculated based on float32 audio
+    local_hebbian_loss_weight=0.01
 )
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
-
-if 'enhanced_ctm_mcmc' not in globals():
-    print("Warning: 'enhanced_ctm_mcmc' not found in globals. Defaulting to None. Ensure the cell defining it (approx. lines 1820-1866) was run successfully.")
-    enhanced_ctm_mcmc = None
     
 if 'EnhancedCTMDiffusion' in globals() and EnhancedCTMDiffusion is not None:
     ctm_model_arc = EnhancedCTMDiffusion(config=config_arc_diffusion).to(device)
     print("✓ EnhancedCTMDiffusion model for ARC (ctm_model_arc) initialized.")
 
-    # The external ARC output head will take features from the CTM core part of EnhancedCTMDiffusion
-    arc_output_head_input_dim = config_arc_diffusion.ctm_out_dims
-    arc_output_head = nn.Linear(arc_output_head_input_dim, ARC_OUTPUT_HEAD_DIM).to(device)
-    print(f"✓ ARC Output Head initialized (input_dim: {arc_output_head_input_dim}, output_dim: {ARC_OUTPUT_HEAD_DIM}).")
+    # The new EnhancedCTMDiffusion model is end-to-end and does not require an external output head.
+    print("✓ ARC Output Head is disabled as it's not needed for the new model.")
 
-    # Handle external MCMC integration if enabled
-    if ENABLE_CTM_MCMC_INTEGRATION_FOR_ARC and enhanced_ctm_mcmc:
-        # Ensure the external MCMC module's input_dim matches the new CTM's output
-        if enhanced_ctm_mcmc.thought_network[0].in_features != config_arc_diffusion.ctm_out_dims:
-            print(f"Re-initializing external enhanced_ctm_mcmc for new input_dim {config_arc_diffusion.ctm_out_dims}")
-            enhanced_ctm_mcmc = EnhancedCTMFenchelYoungIntegration(
-                input_dim=config_arc_diffusion.ctm_out_dims, # Use output dim of CTM core
-                output_space=arc_grid_output_space,
-                mcmc_config=MCMC_CONFIG_ARC,
-                use_large_neighborhood_search=True,
-                lns_frequency=5,
-                lns_neighborhood_size=10
-            )
-        ctm_mcmc_integration_arc = enhanced_ctm_mcmc.to(device) if enhanced_ctm_mcmc else None
-        print(f"✓ External MCMC Integration for ARC is {'enabled' if ctm_mcmc_integration_arc else 'FAILED to enable'}.")
+    # MCMC integration is disabled as per new model requirements.
     
     arc_trainable_params = list(ctm_model_arc.parameters()) # EnhancedCTMDiffusion parameters
-    if arc_output_head: arc_trainable_params.extend(list(arc_output_head.parameters()))
-    if ctm_mcmc_integration_arc:
-        arc_trainable_params.extend(list(ctm_mcmc_integration_arc.parameters()))
 
     optimizer_arc = optim.AdamW([p for p in arc_trainable_params if p.requires_grad], lr=LEARNING_RATE, weight_decay=1e-4)
     
     if ACCELERATE_AVAILABLE:
         accelerator_arc = Accelerator()
-        models_to_prepare = [ctm_model_arc] # Start with the main model
-        if arc_output_head: models_to_prepare.append(arc_output_head)
-        if ctm_mcmc_integration_arc: models_to_prepare.append(ctm_mcmc_integration_arc)
-        
-        prepared_components = accelerator_arc.prepare(*models_to_prepare, optimizer_arc)
-        
-        optimizer_arc = prepared_components[-1] # Last element is the optimizer
-        prepared_models_tuple = prepared_components[:-1] # All other elements are models
-
-        ctm_model_arc = prepared_models_tuple[0]
-        model_idx = 1
-        if arc_output_head:
-            arc_output_head = prepared_models_tuple[model_idx]
-            model_idx +=1
-        if ctm_mcmc_integration_arc:
-            ctm_mcmc_integration_arc = prepared_models_tuple[model_idx]
+        # Only the main model and optimizer need to be prepared.
+        ctm_model_arc, optimizer_arc = accelerator_arc.prepare(ctm_model_arc, optimizer_arc)
         print("✓ ARC models (EnhancedCTMDiffusion) and optimizer prepared with Accelerate.")
 else:
     print("⚠️ EnhancedCTMDiffusion model or its config for ARC-AGI-2 could not be initialized. Check imports.")
@@ -631,5 +599,5 @@ if arc_eval_dataset and len(arc_eval_dataset) > 0:
 else:
     print("⚠️ ARC Evaluation DataLoader could not be initialized.")
 
-arc_criterion = nn.CrossEntropyLoss(ignore_index=PADDING_VALUE)
+# The CE loss criterion is no longer needed as the model calculates its own loss.
 print("\n✓ ARC-AGI-2 Setup Complete.")
