@@ -1,22 +1,65 @@
-ARC_EVAL_DIR = "/workspace/Arc-AGI-2/contineous-thought-machines/data/evaluation"  #Evaluation Dataset Directory.
 
-import sys
+import os
+
+ARC_EVAL_DIR = "/workspace/Arc-AGI-2/contineous-thought-machines/data/evaluation"  #Evaluation Dataset Directory.
+# --- Configuration Variables ---
+# These variables define the ARC environment and MCMC behavior.
+# NOTE: You must provide the paths to your ARC dataset directories.
+ARC_TRAIN_DIR = "../data/training" # <<< IMPORTANT: SET THIS PATH
+
+# Get the notebook's current working directory
+notebook_cwd = os.getcwd()
+eval_dir = os.path.abspath(os.path.join(notebook_cwd, '..', 'data', 'evaluation')) # <<< IMPORTANT: SET THIS PATH
+
+MAX_GRID_SIZE = (30, 30)
+NUM_ARC_SYMBOLS = 10
+PADDING_VALUE = -1 # A value not in 0-9 to be ignored by the loss function
+
+# Configuration for ARC-AGI-2 Training (shared constants)
+ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
+
+print(f"Using MAX_GRID_SIZE: {MAX_GRID_SIZE}")
+print(f"Using NUM_ARC_SYMBOLS: {NUM_ARC_SYMBOLS}")
+print(f"Using ARC_INPUT_FLAT_DIM: {ARC_INPUT_FLAT_DIM}") 
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+from typing import Optional, Callable, Tuple, Dict, Any, List, Union
+from dataclasses import dataclass, field
+import math
+import numpy as np
+import warnings # For ARCGridOutputSpace warnings
+import sys
+import os
+import json
+import glob
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 from accelerate import Accelerator
 
 # --- Path Setup ---
 project_root = '/workspaces/Arc-AGI-2'
-ctm_module_path = os.path.join(project_root, 'contineous-thought-machines')
-if ctm_module_path not in sys.path:
-    sys.path.insert(0, ctm_module_path)
+paths_to_add = [
+    os.path.join(project_root, 'contineous-thought-machines'),
+    os.path.join(project_root, 'contineous-thought-machines', 'models'),
+    os.path.join(project_root, 'contineous-thought-machines', 'examples/contineous-thought-machines')
+]
+
+for path in paths_to_add:
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 # --- Model Import ---
 EnhancedCTMDiffusion = None
 try:
-    from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion
+    from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, SynapticEmpathy, MirrorNeuronLayer
+    from contineous_thought_machines.models.Principles import principles
 except ImportError as e:
-    print(f"Could not import EnhancedCTMDiffusion: {e}")
+    print(f"Error importing Enhanced CTM or related components: {e}")
     EnhancedCTMDiffusion = None
 
 # --- Constants and Configs ---
@@ -35,6 +78,27 @@ try:
 except ImportError:
     ACCELERATE_AVAILABLE = False
     Accelerator = None
+
+# Check for xformers
+XFORMERS_AVAILABLE = False
+if device == "cuda":
+    try:
+        import xformers
+        XFORMERS_AVAILABLE = True
+    except ImportError:
+        pass
+
+# Check for torch.compile
+TORCH_COMPILE_AVAILABLE = hasattr(torch, 'compile')
+
+# Check for deepspeed
+DEEPSPEED_AVAILABLE = False
+if device == "cuda":
+    try:
+        import deepspeed
+        DEEPSPEED_AVAILABLE = True
+    except ImportError:
+        pass
 
 # A reasonable default for dataloader config
 OPTIMIZED_DATALOADER_CONFIG = {
@@ -200,8 +264,17 @@ print(f"ARC Output Head Dim: {ARC_OUTPUT_HEAD_DIM}")
 ctm_model_arc, optimizer_arc, accelerator_arc = None, None, None
 
 print("\n-----------------------------------------------------------------------------")
-print("Initializing Configuration and Model for ARC with EnhancedCTMDiffusion")
+print("Initializing Configuration for Integrated Diffusion CTM")
 print("-----------------------------------------------------------------------------")
+print(f"Using device: {device}")
+if device == "cuda":
+    print("✅ Mixed precision training enabled (BF16) - Expected ~2x speedup")
+
+print("\n🚀 OPTIMIZATION STATUS:")
+print(f"  ⚡ torch.compile: {'✅' if TORCH_COMPILE_AVAILABLE else '❌'}")
+print(f"  📈 Accelerate: {'✅' if ACCELERATE_AVAILABLE else '❌'}")
+print(f"  ⚡ xFormers: {'✅' if XFORMERS_AVAILABLE else '❌'}")
+print(f"  ⚡ Deepspeed: {'✅' if DEEPSPEED_AVAILABLE else '❌'}")
 
 # From contineous-thought-machines/models/constants.py
 VALID_NEURON_SELECT_TYPES = [
