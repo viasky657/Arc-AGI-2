@@ -79,9 +79,19 @@ class RealtimeVoiceStreamer:
         print("Streaming finished.")
 
 if __name__ == '__main__':
-    # Example usage
+    # Example usage of the new simultaneous generation method
     config = EnhancedCTMConfig()
     model = EnhancedCTMDiffusion(config)
-    
-    streamer = RealtimeVoiceStreamer(model, config)
-    streamer.run()
+
+    # Generate text and audio together
+    prompt = "Hello, this is a test of simultaneous text and audio generation."
+    generated_text, generated_audio = model.generate_text_and_audio_simultaneously(
+        text_prompt=prompt,
+        audio_duration_seconds=3.0
+    )
+
+    print("Generated Text:", generated_text)
+    if generated_audio.numel() > 0:
+        print("Generated Audio Shape:", generated_audio.shape)
+    else:
+        print("No audio was generated.")

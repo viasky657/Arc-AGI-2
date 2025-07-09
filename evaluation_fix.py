@@ -277,7 +277,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     max_tasks: int = 50  # Maximum number of tasks for continual learning
     # Added to resolve TypeError for unexpected keyword arguments
     vocab_size: Optional[int] = None
-    output_audio_bytes: bool = False
+    output_audio_bytes: bool = True
     inferred_task_latent_dim: Optional[int] = None # Default to None, __post_init__ handles it
     use_hipa_attention: bool = False # Default to False
     hipa_num_heads: Optional[int] = None # Default to None

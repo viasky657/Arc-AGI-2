@@ -63,10 +63,14 @@ def serialize_and_pad_grid(grid, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_
         
     return padded_sequence
 
+from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import batched_numeric_tensor_to_bytes
+
 class PrinciplesDataset(Dataset):
-    def __init__(self, file_path, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE):
+    def __init__(self, file_path, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE, audio_duration_seconds=2.0, sample_rate=16000):
         self.max_len = max_len
         self.pad_value = pad_value
+        self.audio_duration_seconds = audio_duration_seconds
+        self.sample_rate = sample_rate
         self.principles = []
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -83,16 +87,32 @@ class PrinciplesDataset(Dataset):
 
     def __getitem__(self, idx):
         principle_text = self.principles[idx]
-        byte_sequence = principle_text.encode('utf-8')
-        padding_len = self.max_len - len(byte_sequence)
+        
+        # 1. Prepare text input
+        text_bytes = torch.tensor(list(principle_text.encode('utf-8')), dtype=torch.uint8)
+        
+        # 2. Prepare silent audio template
+        num_audio_samples = int(self.audio_duration_seconds * self.sample_rate)
+        # Create on CPU, as conversion to bytes happens on CPU.
+        audio_template_numeric = torch.zeros(1, num_audio_samples) # Batch of 1
+        
+        # Convert audio template to bytes
+        audio_template_bytes = batched_numeric_tensor_to_bytes(audio_template_numeric, source_dtype=np.float32).squeeze(0)
 
+        # 3. Create combined byte sequence
+        separator = torch.tensor([255, 0, 255, 0, 255, 0, 255, 0], dtype=torch.uint8)
+        
+        combined_input_bytes = torch.cat([text_bytes, separator, audio_template_bytes])
+
+        # 4. Pad or truncate the combined sequence
+        padding_len = self.max_len - len(combined_input_bytes)
         if padding_len < 0:
-            padded_sequence = byte_sequence[:self.max_len]
+            padded_sequence = combined_input_bytes[:self.max_len]
         else:
-            padding = bytes([self.pad_value] * padding_len)
-            padded_sequence = byte_sequence + padding
+            padding = torch.full((padding_len,), self.pad_value, dtype=torch.uint8)
+            padded_sequence = torch.cat([combined_input_bytes, padding])
             
-        return torch.tensor(list(padded_sequence), dtype=torch.uint8)
+        return padded_sequence
 
 def collate_fn_principles(batch):
     # The batch is already a list of tensors from __getitem__
