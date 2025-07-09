@@ -1,5 +1,48 @@
 ARC_EVAL_DIR = "/workspace/Arc-AGI-2/contineous-thought-machines/data/evaluation"  #Evaluation Dataset Directory.
 
+import sys
+import torch
+import torch.optim as optim
+from accelerate import Accelerator
+
+# --- Path Setup ---
+project_root = '/workspaces/Arc-AGI-2'
+ctm_module_path = os.path.join(project_root, 'contineous-thought-machines')
+if ctm_module_path not in sys.path:
+    sys.path.insert(0, ctm_module_path)
+
+# --- Model Import ---
+EnhancedCTMDiffusion = None
+try:
+    from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion
+except ImportError as e:
+    print(f"Could not import EnhancedCTMDiffusion: {e}")
+    EnhancedCTMDiffusion = None
+
+# --- Constants and Configs ---
+MAX_GRID_SIZE = (30, 30)
+PADDING_VALUE = -1
+NUM_ARC_SYMBOLS = 10
+ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
+device = "cuda" if torch.cuda.is_available() else "cpu"
+LEARNING_RATE = 1e-4
+CHECKPOINT_DIR = "checkpoints"
+ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous-thought-machines/data/training" #Training Dataset Directory
+
+ACCELERATE_AVAILABLE = True
+try:
+    from accelerate import Accelerator
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    Accelerator = None
+
+# A reasonable default for dataloader config
+OPTIMIZED_DATALOADER_CONFIG = {
+    "num_workers": 4,
+    "pin_memory": True,
+    "prefetch_factor": 2
+} if torch.cuda.is_available() else {}
+
 # --- Context: 2D Grid Padding (from original code) ---
 # This function handles padding at the 2D grid level, before serialization.
 def pad_grid(grid_list, max_dims, pad_value):
