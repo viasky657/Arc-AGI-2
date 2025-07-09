@@ -316,6 +316,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
 
     # --- Confidence Thresholding Parameters ---
     confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
+ 
+    # --- Consciousness Controller Parameters ---
+    enable_consciousness_controller: bool = True
+    consciousness_max_attention_steps: int = 100
 
     def __post_init__(self):
         # Validate output dimensions
@@ -461,7 +465,9 @@ class ARCEvalDataset(Dataset):
 
 ARC_EVAL_DIR = "/workspace/Arc-AGI-2/contineous-thought-machines/data/evaluation"
 CHECKPOINT_DIR_ARC = "/workspaces/Arc-AGI-2/contineous-thought-machines/examples/checkpoints/ctm_arc_agi_2_enhanced_diffusion"
+CHECKPOINT_DIR_PRINCIPLES = os.path.join(CHECKPOINT_DIR_ARC, "principles_checkpoints")
 NUM_EPOCHS_ARC = 20
+NUM_EPOCHS_PRINCIPLES = 10 # Should match the value in training.py
 
 print("\n--- Initializing Evaluation Dataloader ---")
 arc_eval_loader = None
@@ -481,8 +487,8 @@ print("="*60 + "\n")
 if not all([ctm_model_arc, optimizer_arc, arc_eval_loader]):
      print("⚠️ Skipping evaluation due to missing components.")
 else:
-    latest_epoch = NUM_EPOCHS_ARC
-    ctm_checkpoint_path_eval = os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{latest_epoch}.safetensors")
+    latest_epoch = NUM_EPOCHS_PRINCIPLES
+    ctm_checkpoint_path_eval = os.path.join(CHECKPOINT_DIR_PRINCIPLES, f"ctm_model_arc_epoch_{latest_epoch}.safetensors")
 
     try:
         if os.path.exists(ctm_checkpoint_path_eval):

@@ -387,6 +387,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
 
     # --- Confidence Thresholding Parameters ---
     confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
+ 
+    # --- Consciousness Controller Parameters ---
+    enable_consciousness_controller: bool = True
+    consciousness_max_attention_steps: int = 100
 
     def __post_init__(self):
         # Validate output dimensions

@@ -2073,7 +2073,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     enable_consciousness_controller: bool = True
     consciousness_max_attention_steps: int = 100
 
-     def __post_init__(self):
+    def __post_init__(self):
          # Validate output dimensions
         if len(self.output_dims) != self.num_outputs:
             raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")

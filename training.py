@@ -24,6 +24,9 @@ print(f"   Epochs: {NUM_EPOCHS_ARC}, Batch Size: {ARC_BATCH_SIZE}, Task ID: {ARC
 print(f"   Device: {device if not accelerator_arc else accelerator_arc.device}")
 print("="*60 + "\n")
 
+# --- Principles Training Configuration ---
+NUM_EPOCHS_PRINCIPLES = 10 # Number of epochs for principles alignment training
+
 # --- Training Configuration ---
 USE_MIXED_PRECISION = torch.cuda.is_available()
 autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -59,6 +62,42 @@ def serialize_and_pad_grid(grid, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_
         padded_sequence = byte_sequence + padding
         
     return padded_sequence
+
+class PrinciplesDataset(Dataset):
+    def __init__(self, file_path, max_len=MAX_SEQUENCE_LENGTH, pad_value=PADDING_BYTE_VALUE):
+        self.max_len = max_len
+        self.pad_value = pad_value
+        self.principles = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self.principles.append(line)
+            print(f"PrinciplesDataset: Loaded {len(self.principles)} principles from {file_path}.")
+        except Exception as e:
+            print(f"PrinciplesDataset Warning: Could not load or parse {file_path}: {e}")
+
+    def __len__(self):
+        return len(self.principles)
+
+    def __getitem__(self, idx):
+        principle_text = self.principles[idx]
+        byte_sequence = principle_text.encode('utf-8')
+        padding_len = self.max_len - len(byte_sequence)
+
+        if padding_len < 0:
+            padded_sequence = byte_sequence[:self.max_len]
+        else:
+            padding = bytes([self.pad_value] * padding_len)
+            padded_sequence = byte_sequence + padding
+            
+        return torch.tensor(list(padded_sequence), dtype=torch.uint8)
+
+def collate_fn_principles(batch):
+    # The batch is already a list of tensors from __getitem__
+    # We just need to stack them.
+    return {'input_byte_sequences': torch.stack(batch)}
 
 class NewCustomARCGridDataset(Dataset):
     def __init__(self, data_dir, max_grid_size=MAX_GRID_SIZE, padding_value=PADDING_VALUE):
@@ -177,6 +216,21 @@ if arc_eval_dataset and len(arc_eval_dataset) > 0:
     print(f"✓ ARC Evaluation DataLoader initialized with {len(arc_eval_dataset)} tasks.")
 else:
     print("⚠️ ARC Evaluation DataLoader could not be initialized.")
+
+
+# --- Principles Dataset and DataLoader ---
+PRINCIPLES_FILE_PATH = "contineous-thought-machines/models/Principles/principles.txt"
+principles_dataset = PrinciplesDataset(PRINCIPLES_FILE_PATH)
+principles_loader = None
+if principles_dataset and len(principles_dataset) > 0:
+    principles_loader = DataLoader(
+        principles_dataset, batch_size=ARC_BATCH_SIZE, shuffle=True,
+        collate_fn=collate_fn_principles, **OPTIMIZED_DATALOADER_CONFIG
+    )
+    if accelerator_arc: principles_loader = accelerator_arc.prepare(principles_loader)
+    print(f"✓ Principles DataLoader initialized with {len(principles_dataset)} principles.")
+else:
+    print("⚠️ Principles DataLoader could not be initialized.")
 
 
 # === DEBUG + RANK CHECK ===
@@ -300,3 +354,94 @@ else:
             ctm_model_arc.sleep_down()
 
     print("\n🎉 ARC-AGI-2 Meta-Learning Training Phase Completed!")
+
+
+# --- Principles Alignment Training Loop ---
+if principles_loader and NUM_EPOCHS_PRINCIPLES > 0 and 'ctm_model_arc' in globals() and ctm_model_arc is not None:
+    print("\n" + "="*60)
+    print(f"🚀 STARTING PHASE: Principles Alignment Training")
+    print(f"   Epochs: {NUM_EPOCHS_PRINCIPLES}")
+    print("="*60 + "\n")
+
+    for epoch in range(NUM_EPOCHS_PRINCIPLES):
+        ctm_model_arc.train()
+        if hasattr(ctm_model_arc, 'wake_up'):
+            ctm_model_arc.wake_up()
+
+        total_epoch_loss_principles = 0
+        
+        progress_bar_principles = tqdm(enumerate(principles_loader), total=len(principles_loader), desc=f"Principles Epoch {epoch + 1}")
+
+        for batch_idx, batch_data in progress_bar_principles:
+            if not batch_data or batch_data['input_byte_sequences'].numel() == 0:
+                print(f"Skipping empty principles batch {batch_idx}")
+                continue
+
+            input_bytes = batch_data['input_byte_sequences'].to(accelerator_arc.device if accelerator_arc else device)
+            
+            current_batch_size = input_bytes.size(0)
+
+            optimizer_arc.zero_grad()
+            
+            autocast_context = accelerator_arc.autocast() if accelerator_arc else autocast(enabled=USE_MIXED_PRECISION, dtype=autocast_dtype)
+
+            with autocast_context:
+                # For principles, the input is the target. The model learns to reconstruct the principles.
+                model_output_dict = ctm_model_arc(
+                    byte_sequence=input_bytes,
+                    target_diffusion_output=input_bytes, # Self-supervision
+                    mode='ctm_controlled_diffusion',
+                    timestep=torch.randint(0, config_arc_diffusion.diffusion_steps, (current_batch_size,), device=input_bytes.device).long()
+                )
+
+                total_loss = model_output_dict.get('total_loss', torch.tensor(0.0, device=input_bytes.device))
+
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"[NaN or Inf Loss Detected] in Principles training at Epoch {epoch+1}, Batch {batch_idx+1}. Skipping backward pass.")
+                continue
+
+            if accelerator_arc:
+                accelerator_arc.backward(total_loss)
+                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                   if accelerator_arc.sync_gradients:
+                       accelerator_arc.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
+                   optimizer_arc.step()
+                   optimizer_arc.zero_grad()
+            else:
+                scaler.scale(total_loss).backward()
+                if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                    scaler.unscale_(optimizer_arc)
+                    torch.nn.utils.clip_grad_norm_(ctm_model_arc.parameters(), MAX_GRAD_NORM)
+                    scaler.step(optimizer_arc)
+                    scaler.update()
+                    optimizer_arc.zero_grad()
+
+            total_epoch_loss_principles += total_loss.item()
+            progress_bar_principles.set_postfix({
+                'loss': total_loss.item(),
+                'avg_loss': total_epoch_loss_principles / (batch_idx + 1)
+            })
+
+        avg_epoch_loss_principles = total_epoch_loss_principles / len(principles_loader) if len(principles_loader) > 0 else 0
+        print(f"Principles Epoch [{epoch+1}/{NUM_EPOCHS_PRINCIPLES}] completed. Average Loss: {avg_epoch_loss_principles:.4f}")
+
+        # --- Checkpointing for Principles Training ---
+        if accelerator_arc and accelerator_arc.is_main_process:
+            if (epoch + 1) % 5 == 0: # Save every 5 epochs
+                accelerator_arc.wait_for_everyone()
+                unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
+                
+                checkpoint_dir = os.path.join(CHECKPOINT_DIR_ARC, "principles_checkpoints")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+
+                if hasattr(accelerator_arc.state, 'deepspeed_plugin') and accelerator_arc.state.deepspeed_plugin is not None:
+                    accelerator_arc.save_state(os.path.join(checkpoint_dir, f"epoch_{epoch+1}"))
+                else:
+                    save_file(unwrapped_model.state_dict(), os.path.join(checkpoint_dir, f"ctm_model_arc_epoch_{epoch+1}.safetensors"))
+                
+                print(f"✓ Principles checkpoint saved for epoch {epoch+1} to {checkpoint_dir}")
+
+        if hasattr(ctm_model_arc, 'sleep_down'):
+            ctm_model_arc.sleep_down()
+
+    print("\n🎉 Principles Alignment Training Phase Completed!")
