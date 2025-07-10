@@ -30,7 +30,7 @@ NUM_EPOCHS_PRINCIPLES = 10 # Number of epochs for principles alignment training
 # --- Training Configuration ---
 USE_MIXED_PRECISION = torch.cuda.is_available()
 autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-GRADIENT_ACCUMULATION_STEPS = 4
+GRADIENT_ACCUMULATION_STEPS = 2
 MAX_GRAD_NORM = 1.0
 scaler = torch.amp.GradScaler('cuda',enabled=USE_MIXED_PRECISION)
 

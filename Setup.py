@@ -695,7 +695,7 @@ os.makedirs(CHECKPOINT_DIR_ARC, exist_ok=True)
 print(f"ARC Checkpoints will be saved to: {CHECKPOINT_DIR_ARC}")
 
 NUM_EPOCHS_ARC = 20
-ARC_BATCH_SIZE = 8
+ARC_BATCH_SIZE = 16
 
 arc_train_dataset = NewCustomARCGridDataset(ARC_TRAIN_DIR)
 arc_eval_dataset = NewCustomARCGridDataset(ARC_EVAL_DIR)
