@@ -25,7 +25,7 @@ print(f"   Device: {device if not accelerator_arc else accelerator_arc.device}")
 print("="*60 + "\n")
 
 # --- Principles Training Configuration ---
-NUM_EPOCHS_PRINCIPLES = 10 # Number of epochs for principles alignment training
+NUM_EPOCHS_PRINCIPLES = 3 #Can be lowered due to new DPPM++ Solver converging 10 epoch sooner.
 
 # --- Training Configuration ---
 USE_MIXED_PRECISION = torch.cuda.is_available()

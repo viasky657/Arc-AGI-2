@@ -56,19 +56,19 @@ class RealtimeVoiceStreamer:
         """Processes a chunk of audio data."""
         audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
         audio_tensor = torch.from_numpy(audio_np).float().unsqueeze(0)
-
+    
         # Use dynamic entropy patcher to create patches
         patches, _, _ = self.patcher(audio_tensor)
-
+    
         # Get generated output from the model
         with torch.no_grad():
-            generated_output = self.model.iterative_ctm_diffusion_sample(
-                shape=patches.shape,
-                initial_byte_sequence_for_inference=patches
-            )
-        
+            generated_output, _ = self.model.ultra_fast_integration_flow_generation(
+                    shape=patches.shape,
+                    initial_byte_sequence_for_inference=patches
+                )
+            
         # In a real application, you would play this output back
-        print("Generated output shape:", generated_output[0].shape)
+        print("Generated output shape:", generated_output.shape)
 
     def run(self, duration=10, chunk_size=1024, sample_rate=16000):
         """Runs the real-time voice streaming loop."""

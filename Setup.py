@@ -410,7 +410,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     patch_grid_width: Optional[int] = None       # Desired width of the patch grid if reshaping
 
     # --- Hierarchical Reasoning Model (HRM) Parameters ---
-    use_hrm_core: bool = False # Set to True to use the HierarchicalCTM core
+    use_hrm_core: bool = True # Set to True to use the HierarchicalCTM core
     hrm_high_level_cycles: int = 4 # N: Number of high-level cycles
     hrm_low_level_timesteps: int = 8 # T: Number of low-level timesteps per high-level cycle
     program_vocab_size: int = 1024 # Vocabulary size for the program synthesizer

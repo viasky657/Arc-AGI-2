@@ -58,6 +58,7 @@ class HRM_L_Module(nn.Module):
         )
         # Projector for the query, derived from the low-level sync state
         self.q_proj = nn.Linear(parent_ctm.synch_representation_size_action, self.d_input)
+        self.top_down_projector = nn.Linear(self.config.d_model, self.d_model)  # Project zH to modulation signal
 
     def forward(self, 
                 activated_zL: torch.Tensor, 
@@ -93,6 +94,8 @@ class HRM_L_Module(nn.Module):
 
         # 3. Apply Synapses to get pre-activation state
         state = self.synapses(pre_synapse_input)
+        top_down_mod = self.top_down_projector(zH)  # (B, D)
+        state = state + top_down_mod * 0.3  # Modulate with strength 0.3
 
         # 4. Update state trace (memory for NLMs)
         next_zL_trace = torch.cat((zL_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
@@ -138,6 +141,13 @@ class HRM_H_Module(nn.Module):
             max_gen_len=config.max_sequence_length, # Or a more specific config
             patcher_config=patcher_config
         )
+        self.meta_learner = nn.Sequential(
+            nn.Linear(self.config.d_model * 2, self.config.d_model),
+            nn.ReLU(),
+            nn.Linear(self.config.d_model, self.config.d_model)
+        )
+        self.max_recursion = config.max_recursion
+        self.early_stop_threshold = config.early_stop_threshold
         
     def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -148,24 +158,44 @@ class HRM_H_Module(nn.Module):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Next high-level state and synthesized program.
         """
-        # The query is the current high-level state
-        q = zH
-        # The key/value is the information from the completed low-level cycle and retrieved memory
-        # The retrieved_memory is now a single contextualized vector from the LTM's attention mechanism
-        kv = self.zl_proj(zL) + retrieved_memory.squeeze(0) # Squeeze to remove the batch dim of 1
-        # Attention step
-        attn_output = self.attn(q, kv, kv)
-        zH = self.norm1(zH + attn_output)
-        # MLP step
-        mlp_output = self.mlp(zH)
-        zH = self.norm2(zH + mlp_output)
+        current_zH = zH
+        prev_zH = None
+        depth = 0
+        encoded_patches = None
+        patch_indices = None
+        entropy_aux_loss = None
         
-        # Synthesize a program using the new synthesizer
-        encoded_patches, patch_indices, entropy_aux_loss = self.program_synthesizer(zH)
+        while depth < self.max_recursion:
+            # The query is the current high-level state
+            q = current_zH
+            # The key/value is the information from the completed low-level cycle and retrieved memory
+            # The retrieved_memory is now a single contextualized vector from the LTM's attention mechanism
+            kv = self.zl_proj(zL) + retrieved_memory.squeeze(0) # Squeeze to remove the batch dim of 1
+            # Attention step
+            attn_output = self.attn(q, kv, kv)
+            meta_input = torch.cat([attn_output, zL], dim=-1)
+            meta_update = self.meta_learner(meta_input)
+            current_zH = current_zH + meta_update * 0.1  # Small meta-update step
+            current_zH = self.norm1(current_zH + attn_output)
+            # MLP step
+            mlp_output = self.mlp(current_zH)
+            current_zH = self.norm2(current_zH + mlp_output)
+            
+            # Synthesize a program using the new synthesizer
+            encoded_patches, patch_indices, entropy_aux_loss = self.program_synthesizer(current_zH)
+            
+            # Early stopping check
+            if prev_zH is not None:
+                delta = torch.norm(current_zH - prev_zH, dim=-1).mean()
+                if delta < self.early_stop_threshold:
+                    break
+            
+            prev_zH = current_zH.clone()
+            depth += 1
         
         # The 'program' is now the sequence of encoded patches.
         # The other outputs might be used for loss calculation or debugging.
-        return zH, encoded_patches, patch_indices, entropy_aux_loss
+        return current_zH, encoded_patches, patch_indices, entropy_aux_loss
 
 class HierarchicalCTM(OriginalCTMCore):
     """
@@ -220,6 +250,7 @@ class HierarchicalCTM(OriginalCTMCore):
         self.set_synchronisation_parameters('action', self.n_synch_action, config.ctm_n_random_pairing_self)
         self.set_synchronisation_parameters('out', self.n_synch_out, config.ctm_n_random_pairing_self)
         self.output_projector = nn.Linear(self.synch_representation_size_out, config.ctm_out_dims)
+        self.fusion_proj = nn.Linear(2 * self.d_model, self.d_model)
 
     def forward_with_full_tracking(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

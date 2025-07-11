@@ -28,11 +28,12 @@ class LongTermMemory(nn.Module):
         # Initialize memory buffers
         self.register_buffer('memory', torch.zeros(self.memory_size, self.d_model))
         self.register_buffer('memory_surprise', torch.zeros(self.memory_size))
-        self.register_buffer('memory_age', torch.zeros(self.memory_size, dtype=torch.long))
+        self.register_buffer('memory_timestamp', torch.zeros(self.memory_size, dtype=torch.long))
         self.register_buffer('memory_usage', torch.zeros(self.memory_size, dtype=torch.long))
-        
+                
         self.register_buffer('is_initialized', torch.zeros(self.memory_size, dtype=torch.bool))
         self.memory_pointer = 0
+        self.global_time = 0
         
         # Mamba block for processing retrieved memories
         self.retrieval_processor = MambaBlock(
@@ -48,6 +49,7 @@ class LongTermMemory(nn.Module):
         # Ensure state is on the correct device
         state = state.to(self.memory.device)
         surprise = surprise.to(self.memory.device)
+        self.global_time += 1
         
         if self.memory_pointer < self.memory_size:
             # Fill memory sequentially until full
@@ -58,24 +60,18 @@ class LongTermMemory(nn.Module):
             # Score = surprise + 0.1 * usage - 0.01 * age
             # We want to replace the one with the lowest score.
             utility_scores = (
-                self.memory_surprise 
-                + 0.1 * self.memory_usage.float() 
-                - 0.01 * self.memory_age.float()
+                self.memory_surprise
+                + 0.1 * self.memory_usage.float()
+                - 0.01 * (self.global_time - self.memory_timestamp).float()
             )
             idx = torch.argmin(utility_scores)
 
         # Add the new state to memory at the determined index
         self.memory[idx] = state
         self.memory_surprise[idx] = surprise
-        self.memory_age[idx] = 0
+        self.memory_timestamp[idx] = self.global_time
         self.memory_usage[idx] = 1 # Start with a usage count of 1
         self.is_initialized[idx] = True
-
-        # Increment age of all other valid memories
-        age_mask = torch.ones_like(self.memory_age, dtype=torch.bool)
-        age_mask[idx] = False
-        valid_entries = self.is_initialized & age_mask
-        self.memory_age[valid_entries] += 1
 
     def retrieve_from_memory(self, query: torch.Tensor) -> torch.Tensor:
         """
