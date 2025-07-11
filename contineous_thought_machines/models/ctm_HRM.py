@@ -225,6 +225,7 @@ class HierarchicalCTM(OriginalCTMCore):
         """
         The main forward pass implementing the hierarchical reasoning process.
         This method will replace the original CTM's iterative loop.
+        self.fusion_proj = nn.Linear(2 * self.d_model, self.d_model)
         """
         b, s, _ = x.shape
         device = x.device
@@ -253,6 +254,7 @@ class HierarchicalCTM(OriginalCTMCore):
             # The L-module's own synchronisation state is reset/recalculated each high-level cycle
             decay_alpha_action, decay_beta_action = None, None
 
+            prev_zL = activated_zL.clone()
             for t in range(self.config.hrm_low_level_timesteps):
                 # Compute L-module's action synchronisation for its attention query
                 sync_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
@@ -263,6 +265,12 @@ class HierarchicalCTM(OriginalCTMCore):
                 activated_zL, zL_trace = self.l_module(
                     activated_zL, zL_trace, zH, x_context, sync_action
                 )
+                
+                # Early stopping if change is small
+                delta = torch.norm(activated_zL - prev_zL)
+                if delta < 1e-3:
+                    break
+                prev_zL = activated_zL.clone()
             
             # Calculate surprise
             surprise = compute_normalized_entropy(activated_zL.unsqueeze(1)).mean()
@@ -275,7 +283,11 @@ class HierarchicalCTM(OriginalCTMCore):
             retrieved_memory = self.ltm.retrieve_from_memory(zH.squeeze(0))
 
             # End of low-level cycle, update high-level state using the final L-state
-            zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, activated_zL, retrieved_memory)
+            # Fuse retrieved_memory with zL before passing to h_module
+            fused_input = torch.cat([activated_zL, retrieved_memory.squeeze(0)], dim=-1)
+            fused_input = self.fusion_proj(fused_input)
+            
+            zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, fused_input, retrieved_memory)
             zH_history.append(zH)
             # The 'programs' list now stores the patch embeddings
             programs.append(encoded_patches)

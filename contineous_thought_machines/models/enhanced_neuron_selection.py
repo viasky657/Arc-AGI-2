@@ -102,14 +102,14 @@ class EnhancedNeuronSelector:
         
         return neuron_select_type_out, neuron_select_type_action
     
-    def select_neurons_for_synchronization(self, 
+    def select_neurons_for_synchronization(self,
                                          activations: torch.Tensor,
                                          synch_type: str,
                                          n_synch: int,
                                          d_model: int,
                                          targets: Optional[torch.Tensor] = None,
                                          weights: Optional[torch.Tensor] = None,
-                                         **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+                                         **kwargs) -> Tuple[torch.Tensor, torch.Tensor, str]:
         """
         Enhanced neuron selection for synchronization.
         
@@ -122,13 +122,15 @@ class EnhancedNeuronSelector:
             weights: Optional weight matrices for plasticity-based selection
             
         Returns:
-            Tuple of (left_neuron_indices, right_neuron_indices)
+            Tuple of (left_neuron_indices, right_neuron_indices, sync_mode) where sync_mode is 'paired' or 'cross'
         """
         device = activations.device if activations is not None else torch.device('cpu')
         
         # Get selection types
         neuron_select_type_out, neuron_select_type_action = self.get_neuron_select_type()
         current_type = neuron_select_type_out if synch_type == 'out' else neuron_select_type_action
+        
+        sync_mode = 'paired'  # Default
         
         # Handle biological selection
         if current_type.startswith('bio_') and self.biological_selector is not None:
@@ -147,17 +149,19 @@ class EnhancedNeuronSelector:
                     
                     # Create right indices based on selection strategy
                     bio_type = current_type[4:]
-                    if bio_type in ['competitive', 'evolutionary']:
-                        # Use different neurons for right side to encourage diversity
-                        remaining_indices = torch.tensor([i for i in range(d_model) 
+                    if bio_type in ['competitive', 'evolutionary', 'bio_criticality', 'bio_multi_objective']:
+                        # Use different neurons for right side to encourage diversity - cross sync
+                        remaining_indices = torch.tensor([i for i in range(d_model)
                                                         if i not in selected_indices[:n_synch]], device=device)
                         if len(remaining_indices) >= n_synch:
                             neuron_indices_right = remaining_indices[:n_synch]
                         else:
                             neuron_indices_right = selected_indices[:n_synch]  # Fallback
+                        sync_mode = 'cross'
                     else:
-                        # Use same neurons for both sides (self-synchronization)
+                        # Use same neurons for both sides (self-synchronization) - paired
                         neuron_indices_right = neuron_indices_left
+                        sync_mode = 'paired'
                         
                 else:
                     # Fallback to random if not enough neurons selected
@@ -165,20 +169,24 @@ class EnhancedNeuronSelector:
                         np.random.choice(np.arange(d_model), size=n_synch, replace=False)
                     ).to(device)
                     neuron_indices_right = neuron_indices_left
+                    sync_mode = 'paired'
             else:
                 # No activations available, fall back to random
                 neuron_indices_left = torch.from_numpy(
                     np.random.choice(np.arange(d_model), size=n_synch, replace=False)
                 ).to(device)
                 neuron_indices_right = neuron_indices_left
+                sync_mode = 'paired'
         
         # Handle legacy selection types
         elif current_type == 'first':
             neuron_indices_left = torch.arange(n_synch, device=device)
             neuron_indices_right = neuron_indices_left
+            sync_mode = 'cross'  # Assuming full cross for first-last
         elif current_type == 'last':
             neuron_indices_left = torch.arange(d_model - n_synch, d_model, device=device)
             neuron_indices_right = neuron_indices_left
+            sync_mode = 'cross'
         elif current_type == 'random':
             neuron_indices_left = torch.from_numpy(
                 np.random.choice(np.arange(d_model), size=n_synch, replace=False)
@@ -186,6 +194,7 @@ class EnhancedNeuronSelector:
             neuron_indices_right = torch.from_numpy(
                 np.random.choice(np.arange(d_model), size=n_synch, replace=False)
             ).to(device)
+            sync_mode = 'cross'
         elif current_type == 'random-pairing':
             neuron_indices_left = torch.from_numpy(
                 np.random.choice(np.arange(d_model), size=n_synch, replace=False)
@@ -193,10 +202,11 @@ class EnhancedNeuronSelector:
             neuron_indices_right = torch.from_numpy(
                 np.random.choice(np.arange(d_model), size=n_synch, replace=False)
             ).to(device)
+            sync_mode = 'paired'
         else:
             raise ValueError(f"Unknown neuron selection type: {current_type}")
         
-        return neuron_indices_left, neuron_indices_right
+        return neuron_indices_left, neuron_indices_right, sync_mode
     
     def update_performance(self, performance_metric: float):
         """Update performance history for adaptive selection."""

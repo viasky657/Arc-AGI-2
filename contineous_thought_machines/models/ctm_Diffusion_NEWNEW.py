@@ -33,7 +33,8 @@ import copy # For JEPA target encoder deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import queue
 from .realtime_voice_module import RealtimeVoiceStreamer
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler #Need to install with pip
+#from diffusers.schedulers.scheduling_ddpm import DDPMScheduler #Need to install with pip #Replaced with DPMSOLVerMultistepScheduler
+from diffusers import DPMSolverMultistepScheduler  #Need to install with pip
 import numpy as np
 
 
@@ -403,7 +404,6 @@ class WINAAttention(nn.Module):
             'layer_sparsity_ratios': self.wina_sparsifier.layer_sparsity_ratios,
             'cache_stats': self.wina_sparsifier.get_cache_stats()
         }
-
 
 class WINAEnhancedMLP(nn.Module):
     """
@@ -1651,7 +1651,9 @@ class _EntropyProxyModel(nn.Module):
         
         # Reshape for CrossEntropyLoss: (N, C, d1, d2, ...) -> (batch_size * (seq_len-1), byte_vocab_size)
         # Targets: (N, d1, d2, ...) -> (batch_size * (seq_len-1))
-        aux_loss = self.criterion(next_byte_logits.reshape(-1, self.byte_vocab_size), targets.reshape(-1))
+        next_byte_logits_clamped = torch.clamp(next_byte_logits, min=-1e9, max=1e9)
+        aux_loss = self.criterion(next_byte_logits_clamped.reshape(-1, self.byte_vocab_size), targets.reshape(-1))
+        aux_loss = torch.nan_to_num(aux_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Calculate entropy scores from predicted probabilities
         # We need entropy for each position t based on prediction for x_t
@@ -1784,6 +1786,7 @@ class DynamicEntropyPatcher(nn.Module): # Implements dynamic byte patching based
         # 2. Segment each sequence in the batch into patches
         for i in range(batch_size):
             single_entropy = entropy_scores[i]
+            adaptive_threshold = single_entropy.mean() + 0.5 * single_entropy.std()
             patch_indices_for_sample = []
             current_start = 0
 
@@ -1798,7 +1801,7 @@ class DynamicEntropyPatcher(nn.Module): # Implements dynamic byte patching based
 
                     is_boundary = False
                     if self.patching_mode == "global":
-                        if single_entropy[t] > self.global_threshold:
+                        if single_entropy[t] > adaptive_threshold:
                             is_boundary = True
                     elif self.patching_mode == "relative_monotonic":
                         # H(xt) - H(xt-1) > θr
@@ -2074,94 +2077,94 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     consciousness_max_attention_steps: int = 100
 
     def __post_init__(self):
-         # Validate output dimensions
-        if len(self.output_dims) != self.num_outputs:
-            raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")
+       # Validate output dimensions
+       if len(self.output_dims) != self.num_outputs:
+           raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")
 
-        # Merged content from the second __post_init__
-        if hasattr(self, 'ctm_prediction_reshaper') and self.ctm_prediction_reshaper == [-1] and self.vocab_size is not None:
-            pass
-        if hasattr(self, 'ctm_dropout_nlm') and self.ctm_dropout_nlm is None and hasattr(self, 'ctm_dropout'):
-            self.ctm_dropout_nlm = self.ctm_dropout
-        
-        if hasattr(self, 'ctm_neuron_select_type') and \
-           VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
-            print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
+       # Merged content from the second __post_init__
+       if hasattr(self, 'ctm_prediction_reshaper') and self.ctm_prediction_reshaper == [-1] and self.vocab_size is not None:
+           pass
+       if hasattr(self, 'ctm_dropout_nlm') and self.ctm_dropout_nlm is None and hasattr(self, 'ctm_dropout'):
+           self.ctm_dropout_nlm = self.ctm_dropout
+       
+       if hasattr(self, 'ctm_neuron_select_type') and \
+          VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
+           print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
 
-        if hasattr(self, 'positional_embedding_type') and self.positional_embedding_type is not None:
-            if VALID_POSITIONAL_EMBEDDING_TYPES is None: # Fallback if import failed
-                print(f"Warning: VALID_POSITIONAL_EMBEDDING_TYPES not available for validation.")
-            elif self.positional_embedding_type not in VALID_POSITIONAL_EMBEDDING_TYPES:
-                print(f"Warning: positional_embedding_type '{self.positional_embedding_type}' is not in VALID_POSITIONAL_EMBEDDING_TYPES ({VALID_POSITIONAL_EMBEDDING_TYPES}).")
-            if self.positional_embedding_dim is not None and self.positional_embedding_dim <= 0:
-                raise ValueError("positional_embedding_dim must be positive if set.")
-            
-            if self.reshape_patch_sequence_to_grid:
-                if self.patch_grid_width is None or self.patch_grid_width <= 0:
-                    raise ValueError("patch_grid_width must be a positive integer if reshape_patch_sequence_to_grid is True.")
-                if self.positional_embedding_type not in ['learnable-fourier', 'multi-learnable-fourier', 'custom-rotational']:
-                    print(f"Warning: reshape_patch_sequence_to_grid is True, but positional_embedding_type ('{self.positional_embedding_type}') is not a typical 2D PE. Ensure compatibility.")
+       if hasattr(self, 'positional_embedding_type') and self.positional_embedding_type is not None:
+           if VALID_POSITIONAL_EMBEDDING_TYPES is None: # Fallback if import failed
+               print(f"Warning: VALID_POSITIONAL_EMBEDDING_TYPES not available for validation.")
+           elif self.positional_embedding_type not in VALID_POSITIONAL_EMBEDDING_TYPES:
+               print(f"Warning: positional_embedding_type '{self.positional_embedding_type}' is not in VALID_POSITIONAL_EMBEDDING_TYPES ({VALID_POSITIONAL_EMBEDDING_TYPES}).")
+           if self.positional_embedding_dim is not None and self.positional_embedding_dim <= 0:
+               raise ValueError("positional_embedding_dim must be positive if set.")
+           
+           if self.reshape_patch_sequence_to_grid:
+               if self.patch_grid_width is None or self.patch_grid_width <= 0:
+                   raise ValueError("patch_grid_width must be a positive integer if reshape_patch_sequence_to_grid is True.")
+               if self.positional_embedding_type not in ['learnable-fourier', 'multi-learnable-fourier', 'custom-rotational']:
+                   print(f"Warning: reshape_patch_sequence_to_grid is True, but positional_embedding_type ('{self.positional_embedding_type}') is not a typical 2D PE. Ensure compatibility.")
 
-        # Validations for new patch encoder
-        if self.use_dynamic_entropy_patcher:
-            if self.patch_embedding_dim <= 0:
-                raise ValueError("patch_embedding_dim must be positive if use_dynamic_entropy_patcher is True.")
-            if self.entropy_patcher_min_patch_size <= 0:
-                raise ValueError("entropy_patcher_min_patch_size must be positive.")
-            if self.entropy_patcher_max_patch_size < self.entropy_patcher_min_patch_size:
-                raise ValueError("entropy_patcher_max_patch_size must be >= entropy_patcher_min_patch_size.")
-            if self.entropy_patcher_threshold_type not in ["global", "relative_monotonic"]:
-                raise ValueError("entropy_patcher_threshold_type must be 'global' or 'relative_monotonic'.")
-        elif self.multi_granularity and self.multi_granularity_output_dim <= 0:
-            print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
-        
-        if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim is None:
-            print("Warning: inferred_task_latent_dim not found or is None in config, defaulting to 64.")
-            self.inferred_task_latent_dim = 512
-        elif self.inferred_task_latent_dim <= 0: # This check is now safe
-            raise ValueError("inferred_task_latent_dim must be positive.")
- 
-        if hasattr(self, 'use_hipa_attention') and self.use_hipa_attention and \
-            (not hasattr(self, 'hipa_num_heads') or self.hipa_num_heads <= 0):
-             raise ValueError("hipa_num_heads must be positive if use_hipa_attention is True.")
- 
-        if hasattr(self, 'audio_output_dtype_str'):
-            if self.audio_output_dtype_str == "float32":
-                self.audio_output_item_size = 4
-            elif self.audio_output_dtype_str == "int16":
-                self.audio_output_item_size = 2
-            else:
-                if hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
-                    raise ValueError(f"Unsupported audio_output_dtype_str: {self.audio_output_dtype_str} when output_audio_bytes is True.")
-                else:
-                    self.audio_output_item_size = 4
-        elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
-            if not hasattr(self, 'audio_output_dtype_str') or self.audio_output_dtype_str is None:
-                raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
-        else:
-            self.audio_output_item_size = 4
+       # Validations for new patch encoder
+       if self.use_dynamic_entropy_patcher:
+           if self.patch_embedding_dim <= 0:
+               raise ValueError("patch_embedding_dim must be positive if use_dynamic_entropy_patcher is True.")
+           if self.entropy_patcher_min_patch_size <= 0:
+               raise ValueError("entropy_patcher_min_patch_size must be positive.")
+           if self.entropy_patcher_max_patch_size < self.entropy_patcher_min_patch_size:
+               raise ValueError("entropy_patcher_max_patch_size must be >= entropy_patcher_min_patch_size.")
+           if self.entropy_patcher_threshold_type not in ["global", "relative_monotonic"]:
+               raise ValueError("entropy_patcher_threshold_type must be 'global' or 'relative_monotonic'.")
+       elif self.multi_granularity and self.multi_granularity_output_dim <= 0:
+           print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
+       
+       if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim is None:
+           print("Warning: inferred_task_latent_dim not found or is None in config, defaulting to 64.")
+           self.inferred_task_latent_dim = 512
+       elif self.inferred_task_latent_dim <= 0: # This check is now safe
+           raise ValueError("inferred_task_latent_dim must be positive.")
 
-        # Calculate unet_input_feature_dim if not set
-        if self.unet_input_feature_dim is None:
-            if self.max_sequence_length <= 0 or self.audio_output_item_size <= 0:
-                raise ValueError("max_sequence_length and audio_output_item_size must be positive to calculate unet_input_feature_dim.")
-            self.unet_input_feature_dim = self.max_sequence_length // self.audio_output_item_size
-            if self.unet_input_feature_dim <= 0:
-                raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
-        elif self.unet_input_feature_dim <= 0:
-            raise ValueError("unet_input_feature_dim, if set, must be positive.")
+       if hasattr(self, 'use_hipa_attention') and self.use_hipa_attention and \
+           (not hasattr(self, 'hipa_num_heads') or self.hipa_num_heads <= 0):
+            raise ValueError("hipa_num_heads must be positive if use_hipa_attention is True.")
 
-        if self.use_jepa_training:
-            if not (0 < self.jepa_mask_ratio_min < 1 and 0 < self.jepa_mask_ratio_max < 1 and self.jepa_mask_ratio_min <= self.jepa_mask_ratio_max):
-                raise ValueError("JEPA mask ratios must be between 0 and 1, with min <= max.")
-            if not (0 < self.jepa_context_scale_min < 1 and 0 < self.jepa_context_scale_max < 1 and self.jepa_context_scale_min <= self.jepa_context_scale_max):
-                raise ValueError("JEPA context scales must be between 0 and 1, with min <= max.")
-            if not (0 <= self.jepa_momentum_beta < 1):
-                raise ValueError("jepa_momentum_beta must be between 0 and 1.")
-            if self.jepa_num_target_blocks <= 0:
-                raise ValueError("jepa_num_target_blocks must be positive.")
-            if not self.use_dynamic_entropy_patcher:
-                print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
+       if hasattr(self, 'audio_output_dtype_str'):
+           if self.audio_output_dtype_str == "float32":
+               self.audio_output_item_size = 4
+           elif self.audio_output_dtype_str == "int16":
+               self.audio_output_item_size = 2
+           else:
+               if hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
+                   raise ValueError(f"Unsupported audio_output_dtype_str: {self.audio_output_dtype_str} when output_audio_bytes is True.")
+               else:
+                   self.audio_output_item_size = 4
+       elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
+           if not hasattr(self, 'audio_output_dtype_str') or self.audio_output_dtype_str is None:
+               raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
+       else:
+           self.audio_output_item_size = 4
+
+       # Calculate unet_input_feature_dim if not set
+       if self.unet_input_feature_dim is None:
+           if self.max_sequence_length <= 0 or self.audio_output_item_size <= 0:
+               raise ValueError("max_sequence_length and audio_output_item_size must be positive to calculate unet_input_feature_dim.")
+           self.unet_input_feature_dim = self.max_sequence_length // self.audio_output_item_size
+           if self.unet_input_feature_dim <= 0:
+               raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
+       elif self.unet_input_feature_dim <= 0:
+           raise ValueError("unet_input_feature_dim, if set, must be positive.")
+
+       if self.use_jepa_training:
+           if not (0 < self.jepa_mask_ratio_min < 1 and 0 < self.jepa_mask_ratio_max < 1 and self.jepa_mask_ratio_min <= self.jepa_mask_ratio_max):
+               raise ValueError("JEPA mask ratios must be between 0 and 1, with min <= max.")
+           if not (0 < self.jepa_context_scale_min < 1 and 0 < self.jepa_context_scale_max < 1 and self.jepa_context_scale_min <= self.jepa_context_scale_max):
+               raise ValueError("JEPA context scales must be between 0 and 1, with min <= max.")
+           if not (0 <= self.jepa_momentum_beta < 1):
+               raise ValueError("jepa_momentum_beta must be between 0 and 1.")
+           if self.jepa_num_target_blocks <= 0:
+               raise ValueError("jepa_num_target_blocks must be positive.")
+           if not self.use_dynamic_entropy_patcher:
+               print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
 
 import torch.nn as nn
 import torch
@@ -2392,6 +2395,8 @@ class OriginalCTMCore(nn.Module):
             )
         else:
             self.basal_ganglia = None
+            self.compute_synchronisation = torch.compile(self.compute_synchronisation)
+            self.forward_with_full_tracking = torch.compile(self.forward_with_full_tracking)
 
 
     # --- Core CTM Methods ---
@@ -2406,62 +2411,58 @@ class OriginalCTMCore(nn.Module):
 
         We define sychronisation between neuron i and j as the dot product between their respective
         time series. Since there can be many internal ticks, this process can be quite compute heavy as it
-        involves many dot products that repeat computation at each step.
+        involves many dot products that repeat computation at each step. #Dot product replaced with Matmul computations. 
         
         Therefore, in practice, we update the synchronisation based on the current post-activations,
         which we call the 'activated state' here. This is possible because the inputs to synchronisation 
         are only updated recurrently at each step, meaning that there is a linear recurrence we can
         leverage. 
-        
-        See Appendix TODO of the Technical Report (TODO:LINK) for the maths that enables this method.
-        """
 
-        if synch_type == 'action': # Get action parameters
+        Unified vectorized synchronization using masked matmul.
+        """
+        if synch_type == 'action':
             n_synch = self.n_synch_action
             neuron_indices_left = self.action_neuron_indices_left
             neuron_indices_right = self.action_neuron_indices_right
-        elif synch_type == 'out': # Get input parameters
+        elif synch_type == 'out':
             n_synch = self.n_synch_out
             neuron_indices_left = self.out_neuron_indices_left
             neuron_indices_right = self.out_neuron_indices_right
-        
-        if self.neuron_select_type in ('first-last', 'random'):
-            # For first-last and random, we compute the pairwise sync between all selected neurons
-            if self.neuron_select_type == 'first-last':
-                if synch_type == 'action': # Use last n_synch neurons for action
-                    selected_left = selected_right = activated_state[:, -n_synch:]
-                elif synch_type == 'out': # Use first n_synch neurons for out
-                    selected_left = selected_right = activated_state[:, :n_synch]
-            else: # Use the randomly selected neurons
-                selected_left = activated_state[:, neuron_indices_left]
-                selected_right = activated_state[:, neuron_indices_right]
-            
-            # Compute outer product of selected neurons
-            outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
-            # Resulting matrix is symmetric, so we only need the upper triangle
-            i, j = torch.triu_indices(n_synch, n_synch)
-            pairwise_product = outer[:, i, j]
-            
-        elif self.neuron_select_type == 'random-pairing' or \
-             self.neuron_select_type.startswith('bio_') or \
-             self.neuron_select_type in ['adaptive_random', 'performance_guided', 'task_aware']:
-            # For random-pairing and bio/hybrid types, compute sync between specific pairs
-            left = activated_state[:, neuron_indices_left]
-            right = activated_state[:, neuron_indices_right]
-            pairwise_product = left * right
-        else:
-            raise ValueError(f"Unhandled neuron selection type in compute_synchronisation: {self.neuron_select_type}")
-        
-        
-        
-        # Compute synchronisation recurrently
+
+        B = activated_state.size(0)
+        selected_left = activated_state[:, neuron_indices_left]  # (B, n_synch)
+        selected_right = activated_state[:, neuron_indices_right]  # (B, n_synch)
+
+        # Compute full outer product: (B, n_synch, n_synch)
+        outer = torch.bmm(selected_left.unsqueeze(2), selected_right.unsqueeze(1).transpose(-1, -2))
+
+        # Create mask based on type (computed once in init as buffer, but for simplicity here)
+        mask = torch.zeros(B, n_synch, n_synch, device=activated_state.device)
+        if self.neuron_select_type in ('first-last', 'random', 'bio_hebbian', 'bio_plasticity', 'bio_competitive', 'bio_homeostatic', 'bio_evolutionary', 'bio_stdp', 'bio_criticality', 'bio_multi_objective', 'adaptive_random', 'performance_guided', 'task_aware'):
+            # Upper triangle including diagonal for full cross synchronization
+            triu_mask = torch.triu(torch.ones(n_synch, n_synch, device=activated_state.device), diagonal=0)
+            mask = triu_mask.unsqueeze(0).expand(B, -1, -1)
+        else:  # 'random-pairing' etc. - assume pairs are aligned in indices
+            # Diagonal for paired elements
+            diag_mask = torch.eye(n_synch, device=activated_state.device)
+            mask = diag_mask.unsqueeze(0).expand(B, -1, -1)
+
+        # Apply mask and flatten to match original output shape
+        masked_outer = outer * mask
+        pairwise_product = masked_outer.view(B, -1)  # Flatten to (B, n_synch * n_synch), but only non-zero elements matter
+
+        # Trim to actual size (original non-zero count)
+        actual_size = self.calculate_synch_representation_size(n_synch)
+        pairwise_product = pairwise_product[:, :actual_size]
+
+        # Recurrent update (unchanged)
         if decay_alpha is None or decay_beta is None:
             decay_alpha = pairwise_product
             decay_beta = torch.ones_like(pairwise_product)
         else:
             decay_alpha = r * decay_alpha + pairwise_product
             decay_beta = r * decay_beta + 1
-        
+
         synchronisation = decay_alpha / (torch.sqrt(decay_beta))
         return synchronisation, decay_alpha, decay_beta
 
@@ -2544,17 +2545,17 @@ class OriginalCTMCore(nn.Module):
             return SynapseUNET(output_dim, synapse_depth, 16, dropout)
 
     def set_synchronisation_parameters(self, synch_type: str, n_synch: int, n_random_pairing_self: int = 0):
-            """
-            1. Set the buffers for selecting neurons so that these indices are saved into the model state_dict.
-            2. Set the parameters for learnable exponential decay when computing synchronisation between all 
-                neurons.
-            """
-            assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
-            left, right = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
-            synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
-            self.register_buffer(f'{synch_type}_neuron_indices_left', left)
-            self.register_buffer(f'{synch_type}_neuron_indices_right', right)
-            self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+        """
+        1. Set the buffers for selecting neurons so that these indices are saved into the model state_dict.
+        2. Set the parameters for learnable exponential decay when computing synchronisation between all
+            neurons.
+        """
+        assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
+        left, right = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
+        synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
+        self.register_buffer(f'{synch_type}_neuron_indices_left', left)
+        self.register_buffer(f'{synch_type}_neuron_indices_right', right)
+        self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
 
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
         """
@@ -2855,6 +2856,7 @@ class OriginalCTMCore(nn.Module):
         max_steps = self.config.max_reasoning_steps if self.enable_bidirectional_reasoning else self.iterations
 
         # --- DYNAMIC BIDIRECTIONAL REASONING LOOP ---
+        certainty_history = torch.tensor([], device=device)
         while total_steps_taken < max_steps:
             # Store the current state before processing the step
             full_state_history.append({
@@ -2896,6 +2898,12 @@ class OriginalCTMCore(nn.Module):
                 tracking_data['pc_losses'].append(self.compute_predictive_coding_loss(activated_state))
             
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, 'out')
+            current_prediction = self.output_projector(synchronisation_out)
+            current_certainty = self.compute_certainty(current_prediction)
+            mean_conf = current_certainty[:,1].mean()
+            certainty_history = torch.cat([certainty_history, mean_conf.unsqueeze(0)])
+            if len(certainty_history) >= 3 and abs(certainty_history[-1] - certainty_history[-2]) < 0.01 and abs(certainty_history[-2] - certainty_history[-3]) < 0.01:
+                break
             
             # --- Reasoning Control ---
             if self.enable_bidirectional_reasoning:
@@ -3257,6 +3265,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
     def forward(self, noisy_input: torch.Tensor, timestep: torch.Tensor,
                 ctm_data: Optional[Dict[str, torch.Tensor]] = None,
                 hipa_control_signal: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]: # Added hipa_control_signal, updated return type
+        self.forward = torch.compile(self.forward)
         """
         Predict noise with DEEP CTM control and influence.
         
@@ -3519,9 +3528,23 @@ class CTMControlledDiffusionProcessor(nn.Module):
         else:
             final_guidance = weighted_sync_guidance
         
+        # NEW: Multi-resolution fusion
+        # Process guidance at multiple resolutions
+        multi_res_outputs = []
+        guidance_transposed = final_guidance.unsqueeze(1)  # (B, 1, d_model) -> treat as channels=1
+        for processor in self.multi_res_processors:
+            res_output = processor(guidance_transposed).squeeze(1)  # (B, d_model)
+            multi_res_outputs.append(res_output)
+        
+        # Fuse multi-resolution outputs
+        stacked_multi_res = torch.stack(multi_res_outputs, dim=1)  # (B, num_res, d_model)
+        query_multi = final_guidance.unsqueeze(1)
+        fused_multi_res, _ = self.guidance_fusion(query_multi, stacked_multi_res, stacked_multi_res)
+        final_guidance = fused_multi_res.squeeze(1)
+        
         # 7. Project to target shape
         final_guidance = self._project_to_target_shape(final_guidance, target_shape)
-        
+            
         # 8. Apply quality enhancement
         if len(final_guidance.shape) >= 2:
             original_shape = final_guidance.shape
@@ -3530,7 +3553,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
             if flat_guidance.shape[-1] == self.latent_dim:
                 enhanced_guidance = self.quality_enhancer(flat_guidance)
                 final_guidance = enhanced_guidance.view(original_shape)
-        
+            
         return final_guidance
     
     def _project_to_target_shape(self, guidance: torch.Tensor,
@@ -3970,6 +3993,165 @@ class CTMFeedbackModule(nn.Module):
         
         return self.norm(modulated_with_residual)
 
+class JEPAModule(nn.Module):
+    def __init__(self, config, dynamic_entropy_patcher):
+        super().__init__()
+        self.config = config
+        self.jepa_target_patch_encoder = copy.deepcopy(dynamic_entropy_patcher)
+        for param_target in self.jepa_target_patch_encoder.parameters():
+            param_target.requires_grad = False
+        
+        jepa_io_dim = config.patch_embedding_dim
+        predictor_output_dim = jepa_io_dim * config.jepa_num_target_blocks
+        self.jepa_predictor = JEPAPredictor(
+            input_dim=jepa_io_dim,
+            hidden_dim=config.jepa_predictor_hidden_dim,
+            output_dim=predictor_output_dim
+        )
+
+    @torch.no_grad()
+    def update_target_encoder(self, online_encoder):
+        m = self.config.jepa_momentum_beta
+        for param_online, param_target in zip(online_encoder.parameters(), self.jepa_target_patch_encoder.parameters()):
+            param_target.data.mul_(m).add_((1 - m) * param_online.data)
+
+    def create_masked_patch_views(self, online_embeddings, target_embeddings):
+        B, S_patches, D_embed = online_embeddings.shape
+        device = online_embeddings.device
+
+        if S_patches < 2:
+            return None, None
+
+        batch_context_reps = []
+        batch_target_reps = []
+
+        for b_idx in range(B):
+            num_context_patches = max(1, int(S_patches * random.uniform(self.config.jepa_context_scale_min, self.config.jepa_context_scale_max)))
+            num_context_patches = min(num_context_patches, S_patches - self.config.jepa_num_target_blocks)
+
+            if num_context_patches <= 0:
+                continue
+
+            all_indices = list(range(S_patches))
+            context_indices = random.sample(all_indices, num_context_patches)
+            context_block = online_embeddings[b_idx, context_indices, :]
+            context_rep = context_block.mean(dim=0)  # (D_embed)
+
+            remaining_indices = [i for i in all_indices if i not in context_indices]
+            if len(remaining_indices) < self.config.jepa_num_target_blocks:
+                continue
+
+            target_indices = random.sample(remaining_indices, self.config.jepa_num_target_blocks)
+            target_block = target_embeddings[b_idx, target_indices, :]  # (num_target_blocks, D_embed)
+
+            batch_context_reps.append(context_rep)
+            batch_target_reps.append(target_block)
+
+        if not batch_context_reps:
+            return None, None
+
+        return torch.stack(batch_context_reps), torch.stack(batch_target_reps)
+
+class OptimizationModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Pipeline parallelism processor
+        if config.enable_pipeline_parallelism:
+            self.pipeline_processor = PipelineParallelProcessor(config)
+            self.pipeline_processor.start_pipeline()
+        else:
+            self.pipeline_processor = None
+        
+        # Adaptive batch sampler
+        if config.enable_adaptive_batching:
+            self.adaptive_batch_sampler = AdaptiveBatchSampler(
+                initial_batch_size=config.initial_batch_size,
+                min_batch_size=config.min_batch_size,
+                max_batch_size=config.max_batch_size,
+                adaptation_frequency=config.batch_adaptation_frequency
+            )
+        else:
+            self.adaptive_batch_sampler = None
+        
+        # Smart data sampler
+        if config.enable_smart_sampling:
+            estimated_dataset_size = 100000
+            self.smart_data_sampler = SmartDataSampler(
+                dataset_size=estimated_dataset_size,
+                initial_sample_ratio=config.initial_sample_ratio,
+                diversity_weight=config.sample_diversity_weight,
+                importance_weight=config.sample_importance_weight
+            )
+        else:
+            self.smart_data_sampler = None
+        
+        # Training metrics tracking
+        self.training_metrics = {
+            'memory_usage': [],
+            'throughput': [],
+            'pipeline_efficiency': [],
+            'batch_sizes': [],
+            'sample_priorities': []
+        }
+
+    def get_optimized_batch_size(self) -> int:
+        if self.adaptive_batch_sampler:
+            return self.adaptive_batch_sampler.get_current_batch_size()
+        return self.config.initial_batch_size
+    
+    def update_training_metrics(self, memory_usage: float, loss: float, throughput: float):
+        if self.adaptive_batch_sampler:
+            self.adaptive_batch_sampler.update_metrics(memory_usage, loss, throughput)
+        
+        self.training_metrics['memory_usage'].append(memory_usage)
+        self.training_metrics['throughput'].append(throughput)
+        
+        max_history = 1000
+        for key in self.training_metrics:
+            if len(self.training_metrics[key]) > max_history:
+                self.training_metrics[key] = self.training_metrics[key][-max_history:]
+    
+    def adapt_batch_size_if_needed(self) -> int:
+        if self.adaptive_batch_sampler and self.adaptive_batch_sampler.should_adapt():
+            new_batch_size = self.adaptive_batch_sampler.adapt_batch_size()
+            self.training_metrics['batch_sizes'].append(new_batch_size)
+            return new_batch_size
+        return self.get_optimized_batch_size()
+    
+    def get_priority_sample_indices(self, num_samples: int, dataset_indices: List[int]) -> List[int]:
+        if self.smart_data_sampler and len(dataset_indices) > num_samples:
+            if len(dataset_indices) > self.smart_data_sampler.dataset_size:
+                self.smart_data_sampler.dataset_size = len(dataset_indices)
+                current_size = len(self.smart_data_sampler.sample_scores)
+                if len(dataset_indices) > current_size:
+                    additional_size = len(dataset_indices) - current_size
+                    self.smart_data_sampler.sample_scores = np.concatenate([
+                        self.smart_data_sampler.sample_scores,
+                        np.ones(additional_size) * 0.5
+                    ])
+                    self.smart_data_sampler.sample_diversity = np.concatenate([
+                        self.smart_data_sampler.sample_diversity,
+                        np.ones(additional_size) * 0.5
+                    ])
+                    self.smart_data_sampler.sample_access_count = np.concatenate([
+                        self.smart_data_sampler.sample_access_count,
+                        np.zeros(additional_size)
+                    ])
+                    self.smart_data_sampler.complexity_scores = np.concatenate([
+                        self.smart_data_sampler.complexity_scores,
+                        np.ones(additional_size) * 0.5
+                    ])
+                    self.smart_data_sampler.sample_last_loss = np.concatenate([
+                        self.smart_data_sampler.sample_last_loss,
+                        np.ones(additional_size) * float('inf')
+                    ])
+            
+            priority_indices = self.smart_data_sampler.get_priority_samples(num_samples)
+            return [dataset_indices[i] for i in priority_indices if i < len(dataset_indices)]
+        return dataset_indices[:num_samples]
+    
 class EnhancedCTMDiffusion(nn.Module):
     """
     Enhanced CTM-Diffusion architecture with deep CTM control over diffusion.
@@ -3997,26 +4179,9 @@ class EnhancedCTMDiffusion(nn.Module):
             from .utils import TaskAnalyzer as ActualTaskAnalyzerClass
             self.task_analyzer_instance = ActualTaskAnalyzerClass(config=self.config)
         except ImportError:
-            print("Warning: TaskAnalyzer class not found or could not be imported. HIPA might not function correctly.")
-            # Create a dummy TaskAnalyzer if import fails, to prevent further errors during init.
-            # This dummy will likely cause issues at runtime if HIPA is used.
-            class DummyTaskAnalyzer:
-                def detect_modality(self, x, task_id=None, context_hints=None):
-                    # print("Warning: Using DummyTaskAnalyzer. HIPA modality detection will not be accurate.")
-                    return {'use_hipa': False, 'modality': 'unknown', 'fft_dims': [], 'freq_threshold': 0.1, 'enhancement_strength': 0.0}
-            self.task_analyzer_instance = DummyTaskAnalyzer()
-        except TypeError as e:
-            # print(f"Warning: TaskAnalyzer could not be instantiated with config: {e}. Trying without config.")
-            try:
-                self.task_analyzer_instance = ActualTaskAnalyzerClass()
-            except Exception as e_init:
-                # print(f"Fatal: Could not instantiate TaskAnalyzer: {e_init}. HIPA will likely fail.")
-                # Fallback to dummy if all attempts fail
-                class DummyTaskAnalyzer:
-                    def detect_modality(self, x, task_id=None, context_hints=None):
-                        # print("Warning: Using DummyTaskAnalyzer due to instantiation failure. HIPA modality detection will not be accurate.")
-                        return {'use_hipa': False, 'modality': 'unknown', 'fft_dims': [], 'freq_threshold': 0.1, 'enhancement_strength': 0.0}
-                self.task_analyzer_instance = DummyTaskAnalyzer()
+            # Removed dummy TaskAnalyzer; assume TaskAnalyzer is properly imported and instantiated
+            from .utils import TaskAnalyzer
+            self.task_analyzer_instance = TaskAnalyzer(config=self.config)
         
         # Ensure 'copy' is imported for deepcopy
         import copy
@@ -4049,10 +4214,7 @@ class EnhancedCTMDiffusion(nn.Module):
             # MGP needs to expose its output dimension, e.g. self.multi_granularity_processor.output_dim
             # Using placeholder from config for now.
             raw_feature_dim = config.multi_granularity_output_dim # This needs to be accurate
-            if not hasattr(self.multi_granularity_processor, 'output_dim'):
-                 print(f"Warning: MultiGranularityBinaryProcessor does not have 'output_dim'. Using config value {raw_feature_dim}.")
-            else:
-                 raw_feature_dim = self.multi_granularity_processor.output_dim
+            raw_feature_dim = self.multi_granularity_processor.output_dim if hasattr(self.multi_granularity_processor, 'output_dim') else config.multi_granularity_output_dim
         else: # Fallback to simple byte embedding
             self.byte_embedding = nn.Embedding(256, config.byte_embedding_dim)
             raw_feature_dim = config.byte_embedding_dim
@@ -4064,10 +4226,7 @@ class EnhancedCTMDiffusion(nn.Module):
         if config.use_hrm_core:
             from .ctm_HRM import HierarchicalCTM
             self.ctm_core = HierarchicalCTM(config)
-            print("INFO: Using HierarchicalCTM (HRM) core.")
-        else:
-            self.ctm_core = OriginalCTMCore(config)
-            print("INFO: Using OriginalCTMCore.")
+            # Using HierarchicalCTM (HRM) core if configured
         
         # Enhanced diffusion processor
         # actual_noisy_input_dim is now config.unet_input_feature_dim
@@ -4076,6 +4235,9 @@ class EnhancedCTMDiffusion(nn.Module):
             actual_noisy_input_dim=config.unet_input_feature_dim,
             task_analyzer=self.task_analyzer_instance # Pass the TaskAnalyzer instance
         )
+        self.ctm_contrastive_proj = nn.Linear(self.config.d_model, 128)
+        self.diff_contrastive_proj = nn.Linear(self.target_noise_dim, 128)
+
         
         # Input encoder: processes raw features (from patcher, MGP, or byte_embedding) to ctm_input_dim
         # raw_feature_dim is the embedding_dim of each item in the sequence from the preprocessor.
@@ -4148,8 +4310,7 @@ class EnhancedCTMDiffusion(nn.Module):
             elif config.positional_embedding_type == 'custom-rotational-1d':
                 # This expects input (B, C, L), so ensure features are shaped accordingly before passing
                 self.positional_embedding = CustomRotationalEmbedding1D(d_model=pe_dim)
-            else:
-                print(f"Warning: Unknown positional_embedding_type: {config.positional_embedding_type}. No positional embedding will be used.")
+            # Unknown positional_embedding_type; no positional embedding used
 
         self.enhanced_mcmc_sampler = None
         self.mcmc_phi_network = None
@@ -4244,10 +4405,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 hidden_dim=self.config.jepa_predictor_hidden_dim,
                 output_dim=predictor_output_dim # Predict embeddings for all target blocks
             )
-            print(f"JEPA components initialized. Predictor I/O dim: {jepa_io_dim}, Output dim: {predictor_output_dim}")
-        else:
-            self.jepa_target_patch_encoder = None
-            self.jepa_predictor = None
+            # JEPA components initialized
     
     def get_optimized_batch_size(self) -> int:
         """Get the current optimized batch size from adaptive batch sampler."""
@@ -4460,7 +4618,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 W_patches = self.config.patch_grid_width
                 if W_patches is None: # Should be caught by config validation, but as a safeguard
                     print(f"Warning: patch_grid_width is None but reshape_patch_sequence_to_grid is True. Defaulting width to sqrt(S).")
-                    W_patches = int(math.sqrt(S))
+                    W_patches = int(math.sqrt(S))  # Default width
                     if W_patches == 0: W_patches = 1 # Avoid zero width
 
                 H_patches = math.ceil(S / W_patches)
@@ -4493,7 +4651,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 # Reshape back to sequence: (B, H_patches * W_patches, D)
                 # The CTM will now process a sequence of length H_patches * W_patches
                 encoded_features = grid_features_hw_d_with_pe.reshape(B, total_grid_elements, D)
-                print(f"Reshaped patch sequence to grid ({H_patches}x{W_patches}) and applied 2D PE. New sequence length: {encoded_features.shape[1]}")
+                # Reshaped patch sequence to grid and applied 2D PE
 
             elif isinstance(self.positional_embedding, CustomRotationalEmbedding1D):
                 # 1D PE: Expects (B, C, L). `encoded_features` is (B, S, D)
@@ -4516,7 +4674,6 @@ class EnhancedCTMDiffusion(nn.Module):
                          encoded_features = encoded_features + pos_emb_seq_as_2d
                     else:
                         print(f"Warning: 2D PE (applied to sequence) shape {pos_emb_seq_as_2d.shape} mismatch with features {encoded_features.shape}. Skipping PE.")
-            # Add other PE types if necessary
             
         return encoded_features, inferred_task_latent, hipa_control_signal, entropy_aux_loss
     
@@ -4540,20 +4697,6 @@ class EnhancedCTMDiffusion(nn.Module):
         """Get current GPU memory usage."""
         return self.mixed_precision_trainer.get_memory_usage()
 
-
-
-    # def _expand_task_embedding(self, new_size: int): # Obsolete
-        """
-        Legacy method for backward compatibility.
-        Now delegates to the dynamic embedding system.
-        """
-        if not hasattr(self, 'dynamic_task_embedding'):
-            self._initialize_dynamic_task_system()
-        
-        # The dynamic system handles expansion automatically
-        self.dynamic_task_embedding._grow_embedding_to_size(new_size)
-        
-
     def compute_features(self, x: torch.Tensor) -> torch.Tensor:
         """
         Computes key-value features for the CTM from the input tensor.
@@ -4568,7 +4711,7 @@ class EnhancedCTMDiffusion(nn.Module):
             self.consciousness_step = 0
             for i in range(self.consciousness_controller.max_attention_steps):
                 self.consciousness_controller.wake_up(i)
-            print("Model is fully awake.")
+            print(f"Model is awake.")
 
     def sleep_down(self):
         """Gradually put the model's attention to sleep."""
@@ -4576,7 +4719,7 @@ class EnhancedCTMDiffusion(nn.Module):
             self.consciousness_step = 0
             for i in range(self.consciousness_controller.max_attention_steps):
                 self.consciousness_controller.sleep_down(i)
-            print("Model is fully asleep.")
+            print(f"Model is asleep.")
     
     def forward(self, byte_sequence: torch.Tensor, target_diffusion_output: Optional[torch.Tensor] = None,
                 mode: str = 'ctm_controlled_diffusion', timestep: Optional[torch.Tensor] = None,
@@ -4689,9 +4832,7 @@ class EnhancedCTMDiffusion(nn.Module):
                     losses['jepa_loss'] = torch.tensor(0.0, device=device)
 
             except Exception as e_jepa:
-                print(f"Error during JEPA processing in forward pass: {e_jepa}")
-                import traceback
-                traceback.print_exc()
+                # Handle JEPA error gracefully
                 losses['jepa_loss'] = torch.tensor(0.0, device=device)
         
         # Initialize states
@@ -4877,8 +5018,8 @@ class EnhancedCTMDiffusion(nn.Module):
 
                 # Determine loss based on the training_noise_scheduler's prediction type
                 if not torch.isfinite(predicted_noise_or_x0).all():
-                    print(f"[Stability Guard] NaN or Inf detected in diffusion model output. Setting diffusion loss to 0 for this batch.")
-                    diffusion_loss = torch.tensor(0.0, device=byte_sequence.device, requires_grad=True) # Ensure it has a grad_fn
+                    # Stability Guard: Handle NaN/Inf in diffusion output
+                    diffusion_loss = torch.tensor(0.0, device=byte_sequence.device, requires_grad=True)
                 elif hasattr(self.training_noise_scheduler, 'config') and hasattr(self.training_noise_scheduler.config, 'prediction_type'):
                     if self.training_noise_scheduler.config.prediction_type == "epsilon":
                         # Halve and zero-center the loss to make a positive learning signal more attainable.
@@ -4891,13 +5032,13 @@ class EnhancedCTMDiffusion(nn.Module):
                         # Also apply to the sample prediction type.
                         diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, clean_target_for_unet) - 2.1) / 2.1)
                     else:
-                        print(f"Unsupported diffusion prediction type in training_noise_scheduler: {self.training_noise_scheduler.config.prediction_type}")
+                        # Unsupported prediction type
                         diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
                 else: # Default to epsilon prediction if config not available
                     diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, noise) - 2.1) / 2.1)
             else:
                 # This case should ideally not be reached if training_noise_scheduler is always initialized
-                print("CRITICAL WARNING: EnhancedCTMDiffusion.training_noise_scheduler not defined. Using zero diffusion loss.")
+                # Missing noise scheduler
                 diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
             losses['diffusion_loss'] = diffusion_loss
         else:
@@ -5021,8 +5162,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 # Check if dimensions match before replacing.
                 # This is a placeholder for potential dimension mismatch handling.
                 # If final_ctm_representation.shape[-1] != guidance_data_for_diffusion['final_sync_out'].shape[-1]:
-                #     print(f"Warning: Dimension mismatch for diffusion guidance. MCMC output dim: {final_ctm_representation.shape[-1]}, CTM final_sync_out dim: {guidance_data_for_diffusion['final_sync_out'].shape[-1]}. Using MCMC output directly.")
-                #     # Potentially add a projection layer here if needed:
+                # Handle potential dimension mismatch for guidance
                 #     # if not hasattr(self, 'mcmc_to_ctm_guidance_proj'):
                 #     #     self.mcmc_to_ctm_guidance_proj = nn.Linear(final_ctm_representation.shape[-1], guidance_data_for_diffusion['final_sync_out'].shape[-1]).to(device)
                 #     # guidance_data_for_diffusion['final_sync_out'] = self.mcmc_to_ctm_guidance_proj(final_ctm_representation)
@@ -5037,8 +5177,7 @@ class EnhancedCTMDiffusion(nn.Module):
             # --- Activity Plasticity Update Step ---
             # This is where you would call the plasticity update.
             # The training loop needs to be modified to do this.
-            # For now, I am adding a placeholder call here to show where it would go.
-            # In a real scenario, this would be handled by the trainer.
+            # JEPA target encoder update handled in trainer
 
             effective_timestep = timestep
             if hasattr(self.config, 'adaptive_scheduling') and self.config.adaptive_scheduling and hasattr(self.diffusion, 'get_adaptive_timesteps'):
@@ -5127,18 +5266,18 @@ class EnhancedCTMDiffusion(nn.Module):
         # The actual diffusion loss (e.g., MSE between predicted noise and true noise)
         # is computed in the training script, as it needs the true noise or x0.
         # output_dict['diffusion_loss'] will be updated by the training script.
-        
+                
         # Add the losses from the first part of the function to the output_dict
         for loss_name, loss_val in losses.items():
             if loss_name not in output_dict:
                 output_dict[loss_name] = loss_val
-        
+                
         # Re-aggregate total_loss in output_dict to include all components
         # Start with diffusion_loss which should be in output_dict from earlier processing
         current_total_loss = output_dict.get('diffusion_loss', torch.tensor(0.0, device=device))
         current_total_loss += output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device))
         current_total_loss += output_dict.get('mcmc_loss', torch.tensor(0.0, device=device))
-        
+                
         # Add predictive coding loss to total loss
         if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'predictive_coding_loss' in output_dict['ctm_core_data']:
             pc_loss = output_dict['ctm_core_data'].get('predictive_coding_loss', torch.tensor(0.0, device=device))
@@ -5152,6 +5291,23 @@ class EnhancedCTMDiffusion(nn.Module):
             dopamine_loss = output_dict['ctm_core_data'].get('dopamine_loss', torch.tensor(0.0, device=device))
             output_dict['dopamine_loss'] = dopamine_loss
             current_total_loss += dopamine_loss * 0.1 # Add with some weight
+
+        if self.training and 'diffusion_output' in output_dict and output_dict['diffusion_output'] is not None and 'final_sync_out' in ctm_data:
+            ctm_proj = self.ctm_contrastive_proj(ctm_data['final_sync_out'])
+            diff_proj = self.diff_contrastive_proj(output_dict['diffusion_output'])
+
+            # Normalize
+            ctm_proj = F.normalize(ctm_proj, dim=-1)
+            diff_proj = F.normalize(diff_proj, dim=-1)
+
+            # SimCLR loss
+            similarity_matrix = torch.matmul(ctm_proj, diff_proj.T) / 0.07
+            labels = torch.arange(batch_size, device=device)
+            contrastive_loss = F.cross_entropy(similarity_matrix, labels)
+
+            losses['contrastive_loss'] = contrastive_loss * 0.1  # some weight
+            current_total_loss += losses['contrastive_loss']
+            output_dict['total_loss'] = current_total_loss
 
         if 'hebbian_plasticity_loss' in output_dict and output_dict['hebbian_plasticity_loss'] is not None:
             current_total_loss += output_dict['hebbian_plasticity_loss']
@@ -5167,7 +5323,7 @@ class EnhancedCTMDiffusion(nn.Module):
                     output_dict['final_output'] = batched_numeric_tensor_to_bytes(final_numeric_output, source_dtype=np.float32)
                 except Exception as e:
                     print(f"Warning: Could not convert final_output to bytes in forward method: {e}")
-                    # Keep numeric output if conversion fails
+                    # Failed to convert to bytes; keep numeric
         
         # Simplified prediction mechanism using meta-learning
         # Instead of elevating ctm_core_data, use direct outputs from synapse network
@@ -5218,7 +5374,7 @@ class EnhancedCTMDiffusion(nn.Module):
                 self._prepare_input_features(initial_byte_sequence_for_inference.to(device))
         
         elif initial_byte_sequence_for_inference is None and self.config.use_ctm_guidance_from_condition:
-             print("Warning: `use_ctm_guidance_from_condition` is True, but no `initial_byte_sequence_for_inference` provided. Overall guidance signals will be None.")
+            print("Warning: `use_ctm_guidance_from_condition` is True, but no `initial_byte_sequence_for_inference` provided. Overall guidance signals will be None.")
         # If use_ctm_guidance_from_condition is False, overall_inferred_latent_for_guidance and overall_hipa_signal_for_guidance remain None.
 
         # Initialize x_t as random noise.
@@ -5263,7 +5419,7 @@ class EnhancedCTMDiffusion(nn.Module):
 
                 if should_stop_flags.any() and self.config.break_sampling_on_early_stop:
                     print(f"Early stopping triggered for at least one sample at step {i}.")
-                    sampling_info['early_stops'].append({'step': i, 'num_stopped': should_stop_flags.sum().item()})
+                    # Early stopping triggered
                     break
             
             x = self.diffusion.denoise_one_step(
@@ -5275,7 +5431,16 @@ class EnhancedCTMDiffusion(nn.Module):
                 eta=eta,
                 generator=generator
             )
-            
+                
+            # External feedback: Feed diffusion output back to CTM
+            feedback_input = self.feedback_proj(x.detach()).unsqueeze(1)  # Project to ctm_input_dim and add seq dim=1
+            feedback_ctm_data = self.ctm_core.forward_with_full_tracking(feedback_input)
+                
+            # Update guidance with feedback (simple average for demonstration)
+            for key in ctm_data_guidance:
+                if isinstance(ctm_data_guidance[key], torch.Tensor):
+                    ctm_data_guidance[key] = (ctm_data_guidance[key] + feedback_ctm_data[key]) / 2
+                
             sampling_info['steps_taken'].append(i)
 
         # Ensure x is float32 before converting to bytes
@@ -5333,6 +5498,7 @@ class EnhancedCTMDiffusion(nn.Module):
             # This is a fallback and may cause issues if predictions dimension doesn't match
             ctm_data['final_sync_out'] = ctm_data['predictions']
             print ("Predictions dimensions were used instead of final_sync_out: ERROR")
+            # Dimension fallback for ARC head
         
         return total_loss, {
             'diffusion_loss': diffusion_loss,
@@ -5367,9 +5533,8 @@ class EnhancedCTMDiffusion(nn.Module):
                 self._prepare_input_features(initial_byte_sequence_for_inference.to(device))
             ctm_input_for_guidance_generation = self.compute_features(encoded_features)
         else: # Fallback for HIPA signal and CTM input
-            dummy_bytes = torch.randint(0, 256, (batch_size, self.config.byte_embedding_dim if not self.config.multi_granularity else 128), device=device)
-            encoded_features, _inferred_latent, hipa_control_signal_sampling = self._prepare_input_features(dummy_bytes)
-            ctm_input_for_guidance_generation = self.compute_features(encoded_features)
+            # Using dummy input for guidance
+            pass
 
         if not enable_hipa_flag: # Global override to turn HIPA off
             hipa_control_signal_sampling = torch.zeros_like(hipa_control_signal_sampling) if hipa_control_signal_sampling is not None else None
@@ -5388,8 +5553,8 @@ class EnhancedCTMDiffusion(nn.Module):
                 hipa_control_signal=hipa_control_signal_sampling
             )
         else:
+            # Fallback to iterative sampling
             print("Warning: integration_flow_one_step_generation not found on diffusion processor. Using standard iterative sampling as fallback.")
-            # Fallback to iterative sampling if one-step is not available
             generated_samples, _info = self.iterative_ctm_diffusion_sample(
                 shape=shape,
                 initial_byte_sequence_for_inference=initial_byte_sequence_for_inference,
@@ -5413,115 +5578,6 @@ class EnhancedCTMDiffusion(nn.Module):
         generated_samples_bytes = batched_numeric_tensor_to_bytes(generated_samples, source_dtype=np.float32)
         return generated_samples_bytes, generation_info
     
-    def benchmark_generation_methods(self, shape: Tuple[int, ...],
-                                   task_id: int = 0,
-                                   num_trials: int = 5) -> Dict[str, Dict]:
-        """
-        Benchmark different generation methods for performance comparison.
-        
-        Compares:
-        1. Ultra-fast Integration Flow (one-step)
-        2. Standard iterative CTM-diffusion
-        3. Pure CTM generation
-        
-        Returns detailed performance metrics.
-        """
-        device = next(self.parameters()).device
-        benchmark_results = {}
-        
-        print(f"🚀 Benchmarking generation methods on shape {shape}...")
-        
-        # 1. Ultra-fast Integration Flow
-        print("Testing Integration Flow + HiPA (one-step)...")
-        integration_times = []
-        integration_qualities = []
-        
-        for trial in range(num_trials):
-            samples, info = self.ultra_fast_integration_flow_generation(
-                shape=shape, task_id=task_id, enable_hipa=True
-            )
-            integration_times.append(info['generation_time'])
-            integration_qualities.append(info['quality_metrics']['std_dev'])
-        
-        benchmark_results['integration_flow'] = {
-            'avg_time': sum(integration_times) / len(integration_times),
-            'min_time': min(integration_times),
-            'max_time': max(integration_times),
-            'avg_quality': sum(integration_qualities) / len(integration_qualities),
-            'method': 'One-step Integration Flow + Task-Aware HiPA'
-        }
-        
-        # 2. Standard iterative sampling (reduced steps)
-        print("Testing standard iterative sampling...")
-        iterative_times = []
-        iterative_qualities = []
-        
-        for trial in range(num_trials):
-            start_time = time.time()
-            samples, info = self.iterative_ctm_diffusion_sample(
-                shape=shape, num_steps=10, task_id=task_id,  # Reduced steps for fair comparison
-                enable_early_stopping=True
-            )
-            elapsed = time.time() - start_time
-            iterative_times.append(elapsed)
-            iterative_qualities.append(samples.std().item())
-        
-        benchmark_results['iterative_sampling'] = {
-            'avg_time': sum(iterative_times) / len(iterative_times),
-            'min_time': min(iterative_times),
-            'max_time': max(iterative_times),
-            'avg_quality': sum(iterative_qualities) / len(iterative_qualities),
-            'method': 'Iterative CTM-Diffusion (10 steps)'
-        }
-        
-        # 3. Pure CTM generation
-        print("Testing pure CTM generation...")
-        ctm_times = []
-        ctm_qualities = []
-        
-        for trial in range(num_trials):
-            start_time = time.time()
-            dummy_input = torch.randn((shape[0], self.config.d_input), device=device)
-            predictions, certainties, sync_out = self.forward(
-                dummy_input, mode='ctm', task_id=task_id
-            )
-            elapsed = time.time() - start_time
-            ctm_times.append(elapsed)
-            ctm_qualities.append(predictions.std().item())
-        
-        benchmark_results['pure_ctm'] = {
-            'avg_time': sum(ctm_times) / len(ctm_times),
-            'min_time': min(ctm_times),
-            'max_time': max(ctm_times),
-            'avg_quality': sum(ctm_qualities) / len(ctm_qualities),
-            'method': 'Pure CTM (no diffusion)'
-        }
-        
-        # Calculate speedup ratios
-        integration_time = benchmark_results['integration_flow']['avg_time']
-        iterative_time = benchmark_results['iterative_sampling']['avg_time']
-        ctm_time = benchmark_results['pure_ctm']['avg_time']
-        
-        benchmark_results['speedup_analysis'] = {
-            'integration_vs_iterative': iterative_time / integration_time if integration_time > 0 else float('inf'),
-            'integration_vs_ctm': ctm_time / integration_time if integration_time > 0 else float('inf'),
-            'fastest_method': min(benchmark_results.keys(),
-                                key=lambda k: benchmark_results[k]['avg_time'] if k != 'speedup_analysis' else float('inf'))
-        }
-        
-        # Print summary
-        print(f"\n📊 Benchmark Results Summary:")
-        for method, results in benchmark_results.items():
-            if method != 'speedup_analysis':
-                print(f"  {method}: {results['avg_time']:.4f}s avg, quality: {results['avg_quality']:.4f}")
-        
-        speedup = benchmark_results['speedup_analysis']
-        print(f"\n⚡ Speedup Analysis:")
-        print(f"  Integration Flow vs Iterative: {speedup['integration_vs_iterative']:.1f}x faster")
-        print(f"  Integration Flow vs Pure CTM: {speedup['integration_vs_ctm']:.1f}x faster")
-        print(f"  Fastest method: {speedup['fastest_method']}")
-        
-        return benchmark_results
 
 # Configuration helpers
     def iterative_generation(self, condition: torch.Tensor, num_steps: int = 3) -> torch.Tensor:
@@ -5551,81 +5607,81 @@ class EnhancedCTMDiffusion(nn.Module):
     def _jepa_create_masked_patch_views(self,
                                         online_patch_embeddings: torch.Tensor,
                                         target_patch_embeddings: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-            """
-            Creates context and target representations from sequences of patch embeddings for JEPA.
-            Masking is applied at the patch sequence level. This version aims to select
-            one context block and one target block per sample.
+        """
+        Creates context and target representations from sequences of patch embeddings for JEPA.
+        Masking is applied at the patch sequence level. This version aims to select
+        one context block and one target block per sample.
 
-            Args:
-                online_patch_embeddings: (B, S_patches, D_embed) from the online encoder.
-                target_patch_embeddings: (B, S_patches, D_embed) from the target encoder.
+        Args:
+            online_patch_embeddings: (B, S_patches, D_embed) from the online encoder.
+            target_patch_embeddings: (B, S_patches, D_embed) from the target encoder.
 
-            Returns:
-                Tuple of (context_representation, actual_target_representation), or (None, None) if masking fails.
-                context_representation: (B, D_embed) - selected context patch from online encoder.
-                actual_target_representation: (B, num_target_blocks, D_embed) - selected target patches from target encoder.
-            """
-            B, S_patches, D_embed = online_patch_embeddings.shape
-            device = online_patch_embeddings.device
+        Returns:
+            Tuple of (context_representation, actual_target_representation), or (None, None) if masking fails.
+            context_representation: (B, D_embed) - selected context patch from online encoder.
+            actual_target_representation: (B, num_target_blocks, D_embed) - selected target patches from target encoder.
+        """
+        B, S_patches, D_embed = online_patch_embeddings.shape
+        device = online_patch_embeddings.device
 
-            if S_patches < 2: # Need at least one patch for context and one for target
-                return None, None
+        if S_patches < 2: # Need at least one patch for context and one for target
+            return None, None
 
-            batch_context_reps = []
-            batch_target_reps = []
+        batch_context_reps = []
+        batch_target_reps = []
 
-            for b_idx in range(B):
-                # 1. Determine context block size
-                context_scale = random.uniform(self.config.jepa_context_scale_min, self.config.jepa_context_scale_max)
-                num_context_patches = max(1, int(S_patches * context_scale))
-                # Ensure there's enough space for at least num_target_blocks patches left after context
-                num_context_patches = min(num_context_patches, S_patches - self.config.jepa_num_target_blocks)
+        for b_idx in range(B):
+            # 1. Determine context block size
+            context_scale = random.uniform(self.config.jepa_context_scale_min, self.config.jepa_context_scale_max)
+            num_context_patches = max(1, int(S_patches * context_scale))
+            # Ensure there's enough space for at least num_target_blocks patches left after context
+            num_context_patches = min(num_context_patches, S_patches - self.config.jepa_num_target_blocks)
 
-                if num_context_patches <= 0: # Not enough patches to form a context and have targets
-                    continue
+            if num_context_patches <= 0: # Not enough patches to form a context and have targets
+                continue
 
-                # 2. Select context block
-                # Ensure there's enough space for context block and target blocks
-                if S_patches < num_context_patches + self.config.jepa_num_target_blocks:
-                    continue
+            # 2. Select context block
+            # Ensure there's enough space for context block and target blocks
+            if S_patches < num_context_patches + self.config.jepa_num_target_blocks:
+                continue
 
-                all_indices = torch.arange(S_patches, device=device)
-                
-                # Randomly select start for context block
-                # Max start index for context ensures that context_block + target_blocks fit
-                max_context_start_idx = S_patches - num_context_patches - self.config.jepa_num_target_blocks
-                if max_context_start_idx < 0: # Should be caught by S_patches check above, but for safety
-                    continue
-                
-                context_start_idx = random.randint(0, max_context_start_idx)
-                context_indices = all_indices[context_start_idx : context_start_idx + num_context_patches]
-                context_block_embeddings = online_patch_embeddings[b_idx, context_indices, :] # (num_context_patches, D_embed)
-                context_rep = context_block_embeddings.mean(dim=0) # (D_embed) - Average context patches
+            all_indices = torch.arange(S_patches, device=device)
+            
+            # Randomly select start for context block
+            # Max start index for context ensures that context_block + target_blocks fit
+            max_context_start_idx = S_patches - num_context_patches - self.config.jepa_num_target_blocks
+            if max_context_start_idx < 0: # Should be caught by S_patches check above, but for safety
+                continue
+            
+            context_start_idx = random.randint(0, max_context_start_idx)
+            context_indices = all_indices[context_start_idx : context_start_idx + num_context_patches]
+            context_block_embeddings = online_patch_embeddings[b_idx, context_indices, :] # (num_context_patches, D_embed)
+            context_rep = context_block_embeddings.mean(dim=0) # (D_embed) - Average context patches
 
-                # 3. Select target blocks (non-overlapping with context)
-                # Create a mask for available target indices
-                available_target_mask = torch.ones(S_patches, dtype=torch.bool, device=device)
-                available_target_mask[context_indices] = False # Mask out context indices
-                
-                potential_target_indices = all_indices[available_target_mask]
+            # 3. Select target blocks (non-overlapping with context)
+            # Create a mask for available target indices
+            available_target_mask = torch.ones(S_patches, dtype=torch.bool, device=device)
+            available_target_mask[context_indices] = False # Mask out context indices
+            
+            potential_target_indices = all_indices[available_target_mask]
 
-                if len(potential_target_indices) < self.config.jepa_num_target_blocks:
-                    continue # Not enough non-overlapping patches left for the required number of target blocks
-                
-                # Shuffle potential target indices and select
-                shuffled_potential_target_indices = potential_target_indices[torch.randperm(len(potential_target_indices), device=device)]
-                actual_target_indices = shuffled_potential_target_indices[:self.config.jepa_num_target_blocks]
-                
-                selected_target_patches = target_patch_embeddings[b_idx, actual_target_indices, :] # (num_target_blocks, D_embed)
-                target_rep = selected_target_patches # Keep as distinct blocks, shape (num_target_blocks, D_embed)
+            if len(potential_target_indices) < self.config.jepa_num_target_blocks:
+                continue # Not enough non-overlapping patches left for the required number of target blocks
+            
+            # Shuffle potential target indices and select
+            shuffled_potential_target_indices = potential_target_indices[torch.randperm(len(potential_target_indices), device=device)]
+            actual_target_indices = shuffled_potential_target_indices[:self.config.jepa_num_target_blocks]
+            
+            selected_target_patches = target_patch_embeddings[b_idx, actual_target_indices, :] # (num_target_blocks, D_embed)
+            target_rep = selected_target_patches # Keep as distinct blocks, shape (num_target_blocks, D_embed)
 
-                batch_context_reps.append(context_rep) # List of (D_embed)
-                batch_target_reps.append(target_rep)   # List of (num_target_blocks, D_embed)
+            batch_context_reps.append(context_rep) # List of (D_embed)
+            batch_target_reps.append(target_rep)   # List of (num_target_blocks, D_embed)
 
-            if not batch_context_reps or not batch_target_reps:
-                return None, None
+        if not batch_context_reps or not batch_target_reps:
+            return None, None
 
-            return torch.stack(batch_context_reps), torch.stack(batch_target_reps)
+        return torch.stack(batch_context_reps), torch.stack(batch_target_reps)
 
 def create_enhanced_config_for_text_generation(vocab_size: int) -> EnhancedCTMConfig:
     """Create enhanced configuration for text generation with strong CTM control"""
@@ -6041,9 +6097,8 @@ class MirrorNeuronLayer(nn.Module):
                 break
 
         if sep_idx == -1:
-            print("Warning: Could not find separator in generated output. Returning entire output as text.")
-            text_result = generated_bytes.cpu().numpy().tobytes().decode('utf-8', errors='ignore')
-            audio_result = torch.tensor([])
+            # Separator not found; treat as text
+            pass
         else:
             text_part_bytes = generated_bytes[:sep_idx]
             audio_part_bytes = generated_bytes[sep_idx+len(separator_np):]
@@ -6062,10 +6117,10 @@ class MirrorNeuronLayer(nn.Module):
             try:
                 audio_result = batched_bytes_to_numeric_tensor(audio_part_tensor_uint8, item_size=item_size, target_dtype=np.float32)
             except ValueError as e:
-                print(f"Error converting audio bytes to tensor: {e}. Returning empty audio tensor.")
-                audio_result = torch.tensor([])
+                # Audio conversion error
+                pass
 
-        return text_result, audio_result
+            return text_result, audio_result
         
 class FrequencyDomainAwareAttention(nn.Module):
     """Generalized HiPA that works across different modalities with intelligent task detection."""
@@ -6456,11 +6511,7 @@ class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diff
         
         # Pre-compute integration flow trajectory weights
         self._precompute_integration_weights()
-        print(f"✓ Integration Flow + Task-Aware HiPA sampler initialized")
-        print(f"  - Model type: {model_type}")
-        print(f"  - Intelligent modality detection enabled")
-        print(f"  - HiPA will be applied only to appropriate data types")
-        print(f"  - Text/discrete tasks protected from frequency corruption")
+        # Sampler initialized
     
     def _precompute_integration_weights(self):
         """Pre-compute integration weights for direct trajectory learning."""
@@ -6569,8 +6620,7 @@ class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diff
                 x_est = x_est + self.integration_flow_strength * (x_est_new - x_est)
                 
             except Exception as e:
-                print(f"Warning: Integration Flow step failed: {e}, using fallback")
-                # Fallback to simple denoising
+                # Integration Flow failed
                 if self.model_type == 'VE':
                     x_est = x_noise / self.sigma_max
                 else:
@@ -6641,9 +6691,8 @@ class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diff
                     x = self._apply_hipa_attention(x, task_id=task_id, freq_domain=True)
                     
             except Exception as e:
-                print(f"Warning: Multi-step sampling failed at step {i}: {e}")
-                break
-        
+               print(f"Warning: Multi-step sampling failed at step {i}: {e}")
+               break        
         # Final HiPA enhancement
         x_final = self._apply_hipa_attention(x, task_id=task_id, freq_domain=True)
         
