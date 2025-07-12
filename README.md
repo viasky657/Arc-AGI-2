@@ -1,3 +1,5 @@
+#Up to Date Update
+This model currently has a maximum sliding window attentio of 250.000 tokens with a million possible through external memory and relevant retrieval form an SSM (Mamba) model. 
 # Arc-AGI-2
 The Binary Patches/Binary Encoder - CTM - Intergraded Diffusion -Output Arc-AGI-2 Version. 
 
