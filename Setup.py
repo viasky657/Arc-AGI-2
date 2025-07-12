@@ -42,16 +42,8 @@ import torch.optim as optim
 from accelerate import Accelerator
 
 # --- Path Setup ---
-project_root = '/workspaces/Arc-AGI-2'
-paths_to_add = [
-    os.path.join(project_root, 'contineous-thought-machines'),
-    os.path.join(project_root, 'contineous-thought-machines', 'models'),
-    os.path.join(project_root, 'contineous-thought-machines', 'examples/contineous-thought-machines')
-]
-
-for path in paths_to_add:
-    if path not in sys.path:
-        sys.path.insert(0, path)
+if '/workspaces/Arc-AGI-2' not in sys.path:
+    sys.path.insert(0, '/workspaces/Arc-AGI-2')
 
 # --- Model Import ---
 EnhancedCTMDiffusion = None
@@ -395,13 +387,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     binary_pattern_size: int = 8  # Size of binary patterns to detect
 
     # Attention Mechanism Type
-    attention_type: str = "subquadratic"  # Options: "standard", "binary_sparse", "subquadratic"
-    
-    # Subquadratic Attention Parameters (if attention_type is "subquadratic")
-    subquadratic_attn_epsilon: float = 1e-6
-    subquadratic_attn_poly_degree: int = 5
-    attention_qkv_bias: bool = True # General QKV bias for attention mechanisms like Subquadratic or standard MHA
-    # attn_drop and proj_drop for subquadratic_attn will be mapped from ctm_dropout
+    attention_type: str = "standard"  # Options: "standard", "binary_sparse", "WINA" #Need to use WINA attention in place of "standard"
 
     # Positional Embedding Parameters
     positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational-1d', 'learnable-fourier', multi-learnable-fourier' #Can set the value here. 
@@ -626,10 +612,6 @@ config_arc_diffusion = EnhancedCTMConfig(
     ctm_heads=8,
     ctm_out_dims=512,
     ctm_neuron_select_type='bio_multi_objective',
-    attention_type="subquadratic",
-    subquadratic_attn_epsilon=1e-6,
-    subquadratic_attn_poly_degree=5,
-    attention_qkv_bias=True,
     positional_embedding_type='multi-learnable-fourier',
     positional_embedding_dim=None,
     reshape_patch_sequence_to_grid=True,

@@ -465,3 +465,66 @@ if principles_loader and NUM_EPOCHS_PRINCIPLES > 0 and 'ctm_model_arc' in global
             ctm_model_arc.sleep_down()
 
     print("\n🎉 Principles Alignment Training Phase Completed!")
+
+# --- Mixed Context Training ---
+
+import random
+
+class MixedContextDataset(Dataset):
+    def __init__(self, num_samples=1000, short_len=256, long_len=4096, vocab_size=256):
+        self.num_samples = num_samples
+        self.short_len = short_len
+        self.long_len = long_len
+        self.vocab_size = vocab_size
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        if random.random() < 0.5:
+            # Short sequence, pack multiple
+            num_packed = self.long_len // self.short_len
+            packed = []
+            mask = torch.zeros(self.long_len, self.long_len)
+            pos = 0
+            for i in range(num_packed):
+                seq = torch.randint(0, self.vocab_size, (self.short_len,))
+                packed.append(seq)
+                # Causal mask for this segment
+                segment_mask = torch.tril(torch.ones(self.short_len, self.short_len))
+                mask[pos:pos+self.short_len, pos:pos+self.short_len] = segment_mask
+                pos += self.short_len
+            sequence = torch.cat(packed)[:self.long_len]
+            is_long = False
+        else:
+            # Long sequence
+            sequence = torch.randint(0, self.vocab_size, (self.long_len,))
+            mask = torch.tril(torch.ones(self.long_len, self.long_len))
+            is_long = True
+
+        return {'sequence': sequence, 'mask': mask, 'is_long': is_long}
+
+mixed_dataset = MixedContextDataset()
+
+mixed_loader = DataLoader(mixed_dataset, batch_size=4, shuffle=True)
+
+# Mixed training loop
+for epoch in range(5):
+    ctm_model_arc.train()
+    total_loss = 0
+    for batch in mixed_loader:
+        sequence = batch['sequence'].to(device)
+        attn_mask = batch['mask'].to(device)
+        is_long = batch['is_long']
+
+        # Assuming model has train_forward that computes loss
+        loss = ctm_model_arc.train_forward(sequence, attn_mask, use_rescaled_rope=is_long)
+
+        optimizer_arc.zero_grad()
+        loss.backward()
+        optimizer_arc.step()
+        total_loss += loss.item()
+
+    print(f"Mixed Context Epoch {epoch+1} Avg Loss: {total_loss / len(mixed_loader)}")
+
+print("\n🎉 Mixed Context Training Completed!")
