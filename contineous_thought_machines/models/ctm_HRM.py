@@ -2168,6 +2168,7 @@ class EmotionStateTracker(nn.Module):
         self.num_emotion_dim = num_emotion_dim
         self.emotion_proj = nn.Linear(d_model, num_emotion_dim)
         self.emotion_update = nn.GRU(num_emotion_dim, num_emotion_dim, batch_first=True)
+        self.amygdala = AmygdalaSimulator(num_emotion_dim)
         
     def forward(self, neural_state: torch.Tensor, prev_emotion: torch.Tensor) -> torch.Tensor:
         """
@@ -2183,7 +2184,20 @@ class EmotionStateTracker(nn.Module):
         
         # Update emotion state using GRU
         updated_emotion, _ = self.emotion_update(current_emotion, prev_emotion.unsqueeze(0))
-        return updated_emotion.squeeze(0)
+        return self.amygdala(updated_emotion.squeeze(0))
+    
+class AmygdalaSimulator(nn.Module):
+    def __init__(self, emotion_dim):
+        super().__init__()
+        self.intensity_proj = nn.Linear(emotion_dim, 1)
+        self.response_net = nn.Linear(emotion_dim, emotion_dim)
+        self.threshold = nn.Parameter(torch.tensor(0.8))
+
+    def forward(self, emotion_state):
+        intensity = torch.sigmoid(self.intensity_proj(torch.abs(emotion_state).mean(dim=-1, keepdim=True)))
+        response = torch.tanh(self.response_net(emotion_state)) * (intensity > self.threshold).float()
+        emotion_state = emotion_state + response * 0.1
+        return emotion_state
         
 class SynapticEmpathy(nn.Module):
     """
@@ -2364,10 +2378,19 @@ class MirrorNeuronLayer(nn.Module):
             nn.Tanh()
         )
         self.layer_norm = nn.LayerNorm(d_model)
+        
+        # Emotional regulation
+        self.regulation_gru = nn.GRU(num_emotion_dim, num_emotion_dim, num_layers=1, batch_first=True)
+
+    def regulate_emotion(self, emotion, num_steps=2):
+        h = torch.zeros(1, emotion.size(0), self.num_emotion_dim, device=emotion.device)
+        input_seq = emotion.unsqueeze(1).repeat(1, num_steps, 1)
+        regulated, _ = self.regulation_gru(input_seq, h)
+        return regulated[:, -1, :]
 
     def forward(self, self_state: torch.Tensor, observed_state: torch.Tensor,
-               prev_self_emotion: torch.Tensor, prev_observed_emotion: torch.Tensor,
-               prev_observed_goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                prev_self_emotion: torch.Tensor, prev_observed_emotion: torch.Tensor,
+                prev_observed_goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             self_state: Current agent's neural state [batch, seq_len, d_model]
@@ -2384,7 +2407,9 @@ class MirrorNeuronLayer(nn.Module):
         """
         # Track emotion states
         current_self_emotion = self.self_emotion_tracker(self_state, prev_self_emotion)
+        current_self_emotion = self.regulate_emotion(current_self_emotion)
         current_observed_emotion = self.observed_emotion_tracker(observed_state, prev_observed_emotion)
+        current_observed_emotion = self.regulate_emotion(current_observed_emotion)
         
         # Predict internal goal of observed agent
         current_observed_goal = self.goal_predictor(observed_state, prev_observed_goal)
