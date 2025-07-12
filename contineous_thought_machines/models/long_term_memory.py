@@ -25,7 +25,7 @@ class LongTermMemory(nn.Module):
         self.top_k = top_k
         self.replay_policy = replay_policy
 
-        # Initialize memory buffers
+        # Initialize active memory buffers
         self.register_buffer('memory', torch.zeros(self.memory_size, self.d_model))
         self.register_buffer('memory_surprise', torch.zeros(self.memory_size))
         self.register_buffer('memory_timestamp', torch.zeros(self.memory_size, dtype=torch.long))
@@ -35,6 +35,9 @@ class LongTermMemory(nn.Module):
         self.memory_pointer = 0
         self.global_time = 0
         
+        # External memory for overflow
+        self.external_memory = []  # List of dicts: {'state': tensor, 'surprise': float, 'timestamp': int, 'usage': int}
+        
         # Mamba block for processing retrieved memories
         self.retrieval_processor = MambaBlock(
             d_model=d_model, d_state=16, d_conv=4, expand=2
@@ -43,123 +46,148 @@ class LongTermMemory(nn.Module):
 
     def add_to_memory(self, state: torch.Tensor, surprise: torch.Tensor):
         """
-        Adds a state to the memory. If the memory is full, it replaces an existing
-        entry based on a combination of low surprise, high age, and low usage.
+        Adds a state to active memory if space available, otherwise to external memory.
         """
-        # Ensure state is on the correct device
         state = state.to(self.memory.device)
         surprise = surprise.to(self.memory.device)
         self.global_time += 1
         
         if self.memory_pointer < self.memory_size:
-            # Fill memory sequentially until full
             idx = self.memory_pointer
             self.memory_pointer += 1
+            self.memory[idx] = state
+            self.memory_surprise[idx] = surprise
+            self.memory_timestamp[idx] = self.global_time
+            self.memory_usage[idx] = 1
+            self.is_initialized[idx] = True
         else:
-            # Eviction strategy: Replace the least valuable memory entry
-            # Score = surprise + 0.1 * usage - 0.01 * age
-            # We want to replace the one with the lowest score.
-            utility_scores = (
-                self.memory_surprise
-                + 0.1 * self.memory_usage.float()
-                - 0.01 * (self.global_time - self.memory_timestamp).float()
-            )
-            idx = torch.argmin(utility_scores)
-
-        # Add the new state to memory at the determined index
-        self.memory[idx] = state
-        self.memory_surprise[idx] = surprise
-        self.memory_timestamp[idx] = self.global_time
-        self.memory_usage[idx] = 1 # Start with a usage count of 1
-        self.is_initialized[idx] = True
+            # Add to external memory
+            self.external_memory.append({
+                'state': state.clone(),
+                'surprise': surprise.item(),
+                'timestamp': self.global_time,
+                'usage': 1
+            })
 
     def retrieve_from_memory(self, query: torch.Tensor) -> torch.Tensor:
         """
-        Retrieves the top_k most similar states from memory, combines them
-        using a Mamba block, and returns a contextualized memory vector.
-        Increments the usage count of retrieved memories.
+        Retrieves from both active and external memory, processes top-k with Mamba.
         """
-        num_valid_memories = self.is_initialized.sum()
-        if num_valid_memories == 0:
+        num_valid_active = self.is_initialized.sum().item()
+        num_external = len(self.external_memory)
+        if num_valid_active + num_external == 0:
             return torch.zeros(1, self.d_model, device=query.device)
 
-        # Get only the valid, initialized memories for retrieval
-        valid_memory = self.memory[self.is_initialized]
-        
-        # Cosine similarity between the query and all valid memories
-        similarities = F.cosine_similarity(query.unsqueeze(0), valid_memory, dim=1)
-        
-        # Determine how many memories to retrieve
-        k = min(self.top_k, num_valid_memories.item())
-        
-        # Get the indices of the top_k most similar memories within the valid subset
-        top_k_indices_in_valid = torch.topk(similarities, k=k).indices
-        
-        # Get the actual top-k memories
-        retrieved_memories = valid_memory[top_k_indices_in_valid] # Shape (k, d_model)
+        # Active memory
+        if num_valid_active > 0:
+            valid_active = self.memory[self.is_initialized]
+            sim_active = F.cosine_similarity(query.unsqueeze(0), valid_active, dim=1)
+        else:
+            sim_active = torch.tensor([], device=query.device)
 
-        # Update usage statistics for the retrieved memories
-        original_indices = torch.where(self.is_initialized)[0][top_k_indices_in_valid]
-        self.memory_usage[original_indices] += 1
+        # External memory
+        if num_external > 0:
+            external_states = torch.stack([mem['state'] for mem in self.external_memory])
+            sim_external = F.cosine_similarity(query.unsqueeze(0), external_states, dim=1)
+        else:
+            sim_external = torch.tensor([], device=query.device)
 
-        # Mamba requires a sequence input: (batch, seq_len, d_model)
-        # We treat the retrieved memories as a sequence for a single batch item.
-        retrieved_sequence = retrieved_memories.unsqueeze(0) # (1, k, d_model)
+        # Combine similarities
+        all_sim = torch.cat([sim_active, sim_external])
+        
+        k = min(self.top_k, len(all_sim))
+        if k == 0:
+            return torch.zeros(1, self.d_model, device=query.device)
+            
+        top_k_values, top_k_indices = torch.topk(all_sim, k=k)
+        
+        # Retrieve states
+        retrieved = []
+        for idx in top_k_indices:
+            if idx < num_valid_active:
+                orig_idx = torch.where(self.is_initialized)[0][idx]
+                retrieved.append(self.memory[orig_idx])
+                self.memory_usage[orig_idx] += 1
+            else:
+                ext_idx = idx - num_valid_active
+                retrieved.append(self.external_memory[ext_idx]['state'])
+                self.external_memory[ext_idx]['usage'] += 1
+        
+        retrieved_memories = torch.stack(retrieved) # (1, k, d_model)
         
         # Process the sequence with the Mamba block
-        processed_memory = self.retrieval_processor(retrieved_sequence) # (1, k, d_model)
-        
-        # We take the output corresponding to the last memory in the sequence
-        # as the final contextualized representation.
+        retrieved_sequence = retrieved_memories.unsqueeze(0)
+        processed_memory = self.retrieval_processor(retrieved_sequence)  # (1, k, d_model)
         contextualized_memory = processed_memory[:, -1, :] # (1, d_model)
         
         return self.retrieval_norm(contextualized_memory)
 
     def replay_memory(self, batch_size: int) -> Optional[torch.Tensor]:
         """
-        Replays memories from the buffer according to the replay policy.
+        Replays memories from both active and external buffers according to the replay policy.
         """
-        num_valid_memories = self.is_initialized.sum().item()
-        if num_valid_memories == 0:
+        num_valid_active = self.is_initialized.sum().item()
+        num_external = len(self.external_memory)
+        total_memories = num_valid_active + num_external
+        if total_memories == 0:
             return None
 
-        actual_batch_size = min(batch_size, num_valid_memories)
-        valid_indices = torch.where(self.is_initialized)[0]
-
+        actual_batch_size = min(batch_size, total_memories)
+        
         if self.replay_policy == MemoryReplayPolicy.SIMPLE_REPLAY:
-            indices = torch.randperm(num_valid_memories)[:actual_batch_size]
-            selected_indices = valid_indices[indices]
-            return self.memory[selected_indices]
+            # Simple random selection from all
+            all_indices = torch.randperm(total_memories)[:actual_batch_size]
+            return self._select_memories(all_indices, num_valid_active)
 
         elif self.replay_policy == MemoryReplayPolicy.SURPRISE_WEIGHTED_REPLAY:
-            valid_surprise = self.memory_surprise[self.is_initialized]
-            probs = F.softmax(valid_surprise, dim=0)
+            # Collect all surprises
+            active_surprise = self.memory_surprise[self.is_initialized]
+            external_surprise = torch.tensor([mem['surprise'] for mem in self.external_memory], device=active_surprise.device)
+            all_surprise = torch.cat([active_surprise, external_surprise])
+            probs = F.softmax(all_surprise, dim=0)
             if probs.sum() > 0:
                 indices = torch.multinomial(probs, num_samples=actual_batch_size, replacement=True)
-                selected_indices = valid_indices[indices]
-                return self.memory[selected_indices]
+                return self._select_memories(indices, num_valid_active)
             else:
-                # Fallback to simple replay if probabilities are all zero
-                indices = torch.randperm(num_valid_memories)[:actual_batch_size]
-                selected_indices = valid_indices[indices]
-                return self.memory[selected_indices]
+                # Fallback to simple
+                all_indices = torch.randperm(total_memories)[:actual_batch_size]
+                return self._select_memories(all_indices, num_valid_active)
 
         elif self.replay_policy == MemoryReplayPolicy.USEFULNESS_REPLAY:
-            # Score = surprise + 0.1 * usage - 0.01 * age
-            utility_scores = (
+            # Calculate utility for active
+            active_age = self.global_time - self.memory_timestamp[self.is_initialized].float()
+            active_utility = (
                 self.memory_surprise[self.is_initialized]
-                + 0.1 * self.memory_usage[self.is_initialized].float() 
-                - 0.01 * self.memory_age[self.is_initialized].float()
+                + 0.1 * self.memory_usage[self.is_initialized].float()
+                - 0.01 * active_age
             )
-            probs = F.softmax(utility_scores, dim=0)
+            
+            # Calculate for external
+            external_ages = torch.tensor([self.global_time - mem['timestamp'] for mem in self.external_memory], device=active_utility.device)
+            external_surprises = torch.tensor([mem['surprise'] for mem in self.external_memory], device=active_utility.device)
+            external_usages = torch.tensor([mem['usage'] for mem in self.external_memory], device=active_utility.device)
+            external_utility = external_surprises + 0.1 * external_usages.float() - 0.01 * external_ages.float()
+            
+            all_utility = torch.cat([active_utility, external_utility])
+            probs = F.softmax(all_utility, dim=0)
             if probs.sum() > 0:
                 indices = torch.multinomial(probs, num_samples=actual_batch_size, replacement=True)
-                selected_indices = valid_indices[indices]
-                return self.memory[selected_indices]
+                return self._select_memories(indices, num_valid_active)
             else:
-                # Fallback to simple replay
-                indices = torch.randperm(num_valid_memories)[:actual_batch_size]
-                selected_indices = valid_indices[indices]
-                return self.memory[selected_indices]
+                # Fallback to simple
+                all_indices = torch.randperm(total_memories)[:actual_batch_size]
+                return self._select_memories(all_indices, num_valid_active)
 
         return None
+        
+    def _select_memories(self, indices: torch.Tensor, num_valid_active: int) -> torch.Tensor:
+        """Helper to select states from indices spanning active and external."""
+        selected = []
+        for idx in indices:
+            if idx < num_valid_active:
+                orig_idx = torch.where(self.is_initialized)[0][idx]
+                selected.append(self.memory[orig_idx])
+            else:
+                ext_idx = idx - num_valid_active
+                selected.append(self.external_memory[ext_idx]['state'])
+        return torch.stack(selected)

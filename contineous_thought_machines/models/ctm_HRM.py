@@ -981,6 +981,8 @@ class WINAAttention(nn.Module):
         if use_adaptive_sparsity:
             layer_names = ["query", "key", "value", "attention", "output"]
             self.wina_sparsifier.adaptive_sparsity_allocation(layer_names, sparsity_ratio)
+        self.locality_strength = nn.Parameter(torch.tensor(1.0))
+        self.locality_sigma = nn.Parameter(torch.tensor(10.0))
         
     def forward(self,
                 query: torch.Tensor,
@@ -1025,6 +1027,13 @@ class WINAAttention(nn.Module):
             context = context_perm.permute(0, 2, 1, 3)
         else:
             scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+            
+            # Add learnable sliding window bias
+            positions = torch.arange(seq_len, device=scores.device)
+            dist = torch.abs(positions.unsqueeze(0) - positions.unsqueeze(1))  # (seq_len, seq_len)
+            locality_bias = torch.exp(-dist / self.locality_sigma.abs().clamp(min=1e-5)) * self.locality_strength.abs()
+            locality_bias = locality_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+            scores = scores + locality_bias
             
             if mask is not None:
                 scores = scores.masked_fill(mask == 0, -1e9)
