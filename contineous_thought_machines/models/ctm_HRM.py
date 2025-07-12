@@ -28,7 +28,7 @@ import numpy as np
 
 from .modules import SynapseUNET, SuperLinear, Squeeze
 from .utils import compute_normalized_entropy
-from .long_term_memory import LongTermMemory
+from .long_term_memory import LongTermMemory, MemoryReplayPolicy
 from .program_synthesizer import ProgramSynthesizer
 from torch.nn import GRU
 
@@ -3068,7 +3068,7 @@ class HierarchicalCTM(OriginalCTMCore):
         # --- Instantiate HRM Modules ---
         self.l_module = HRM_L_Module(config, self)
         self.h_module = HRM_H_Module(config)
-        self.ltm = LongTermMemory(config.d_model, config.ltm_size)
+        self.ltm = LongTermMemory(config.d_model, config.ltm_size, config.ltm_top_k, MemoryReplayPolicy[config.replay_policy.upper()])
         self.consciousness_controller = ConsciousnessController(config.d_model, config.consciousness_max_attention_steps)
         self.basal_ganglia = BasalGangliaMechanism(config.d_model, config.ctm_n_synch_action, config.ctm_bg_dopamine_dim)
         self.synaptic_empathy = SynapticEmpathy(config.d_model, config.ctm_memory_length, config.n_heads, config.dropout)

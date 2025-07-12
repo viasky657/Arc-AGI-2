@@ -406,6 +406,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     program_synth_d_ff: int = 1024
     ltm_size: int = 2048 # Size of the long-term memory
     ltm_surprise_threshold: float = 0.6 # Surprise threshold for storing in LTM
+    ltm_top_k: int = 5 # Top-k for memory retrieval
     replay_batch_size: int = 4 # Batch size for memory replay
     replay_policy: str = "surprise_weighted_replay" # "simple_replay", "surprise_weighted_replay", "usefulness_replay"
 
