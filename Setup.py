@@ -49,6 +49,7 @@ if '/workspaces/Arc-AGI-2' not in sys.path:
 EnhancedCTMDiffusion = None
 try:
     from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, SynapticEmpathy, MirrorNeuronLayer
+    from contineous_thought_machines.models.ctm_HRM import HierarchicalCTM, HRM_L_Module, HRM_H_Module, LongTermMemory, ConsciousnessController, WorkingMemoryBuffer
     from contineous_thought_machines.models.Principles import principles
 except ImportError as e:
     print(f"Error importing Enhanced CTM or related components: {e}")
@@ -387,7 +388,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     binary_pattern_size: int = 8  # Size of binary patterns to detect
 
     # Attention Mechanism Type
-    attention_type: str = "standard"  # Options: "standard", "binary_sparse", "WINA" #Need to use WINA attention in place of "standard"
+    attention_type: str = "WINA"  # Options: "standard", "binary_sparse", "WINA" #Need to use WINA attention in place of "standard"
 
     # Positional Embedding Parameters
     positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational-1d', 'learnable-fourier', multi-learnable-fourier' #Can set the value here. 
@@ -647,7 +648,9 @@ config_arc_diffusion = EnhancedCTMConfig(
     unet_input_feature_dim=MAX_SEQUENCE_LENGTH // 4, # Calculated based on float32 audio
     local_hebbian_loss_weight=0.01,
     enable_consciousness_controller=True,
-    consciousness_max_attention_steps=100
+    consciousness_max_attention_steps=100,
+    use_hrm_core=True,
+    attention_type="WINA"
 )
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
     

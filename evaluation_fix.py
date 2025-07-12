@@ -69,7 +69,7 @@ except ImportError:
 print("\n--- Statically importing EnhancedCTMDiffusion model ---")
 EnhancedCTMDiffusion = None
 try:
-    from models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion
+    from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion
     print(" -> Successfully imported EnhancedCTMDiffusion from models package.")
 except ImportError as e_direct:
     print(f"FATAL: Import from models package failed. Last error: {e_direct}")
@@ -208,22 +208,15 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     binary_pattern_size: int = 8  # Size of binary patterns to detect
 
     # Attention Mechanism Type
-    attention_type: str = "subquadratic"  # Options: "standard", "binary_sparse", "subquadratic"
-    
-    # Subquadratic Attention Parameters (if attention_type is "subquadratic")
-    subquadratic_attn_epsilon: float = 1e-6
-    subquadratic_attn_poly_degree: int = 5
-    attention_qkv_bias: bool = True # General QKV bias for attention mechanisms like Subquadratic or standard MHA
-    # attn_drop and proj_drop for subquadratic_attn will be mapped from ctm_dropout
+    attention_type: str = "WINA"  # Options: "standard", "binary_sparse", "WINA" #Need to use WINA attention in place of "standard"
 
-    # Positional Embedding Parameters
-    positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational-1d', 'learnable-fourier', multi-learnable-fourier' #Can set the value here. 
+    positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational-1d', 'learnable-fourier', multi-learnable-fourier' #Can set the value here.
     positional_embedding_dim: Optional[int] = None  # Dimension of the positional embedding, defaults to ctm_input_dim if None
     reshape_patch_sequence_to_grid: bool = True # If True, reshape patch sequence to a 2D grid for 2D PEs. Must set to true if using 2D Grid for Positional Embeddings.
     patch_grid_width: Optional[int] = None       # Desired width of the patch grid if reshaping
 
     # --- Hierarchical Reasoning Model (HRM) Parameters ---
-    use_hrm_core: bool = False # Set to True to use the HierarchicalCTM core
+    use_hrm_core: bool = True # Set to True to use the HierarchicalCTM core
     hrm_high_level_cycles: int = 4 # N: Number of high-level cycles
     hrm_low_level_timesteps: int = 8 # T: Number of low-level timesteps per high-level cycle
     program_vocab_size: int = 1024 # Vocabulary size for the program synthesizer
@@ -277,7 +270,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     max_tasks: int = 50  # Maximum number of tasks for continual learning
     # Added to resolve TypeError for unexpected keyword arguments
     vocab_size: Optional[int] = None
-    output_audio_bytes: bool = True
+    output_audio_bytes: bool = False
     inferred_task_latent_dim: Optional[int] = None # Default to None, __post_init__ handles it
     use_hipa_attention: bool = False # Default to False
     hipa_num_heads: Optional[int] = None # Default to None
@@ -333,11 +326,13 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             self.ctm_dropout_nlm = self.ctm_dropout
         
         if hasattr(self, 'ctm_neuron_select_type') and \
-           'VALID_NEURON_SELECT_TYPES' in globals() and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
+           VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
             print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
 
         if hasattr(self, 'positional_embedding_type') and self.positional_embedding_type is not None:
-            if 'VALID_POSITIONAL_EMBEDDING_TYPES' in globals() and self.positional_embedding_type not in VALID_POSITIONAL_EMBEDDING_TYPES:
+            if VALID_POSITIONAL_EMBEDDING_TYPES is None: # Fallback if import failed
+                print(f"Warning: VALID_POSITIONAL_EMBEDDING_TYPES not available for validation.")
+            elif self.positional_embedding_type not in VALID_POSITIONAL_EMBEDDING_TYPES:
                 print(f"Warning: positional_embedding_type '{self.positional_embedding_type}' is not in VALID_POSITIONAL_EMBEDDING_TYPES ({VALID_POSITIONAL_EMBEDDING_TYPES}).")
             if self.positional_embedding_dim is not None and self.positional_embedding_dim <= 0:
                 raise ValueError("positional_embedding_dim must be positive if set.")

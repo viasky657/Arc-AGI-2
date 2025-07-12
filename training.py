@@ -466,8 +466,9 @@ if principles_loader and NUM_EPOCHS_PRINCIPLES > 0 and 'ctm_model_arc' in global
 
     print("\n🎉 Principles Alignment Training Phase Completed!")
 
+#The Mixed Context training is not needed since the Program Synthesizer is not being used and the CTM Nueron Network is being used instead. 
 # --- Mixed Context Training ---
-
+'''
 import random
 
 class MixedContextDataset(Dataset):
@@ -504,20 +505,20 @@ class MixedContextDataset(Dataset):
 
         return {'sequence': sequence, 'mask': mask, 'is_long': is_long}
 
-mixed_dataset = MixedContextDataset()
+#mixed_dataset = MixedContextDataset()
 
-mixed_loader = DataLoader(mixed_dataset, batch_size=4, shuffle=True)
+#mixed_loader = DataLoader(mixed_dataset, batch_size=4, shuffle=True)
 
 # Mixed training loop
-for epoch in range(5):
-    ctm_model_arc.train()
-    total_loss = 0
-    for batch in mixed_loader:
+ for epoch in range(5): 
+     ctm_model_arc.train()
+     total_loss = 0
+     for batch in mixed_loader:
         sequence = batch['sequence'].to(device)
         attn_mask = batch['mask'].to(device)
         is_long = batch['is_long']
 
-        # Assuming model has train_forward that computes loss
+         Assuming model has train_forward that computes loss
         loss = ctm_model_arc.train_forward(sequence, attn_mask, use_rescaled_rope=is_long)
 
         optimizer_arc.zero_grad()
@@ -528,3 +529,4 @@ for epoch in range(5):
     print(f"Mixed Context Epoch {epoch+1} Avg Loss: {total_loss / len(mixed_loader)}")
 
 print("\n🎉 Mixed Context Training Completed!")
+'''
