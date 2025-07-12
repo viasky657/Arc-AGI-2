@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, List
 import math
 import random
 from enum import Enum
-from .mamba_block import MambaBlock
+from .mamba_block import MambaBlock, Mamba2Block
 
 class MemoryReplayPolicy(Enum):
     SIMPLE_REPLAY = "simple_replay"
@@ -39,8 +39,8 @@ class LongTermMemory(nn.Module):
         self.external_memory = []  # List of dicts: {'state': tensor, 'surprise': float, 'timestamp': int, 'usage': int}
         
         # Mamba block for processing retrieved memories
-        self.retrieval_processor = MambaBlock(
-            d_model=d_model, d_state=16, d_conv=4, expand=2
+        self.retrieval_processor = Mamba2Block(
+            d_model=d_model, d_state=64, d_head=64, expand=2, chunk_size=256
         )
         self.retrieval_norm = nn.LayerNorm(d_model)
 
