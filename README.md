@@ -1,5 +1,9 @@
 #Up to Date Update
 This model currently has a maximum sliding window attentio of 250.000 tokens with a million possible through external memory and relevant retrieval form an SSM (Mamba) model. 
+This model should probably be tested on this paper to see if it is actually learning or not: https://arxiv.org/pdf/2507.06952. This is the Paper Title: What Has a Foundation Model Found?
+Using Inductive Bias to Probe for World Models
+
+#Old Model components below:
 # Arc-AGI-2
 The Binary Patches/Binary Encoder - CTM - Intergraded Diffusion -Output Arc-AGI-2 Version. 
 
