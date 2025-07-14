@@ -103,9 +103,9 @@ def batched_numeric_tensor_to_bytes(numeric_batch_tensor: torch.Tensor, source_d
 
 
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
-from .ctm_HRM import (
+from .ctm_HRM import HierarchicalCTM
+from .ctm_components import (
     EnhancedCTMConfig,
-    HierarchicalCTM,
     OriginalCTMCore,
     CTMFeedbackModule,
     BasalGangliaMechanism,
@@ -124,7 +124,7 @@ from .ctm_HRM import (
     TemporalSpatialTracker,
     WorkingMemoryBuffer,
     ForesightSimulator,
-    HyperNetwork
+    HyperNetwork,
 )
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
 # Import original CTM modules to preserve exact behavior

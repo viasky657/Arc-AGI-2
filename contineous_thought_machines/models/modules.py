@@ -5,7 +5,7 @@ import math
 import numpy as np
 
 # Assuming 'add_coord_dim' is defined in models.utils
-from models.utils import add_coord_dim
+from .utils import add_coord_dim
 
 # --- Basic Utility Modules ---
 
