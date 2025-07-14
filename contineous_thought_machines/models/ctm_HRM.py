@@ -148,7 +148,8 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     adaptive_scheduling: bool = True  # CTM-adaptive diffusion timestep scheduling
     iterative_refinement: bool = True # Iterative CTM-diffusion refinement for sampling
     
-
+    #Inferred_Latent_Dimensions Set to Avoid runtime errors but it does not functionally do anything in the model or program processing. 
+    inferred_task_latent_dim=512
     
     # Training Efficiency
     mixed_precision: bool = True

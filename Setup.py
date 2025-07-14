@@ -5,11 +5,9 @@ ARC_EVAL_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/evaluatio
 # --- Configuration Variables ---
 # These variables define the ARC environment and MCMC behavior.
 # NOTE: You must provide the paths to your ARC dataset directories.
-ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/training/be94b721.json" # <<< IMPORTANT: SET THIS PATH
+ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/training/0a1d4ef5.json" # <<< IMPORTANT: SET THIS PATH
 
-# Get the notebook's current working directory
-notebook_cwd = os.getcwd()
-eval_dir = os.path.abspath(os.path.join(notebook_cwd, '..', 'data', 'evaluation')) # <<< IMPORTANT: SET THIS PATH
+
 
 MAX_GRID_SIZE = (30, 30)
 NUM_ARC_SYMBOLS = 10
@@ -45,12 +43,21 @@ from accelerate import Accelerator
 if '/workspaces/Arc-AGI-2' not in sys.path:
     sys.path.insert(0, '/workspaces/Arc-AGI-2')
 
+models_dir = os.path.join('/workspaces/Arc-AGI-2', 'contineous_thought_machines', 'models')
+if models_dir not in sys.path:
+    sys.path.append(models_dir)
+
+data_dir = os.path.join('/workspaces/Arc-AGI-2', 'contineous_thought_machines', 'data')
+if data_dir not in sys.path:
+    sys.path.append(data_dir)
+
+
 # --- Model Import ---
 EnhancedCTMDiffusion = None
 try:
-    from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, SynapticEmpathy, MirrorNeuronLayer
-    from contineous_thought_machines.models.ctm_HRM import HierarchicalCTM, HRM_L_Module, HRM_H_Module, LongTermMemory, ConsciousnessController, WorkingMemoryBuffer
-    from contineous_thought_machines.models.Principles import principles
+    from ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, SynapticEmpathy, MirrorNeuronLayer
+    from ctm_HRM import HierarchicalCTM, HRM_L_Module, HRM_H_Module, LongTermMemory, ConsciousnessController, WorkingMemoryBuffer
+    from Principles import principles
 except ImportError as e:
     print(f"Error importing Enhanced CTM or related components: {e}")
     EnhancedCTMDiffusion = None
@@ -269,7 +276,7 @@ print(f"  📈 Accelerate: {'✅' if ACCELERATE_AVAILABLE else '❌'}")
 print(f"  ⚡ xFormers: {'✅' if XFORMERS_AVAILABLE else '❌'}")
 print(f"  ⚡ Deepspeed: {'✅' if DEEPSPEED_AVAILABLE else '❌'}")
 
-# From contineous-thought-machines/models/constants.py
+# From contineous_thought_machines/models/constants.py
 VALID_NEURON_SELECT_TYPES = [
     'first-last', 'random', 'random-pairing',  # Legacy
     # Biologically-inspired types
@@ -284,7 +291,7 @@ VALID_POSITIONAL_EMBEDDING_TYPES = [
     'custom-rotational', 'custom-rotational-1d'
 ]
 
-# From contineous-thought-machines/models/ctm_Diffusion_NEWNEW.py
+# From contineous_thought_machines/models/ctm_Diffusion_NEWNEW.py
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Union, Any, List
 import math
@@ -542,7 +549,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
         
         if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim is None:
-            print("Warning: inferred_task_latent_dim not found or is None in config, defaulting to 64.")
+            print("Warning: inferred_task_latent_dim not found or is None in config, defaulting to 512.")
             self.inferred_task_latent_dim = 512
         elif self.inferred_task_latent_dim <= 0: # This check is now safe
             raise ValueError("inferred_task_latent_dim must be positive.")
@@ -654,7 +661,8 @@ config_arc_diffusion = EnhancedCTMConfig(
     enable_consciousness_controller=True,
     consciousness_max_attention_steps=100,
     use_hrm_core=True,
-    attention_type="WINA"
+    attention_type="WINA",
+    inferred_task_latent_dim=512 #This does nothing in the model training but is included in a placeholder to avoid possible errors with initializing Torch for training.
 )
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
     
