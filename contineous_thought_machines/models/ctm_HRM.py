@@ -340,6 +340,22 @@ class HierarchicalCTM(OriginalCTMCore):
             config.ctm_memory_hidden_dims, self.d_model, config.ctm_dropout_nlm or config.ctm_dropout
         )
 
+        # --- Synchronisation Setup (reusing logic from OriginalCTMCore) ---
+        self.neuron_select_type = config.ctm_neuron_select_type
+        self.verify_args() # verify neuron selection compatibility
+        self.n_synch_out = config.ctm_n_synch_out
+        self.n_synch_action = config.ctm_n_synch_action
+        self.synch_representation_size_action = self.calculate_synch_representation_size(self.n_synch_action)
+        self.synch_representation_size_out = self.calculate_synch_representation_size(self.n_synch_out)
+
+        self.set_synchronisation_parameters('action', self.n_synch_action, config.ctm_n_random_pairing_self)
+        self.set_synchronisation_parameters('out', self.n_synch_out, config.ctm_n_random_pairing_self)
+        
+        # Add synchronization parameters for H-module
+        self.n_synch_h = config.ctm_n_synch_action  # Reuse action size
+        self.synch_representation_size_h = self.calculate_synch_representation_size(self.n_synch_h)
+        self.set_synchronisation_parameters('h', self.n_synch_h, config.ctm_n_random_pairing_self)
+
         # --- Instantiate HRM Modules ---
         self.l_module = HRM_L_Module(config, self)
         self.h_module = HRM_H_Module(config)
@@ -351,6 +367,7 @@ class HierarchicalCTM(OriginalCTMCore):
         self.temporal_spatial_tracker = TemporalSpatialTracker(config)
         self.working_memory = WorkingMemoryBuffer(config.d_model)
         self.glial_support = GlialSupport(config.d_model)
+        
         # --- Input/Output Layers ---
         self.input_encoder = nn.Linear(config.ctm_input_dim, self.d_input)
         self.output_projector = nn.Linear(self.synch_representation_size_out, config.ctm_out_dims)
@@ -363,23 +380,7 @@ class HierarchicalCTM(OriginalCTMCore):
         nn.init.uniform_(self.start_trace_zL, -math.sqrt(1/(self.d_model+self.memory_length)), math.sqrt(1/(self.d_model+self.memory_length)))
         nn.init.uniform_(self.start_zH, -math.sqrt(1/self.d_model), math.sqrt(1/self.d_model))
         
-        # --- Synchronisation Setup (reusing logic from OriginalCTMCore) ---
-        self.neuron_select_type = config.ctm_neuron_select_type
-        self.verify_args() # verify neuron selection compatibility
-        self.n_synch_out = config.ctm_n_synch_out
-        self.n_synch_action = config.ctm_n_synch_action
-        self.synch_representation_size_action = self.calculate_synch_representation_size(self.n_synch_action)
-        self.synch_representation_size_out = self.calculate_synch_representation_size(self.n_synch_out)
-
-        self.set_synchronisation_parameters('action', self.n_synch_action, config.ctm_n_random_pairing_self)
-        self.set_synchronisation_parameters('out', self.n_synch_out, config.ctm_n_random_pairing_self)
-        self.output_projector = nn.Linear(self.synch_representation_size_out, config.ctm_out_dims)
         self.fusion_proj = nn.Linear(2 * self.d_model, self.d_model)
-
-        # Add synchronization parameters for H-module
-        self.n_synch_h = config.ctm_n_synch_action  # Reuse action size
-        self.synch_representation_size_h = self.calculate_synch_representation_size(self.n_synch_h)
-        self.set_synchronisation_parameters('h', self.n_synch_h, config.ctm_n_random_pairing_self)
 
     def forward_with_full_tracking(self, x: torch.Tensor, thought_guidance: bool = True,
                                    voice1_id: Optional[torch.Tensor] = None,
