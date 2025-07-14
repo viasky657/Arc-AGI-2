@@ -30,7 +30,6 @@ from torch.nn import GRU
 from .modules import SynapseUNET, SuperLinear, Squeeze, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
 from .utils import compute_normalized_entropy, TaskAnalyzer
 from .long_term_memory import LongTermMemory, MemoryReplayPolicy
-from .program_synthesizer import ProgramSynthesizer
 from .mamba_block import Mamba2Block
 from .enhanced_neuron_selection import EnhancedNeuronSelector
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
@@ -3747,3 +3746,180 @@ class HyperNetwork(nn.Module):
         weight = params[:, :self.out_features * self.in_features].view(-1, self.out_features, self.in_features)
         bias = params[:, self.out_features * self.in_features:].view(-1, self.out_features)
         return weight, bias
+
+
+class DynamicEntropyRotationalEmbedding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.d_model = d_model
+        self.dropout = nn.Dropout(dropout)
+        self.theta_base = 10000.0
+        self.L_train = 512
+        self.L_target = 4096
+
+    def forward(self, x, entropy_scores, use_rescaled=True):
+        B, S, D = x.shape
+        if D % 2 != 0:
+            raise ValueError("d_model must be even for RoPE")
+        position = torch.arange(0, S, dtype=torch.float, device=x.device).unsqueeze(0).repeat(B, 1) # (B, S)
+        div_term = torch.exp(torch.arange(0, D//2, dtype=torch.float, device=x.device) * (-math.log(self.theta_base) / D)) # (D/2)
+        
+        if use_rescaled:
+            # LongRoPE2-inspired rescaling integrated with entropy
+            extension_ratio = self.L_target / self.L_train
+            d_tcd = int(2 * math.ceil(D / 2 * math.log(self.theta_base) * self.L_train / (2 * math.pi)))
+            
+            average_entropy = entropy_scores.mean()
+            d_rcd = d_tcd - int(average_entropy.item() * 10)  # Adjust based on entropy
+            d_rcd = max(0, min(d_tcd, d_rcd))
+            
+            i = torch.arange(0, D//2, device=x.device, dtype=torch.float)
+            lambda_i = torch.ones_like(i)
+            mask_higher = i >= d_rcd
+            lambda_i[mask_higher] = extension_ratio * (1 + (i[mask_higher] - d_rcd) / (D//2 - d_rcd))
+            mask_lower = ~mask_higher
+            lambda_i[mask_lower] = extension_ratio ** (2 * i[mask_lower] / D)
+            
+            div_term = div_term / lambda_i
+        
+        theta = position.unsqueeze(-1) * div_term.unsqueeze(0).unsqueeze(1) # (B, S, D/2)
+        entropy_scores = entropy_scores.unsqueeze(-1) # (B, S, 1)
+        theta = theta * entropy_scores
+        cos = torch.cos(theta) # (B, S, D/2)
+        sin = torch.sin(theta)
+        x0 = x[:, :, 0::2]
+        x1 = x[:, :, 1::2]
+        x_rot0 = x0 * cos - x1 * sin
+        x_rot1 = x0 * sin + x1 * cos
+        x_rot = torch.zeros_like(x)
+        x_rot[:, :, 0::2] = x_rot0
+        x_rot[:, :, 1::2] = x_rot1
+        return self.dropout(x_rot)
+
+class ProgramSynthesizer(nn.Module):
+    """
+    A transformer-based program synthesizer that generates a program as a sequence of bytes,
+    and then segments it into entropy-based patches.
+    
+    This module takes a high-level state representation, generates a raw byte sequence
+    autoregressively, and then uses a DynamicEntropyPatcher to structure the sequence.
+    """
+    def __init__(self, 
+                 d_model: int, 
+                 n_heads: int = 4, 
+                 n_layers: int = 3,
+                 d_ff: int = 1024,
+                 dropout: float = 0.1,
+                 max_gen_len: int = 512,
+                 patcher_config: dict = None):
+        super().__init__()
+        self.d_model = d_model
+        self.max_gen_len = max_gen_len
+        self.byte_vocab_size = 256
+
+        # --- Transformer Decoder for Byte Generation ---
+        # We need a decoder, not an encoder for generation.
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_ff,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
+
+        # --- I/O Layers ---
+        self.byte_embedding = nn.Embedding(self.byte_vocab_size, d_model)
+        self.output_projector = nn.Linear(d_model, self.byte_vocab_size)
+        
+        # --- Positional Encoding ---
+        self.pos_encoder = DynamicEntropyRotationalEmbedding(d_model, dropout)
+        
+        # --- Entropy-based Patcher ---
+        # Use provided config or a default for the patcher
+        if patcher_config is None:
+            patcher_config = {
+                'embedding_dim': d_model,
+                'patch_cnn_channels': 64,
+                'patching_mode': "global",
+                'global_threshold': 0.5,
+                'relative_threshold': 0.1,
+                'min_patch_size': 4,
+                'max_patch_size': 128,
+                'entropy_byte_vocab_size': 256,
+                'entropy_embedding_dim': 64,
+                'entropy_hidden_dim': 128,
+                'entropy_num_layers': 1,
+                'entropy_dropout': 0.1
+            }
+        self.patcher = DynamicEntropyPatcher(**patcher_config)
+
+        # --- Neuron Pulsing Integration ---
+        self.ctm_config = EnhancedCTMConfig(
+            ctm_iterations=5,
+            ctm_d_model=self.d_model,
+            ctm_input_dim=self.d_model,
+            ctm_heads=4,
+            ctm_n_synch_out=256,
+            ctm_n_synch_action=0,
+            ctm_synapse_depth=1,
+            ctm_memory_length=10,
+            ctm_deep_nlms=True,
+            ctm_memory_hidden_dims=512,
+            ctm_do_layernorm_nlm=False,
+            ctm_out_dims=256,
+            ctm_prediction_reshaper=[-1, 256],
+            ctm_dropout=0.1,
+            ctm_neuron_select_type='random-pairing'
+        )
+        self.ctm_core = OriginalCTMCore(self.ctm_config)
+        self.byte_predictor = nn.Linear(256, 256)  # from ctm_out_dims to byte_vocab
+
+    def forward(self, state: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[List[Tuple[int, int]]], torch.Tensor]:
+        """
+        Synthesizes a program as a sequence of byte patches from a given state using neuron pulsing.
+        
+        Args:
+            state: A tensor representing the high-level state.
+                   Shape: (batch_size, d_model)
+            attn_mask: Optional attention mask for packed sequences (batch_size, seq_len, seq_len)
+                   
+        Returns:
+            A tuple containing:
+            - encoded_patches: Tensor of patch embeddings. (B, max_patches, patch_embed_dim)
+            - patch_indices: List of (start, end) indices for each patch.
+            - entropy_aux_loss: Auxiliary loss from the patcher's entropy model.
+        """
+        device = state.device
+        batch_size = state.size(0)
+        
+        # Initialize generated bytes with BOS (0)
+        generated_bytes = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+        
+        # Initial kv is state as (B,1,D)
+        kv = state.unsqueeze(1)
+
+        for _ in range(self.max_gen_len):
+            # Run CTM core for pulsing update
+            ctm_predictions, ctm_certainties, ctm_sync_out = self.ctm_core(kv)
+            
+            # Use final sync_out to predict next byte
+            logits = self.byte_predictor(ctm_sync_out)
+            
+            # Sample next byte (greedy)
+            next_byte = torch.argmax(logits, dim=-1).unsqueeze(1)
+            
+            # Append to generated
+            generated_bytes = torch.cat([generated_bytes, next_byte], dim=1)
+            
+            # Embed next byte and append to kv
+            next_emb = self.byte_embedding(next_byte)
+            kv = torch.cat([kv, next_emb], dim=1)
+
+        # Remove BOS
+        generated_bytes = generated_bytes[:, 1:]
+        
+        # Patch the generated bytes
+        encoded_patches, patch_indices, entropy_aux_loss = self.patcher(generated_bytes.byte())
+        
+        return encoded_patches, patch_indices, entropy_aux_loss

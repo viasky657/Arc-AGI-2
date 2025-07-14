@@ -28,7 +28,7 @@ from torch.nn import GRU
 from .modules import SynapseUNET, SuperLinear, Squeeze
 from .utils import compute_normalized_entropy
 from .long_term_memory import LongTermMemory, MemoryReplayPolicy
-from .program_synthesizer import ProgramSynthesizer
+
 from .mamba_block import Mamba2Block
 from .ctm_components import (
     EnhancedCTMConfig,
