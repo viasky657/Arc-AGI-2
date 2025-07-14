@@ -1,11 +1,11 @@
 
 import os
 
-ARC_EVAL_DIR = "/workspace/Arc-AGI-2/contineous-thought-machines/data/evaluation"  #Evaluation Dataset Directory.
+ARC_EVAL_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/evaluation"  #Evaluation Dataset Directory. # <<< IMPORTANT: SET THIS PATH
 # --- Configuration Variables ---
 # These variables define the ARC environment and MCMC behavior.
 # NOTE: You must provide the paths to your ARC dataset directories.
-ARC_TRAIN_DIR = "../data/training" # <<< IMPORTANT: SET THIS PATH
+ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/training/be94b721.json" # <<< IMPORTANT: SET THIS PATH
 
 # Get the notebook's current working directory
 notebook_cwd = os.getcwd()
@@ -63,7 +63,7 @@ ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
 device = "cuda" if torch.cuda.is_available() else "cpu"
 LEARNING_RATE = 1e-4
 CHECKPOINT_DIR = "checkpoints"
-ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous-thought-machines/data/training" #Training Dataset Directory
+ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/training" #Training Dataset Directory
 
 ACCELERATE_AVAILABLE = True
 try:
@@ -360,6 +360,9 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     ctm_neuron_select_type: str = 'bio_multi_objective'
     ctm_n_random_pairing_self: int = 0
     
+    #Inferred_Latent_Dimensions Set to Avoid runtime errors but it does not functionally do anything in the model or program processing. 
+    inferred_task_latent_dim=512
+
     # Diffusion Parameters
     diffusion_steps: int = 1000
     noise_schedule: str = "cosine" # e.g., "linear", "cosine"
