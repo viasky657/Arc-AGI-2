@@ -179,6 +179,7 @@ class SuperLinear(nn.Module):
       T (float): Initial value for learnable temperature/scaling factor applied to output.
       do_norm (bool): Apply Layer Normalization to the input history before linear transform.
       dropout (float): Dropout rate applied to the input.
+      depth (int): Number of layers in each NLM. Default 1 (single linear).
     """
     def __init__(self,
                  in_dims,
@@ -186,27 +187,33 @@ class SuperLinear(nn.Module):
                  N,
                  T=1.0,
                  do_norm=False,
-                 dropout=0):
+                 dropout=0,
+                 depth=1):
         super().__init__()
-        # N is the number of neurons (d_model), in_dims is the history length (memory_length)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else Identity()
-        self.in_dims = in_dims # Corresponds to memory_length
-        # LayerNorm applied across the history dimension for each neuron independently
-        self.layernorm = nn.LayerNorm(in_dims, elementwise_affine=True) if do_norm else Identity()
+        self.in_dims = in_dims
+        self.out_dims = out_dims
+        self.N = N
+        self.depth = max(1, depth)
+        self.layernorm = nn.LayerNorm(in_dims) if do_norm else Identity()
         self.do_norm = do_norm
 
-        # Initialize weights and biases
-        # w1 shape: (memory_length, out_dims, d_model)
-        self.register_parameter('w1', nn.Parameter(
-            torch.empty((in_dims, out_dims, N)).uniform_(
-                -1/math.sqrt(in_dims + out_dims),
-                 1/math.sqrt(in_dims + out_dims)
-            ), requires_grad=True)
-        )
-        # b1 shape: (1, d_model, out_dims)
-        self.register_parameter('b1', nn.Parameter(torch.zeros((1, N, out_dims)), requires_grad=True))
-        # Learnable temperature/scaler T
-        self.register_parameter('T', nn.Parameter(torch.Tensor([T]))) 
+        # For multi-layer, we assume intermediate dims = out_dims, adjust if needed
+        self.depth = max(1, depth)
+        self.weights = nn.ModuleList()
+        self.biases = nn.ModuleList()
+        current_dim = in_dims
+        for d in range(self.depth):
+            next_dim = out_dims
+            w = torch.empty((current_dim, next_dim, N)).uniform_(
+                -1/math.sqrt(current_dim + next_dim),
+                1/math.sqrt(current_dim + next_dim)
+            )
+            self.weights.append(nn.Parameter(w))
+            self.biases.append(nn.Parameter(torch.zeros(1, N, next_dim)))
+            current_dim = next_dim
+
+        self.T = nn.Parameter(torch.tensor([T]))
 
     def forward(self, x):
         """
@@ -214,26 +221,23 @@ class SuperLinear(nn.Module):
             x (torch.Tensor): Input tensor, expected shape (B, N, in_dims)
                               where B=batch, N=d_model, in_dims=memory_length.
         Returns:
-            torch.Tensor: Output tensor, shape (B, N) after squeeze(-1).
+            torch.Tensor: Output tensor, shape (B, N) after squeeze(-1) if out_dims=1.
         """
-        # Input shape: (B, D, M) where D=d_model=N neurons in CTM, M=history/memory length
         out = self.dropout(x)
-        # LayerNorm across the memory_length dimension (dim=-1)
-        out = self.layernorm(out) # Shape remains (B, N, M)
+        out = self.layernorm(out)  # Shape (B, N, in_dims)
 
-        # Apply N independent linear models using einsum
-        # einsum('BDM,MHD->BDH', ...)
-        # x: (B=batch size, D=N neurons, one NLM per each of these, M=history/memory length)
-        # w1: (M, H=hidden dims if using MLP, otherwise output, D=N neurons, parallel)
-        # b1: (1, D=N neurons, H)
-        # einsum result: (B, D, H)
-        # Applying bias requires matching shapes, b1 is broadcasted.
-        out = torch.einsum('BDM,MHD->BDH', out, self.w1) + self.b1
+        for d in range(self.depth):
+            w = self.weights[d]  # (current_dim, next_dim, N)
+            b = self.biases[d]   # (1, N, next_dim)
 
-        # Squeeze the output dimension (assumed to be 1 usually) and scale by T
-        # This matches the original code's structure exactly.
-        out = out.squeeze(-1) / self.T
-        return out
+            # Einsum for independent matrix multiplications per neuron
+            out = torch.einsum('bni,ion->bno', out, w) + b
+
+            if d < self.depth - 1:
+                out = F.silu(out)  # Activation between layers
+
+        out = out / self.T
+        return out.squeeze(-1) if self.out_dims == 1 else out
 
 
 # --- Backbone Modules ---
@@ -439,22 +443,7 @@ class PretrainedResNetWrapper(nn.Module):
     def forward(self, x):
         # Get features from the modified ResNet
         out = self.backbone(x)
-
-        # Reshape output to (B, C, H, W) - This is heuristic based on original comment.
-        # User might need to adjust this based on which layers are kept/removed.
-        # Infer C based on ResNet type (example values)
-        nc = 256 if ('18' in self.resnet_type or '34' in self.resnet_type) else 512 if '50' in self.resnet_type else 1024 if '101' in self.resnet_type else 2048 # Approx for layer3/4 output channel numbers
-        # Infer H, W assuming output is flattened C * H * W
-        num_features = out.shape[-1]
-        # This calculation assumes nc is correct and feature map is square
-        wh_squared = num_features / nc
-        if wh_squared < 0 or not float(wh_squared).is_integer():
-             print(f"Warning: Cannot reliably reshape PretrainedResNetWrapper output. nc={nc}, num_features={num_features}")
-             # Return potentially flattened features if reshape fails
-             return out
-        wh = int(np.sqrt(wh_squared))
-
-        return out.reshape(x.size(0), nc, wh, wh)
+        return out
 
 # --- Positional Encoding Modules ---
 
@@ -634,59 +623,26 @@ class CustomRotationalEmbedding(nn.Module):
         ], dim=1) # Stacks along dim 1 -> Shape (W, 2, 2)
 
         # Rotate the start vector by column angle: Shape (W, 2)
-        rotated_vectors = torch.einsum('wij,j->wi', rotation_matrices, self.start_vector)
+        rotated_vectors_w = torch.einsum('wij,j->wi', rotation_matrices, self.start_vector)
 
-        # --- Create Grid Key ---
-        # Original code uses repeats based on rotated_vectors.shape[0] (which is W) for both dimensions.
-        # This creates a (W, W, 4) key tensor.
-        key = torch.cat((
-            torch.repeat_interleave(rotated_vectors.unsqueeze(1), W, dim=1), # (W, 1, 2) -> (W, W, 2)
-            torch.repeat_interleave(rotated_vectors.unsqueeze(0), W, dim=0)  # (1, W, 2) -> (W, W, 2)
-        ), dim=-1) # Shape (W, W, 4)
+        # --- Generate rotations based on Height ---
+        theta_rad_h = torch.deg2rad(torch.linspace(0, 180, H, device=device))
+        cos_theta_h = torch.cos(theta_rad_h)
+        sin_theta_h = torch.sin(theta_rad_h)
+        rotation_matrices_h = torch.stack([
+            torch.stack([cos_theta_h, -sin_theta_h], dim=-1),
+            torch.stack([sin_theta_h, cos_theta_h], dim=-1)
+        ], dim=1)
+        rotated_vectors_h = torch.einsum('hij,j->hi', rotation_matrices_h, self.start_vector)
 
-        # Project the 4D key vector to d_model: Shape (W, W, d_model)
-        pe_grid = self.projection(key)
+        # Expand vectors to grid shape, concatenate, project, and reshape
+        expanded_w = rotated_vectors_w.unsqueeze(0).expand(H, -1, -1)      # (H, W, 2)
+        expanded_h = rotated_vectors_h.unsqueeze(1).expand(-1, W, -1)      # (H, W, 2)
+        concatenated_vectors = torch.cat([expanded_w, expanded_h], dim=-1) # (H, W, 4)
 
-        # Reshape to (1, d_model, W, W) and then select/resize to target H, W?
-        # Original code permutes to (d_model, W, W) and unsqueezes to (1, d_model, W, W)
-        pe = pe_grid.permute(2, 0, 1).unsqueeze(0)
+        # Project down to d_model
+        projected_vectors = self.projection(concatenated_vectors) # (H, W, d_model)
 
-        # If H != W, this needs adjustment. Assuming H=W or cropping/padding happens later.
-        # Let's return the (1, d_model, W, W) tensor as generated by the original logic.
-        # If H != W, downstream code must handle the mismatch or this PE needs modification.
-        if H != W:
-            # Simple interpolation/cropping could be added, but sticking to original logic:
-            # Option 1: Interpolate
-            # pe = F.interpolate(pe, size=(H, W), mode='bilinear', align_corners=False)
-            # Option 2: Crop/Pad (e.g., crop if W > W_target, pad if W < W_target)
-            # Sticking to original: return shape (1, d_model, W, W)
-            pass
-
-        return pe
-
-class CustomRotationalEmbedding1D(nn.Module):
-    def __init__(self, d_model):
-        super(CustomRotationalEmbedding1D, self).__init__()
-        self.projection = nn.Linear(2, d_model)
-
-    def forward(self, x):
-        start_vector = torch.tensor([0., 1.], device=x.device, dtype=torch.float)
-        theta_rad = torch.deg2rad(torch.linspace(0, 180, x.size(2), device=x.device))
-        cos_theta = torch.cos(theta_rad)
-        sin_theta = torch.sin(theta_rad)
-        cos_theta = cos_theta.unsqueeze(1)  # Shape: (height, 1)
-        sin_theta = sin_theta.unsqueeze(1)  # Shape: (height, 1)
-
-        # Create rotation matrices
-        rotation_matrices = torch.stack([
-        torch.cat([cos_theta, -sin_theta], dim=1),
-        torch.cat([sin_theta, cos_theta], dim=1)
-        ], dim=1)  # Shape: (height, 2, 2)
-
-        # Rotate the start vector
-        rotated_vectors = torch.einsum('bij,j->bi', rotation_matrices, start_vector)
-
-        pe = self.projection(rotated_vectors)
-        pe = torch.repeat_interleave(pe.unsqueeze(0), x.size(0), 0)
-        return pe.transpose(1, 2) # Transpose for compatibility with other backbones
-    
+        # Reshape for output: (1, d_model, H, W)
+        output = projected_vectors.permute(2, 0, 1).unsqueeze(0)
+        return output
