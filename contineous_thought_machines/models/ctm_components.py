@@ -233,6 +233,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     ctm_enable_basal_ganglia: bool = True
     ctm_bg_dopamine_dim: int = 32
 
+    # --- Consciousness Controller Parameters ---
+    enable_consciousness_controller: bool = True
+    consciousness_max_attention_steps: int = 100
+
     # --- Synaptic Empathy Parameters ---
     enable_synaptic_empathy: bool = True # Set to True to use the new SynapticEmpathy module
     synaptic_empathy_reward_weight: float = 0.1
