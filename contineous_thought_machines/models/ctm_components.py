@@ -1917,10 +1917,10 @@ class OriginalCTMCore(nn.Module):
         # --- Bidirectional Reasoning Controller ---
         self.enable_bidirectional_reasoning = getattr(config, 'enable_bidirectional_reasoning', False)
         if self.enable_bidirectional_reasoning:
-            self.reasoning_controller = BidirectionalReasoningController(
+            self.reasoning_controller = torch.jit.script(BidirectionalReasoningController(
                 d_model=self.d_model,
                 sync_dim=self.synch_representation_size_out # Use output sync for reasoning control
-            )
+            ))
 
         self.use_basal_ganglia = getattr(config, 'ctm_enable_basal_ganglia', True)
         if self.use_basal_ganglia and self.synch_representation_size_action > 0:
@@ -2494,7 +2494,6 @@ class OriginalCTMCore(nn.Module):
             **tracking_data
         }
 
-@torch.jit.script
 class BidirectionalReasoningController(nn.Module):
     """
     A JIT-compiled controller that decides the direction of the CTM's reasoning process.
