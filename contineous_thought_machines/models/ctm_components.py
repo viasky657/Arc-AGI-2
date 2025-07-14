@@ -27,7 +27,7 @@ from diffusers import DPMSolverMultistepScheduler
 from torch.nn import GRU
 
 # Local imports
-from .modules import SynapseUNET, SuperLinear, Squeeze, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
+from .modules import SynapseUNET, SuperLinear, Squeeze, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding
 from .utils import compute_normalized_entropy, TaskAnalyzer
 from .long_term_memory import LongTermMemory, MemoryReplayPolicy
 from .mamba_block import Mamba2Block
@@ -1564,7 +1564,7 @@ from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron S
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
 # Import original CTM modules to preserve exact behavior
 # try:
-from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
+from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding
 from .utils import compute_normalized_entropy
 from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
 # except ImportError:
