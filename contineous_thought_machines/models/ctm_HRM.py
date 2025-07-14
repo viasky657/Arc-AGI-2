@@ -52,6 +52,8 @@ from .ctm_components import (
     ForesightSimulator,
     HyperNetwork,
     GlialSupport,
+    SpatialReasoningModule,
+    ThreeDSpatialReasoningModule,
 )
 
 class HRM_H_Module(nn.Module):
