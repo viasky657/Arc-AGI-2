@@ -2121,7 +2121,7 @@ class OriginalCTMCore(nn.Module):
             # Use EnhancedNeuronSelector for these types.
             # Pass activations=None as they are not available during initialization.
             # The selector should handle this (e.g., by falling back to random or a default strategy).
-            neuron_indices_left, neuron_indices_right = self._enhanced_selector.select_neurons_for_synchronization(
+            neuron_indices_left, neuron_indices_right, _ = self._enhanced_selector.select_neurons_for_synchronization( # The sync_mode is not currently used here, so we can ignore it with _ #The original dot product processing here was replaced with a torch matmul method.
                 activations=None,
                 synch_type=synch_type,
                 n_synch=n_synch,
