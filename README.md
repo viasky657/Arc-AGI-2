@@ -3,6 +3,8 @@ This model currently has a maximum sliding window attentio of 250.000 tokens wit
 This model should probably be tested on this paper to see if it is actually learning or not: https://arxiv.org/pdf/2507.06952. This is the Paper Title: What Has a Foundation Model Found?
 Using Inductive Bias to Probe for World Models
 
+The HRM core model does not need multichoice tests or other pretraining because it can learn internally to understand the knowledge and how to apply it: The HRM model, as described in the paper, is capable of being trained directly on input-output pairs without explicit Chain-of-Thought supervision or pre-training. It performs latent reasoning in its hidden states, allowing it to internalize and apply knowledge through internal hierarchical processing. For data like the principlesdataset in training.py, which consists of text principles encoded as byte sequences and trained via self-supervised reconstruction, HRM can learn to understand and apply the principles on its own without needing additional mechanisms like multiple-choice tests. The model's architecture enables it to develop reasoning strategies internally, as demonstrated by its performance on complex tasks like ARC, Sudoku, and mazes with minimal examples.
+
 #Old Model components below:
 # Arc-AGI-2
 The Binary Patches/Binary Encoder - CTM - Intergraded Diffusion -Output Arc-AGI-2 Version. 

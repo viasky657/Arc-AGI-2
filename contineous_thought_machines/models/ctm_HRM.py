@@ -3294,7 +3294,10 @@ class HierarchicalCTM(OriginalCTMCore):
         self.synch_representation_size_h = self.calculate_synch_representation_size(self.n_synch_h)
         self.set_synchronisation_parameters('h', self.n_synch_h, config.ctm_n_random_pairing_self)
 
-    def forward_with_full_tracking(self, x: torch.Tensor, thought_guidance: bool = True) -> Dict[str, torch.Tensor]:
+    def forward_with_full_tracking(self, x: torch.Tensor, thought_guidance: bool = True,
+                                   voice1_id: Optional[torch.Tensor] = None,
+                                   voice2_id: Optional[torch.Tensor] = None,
+                                   blend_degree: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         The main forward pass implementing the hierarchical reasoning process.
         This method will replace the original CTM's iterative loop.
@@ -3311,6 +3314,11 @@ class HierarchicalCTM(OriginalCTMCore):
         activated_zL = self.start_activated_zL.unsqueeze(0).expand(b, -1)
         zL_trace = self.start_trace_zL.unsqueeze(0).expand(b, -1, -1)
         zH = self.start_zH.unsqueeze(0).expand(b, -1)
+        
+        # Optional voice blending
+        if voice1_id is not None and voice2_id is not None and blend_degree is not None:
+            blended_voice = self.voice_blender(voice1_id, voice2_id, blend_degree)
+            zH = zH + blended_voice  # Add blended voice to high-level state
         
         # 3. Initialize sync recurrent values
         decay_alpha_action, decay_beta_action = None, None
