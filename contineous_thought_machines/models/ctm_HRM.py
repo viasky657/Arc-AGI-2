@@ -345,6 +345,8 @@ class HierarchicalCTM(OriginalCTMCore):
         self.verify_args() # verify neuron selection compatibility
         self.n_synch_out = config.ctm_n_synch_out
         self.n_synch_action = config.ctm_n_synch_action
+        self.register_parameter('start_activated_state', nn.Parameter(torch.zeros((self.d_model)).uniform_(-math.sqrt(1/(self.d_model)), math.sqrt(1/(self.d_model)))))
+        self.register_parameter('start_trace', nn.Parameter(torch.zeros((self.d_model, self.memory_length)).uniform_(-math.sqrt(1/(self.d_model+self.memory_length)), math.sqrt(1/(self.d_model+self.memory_length)))))
         self.synch_representation_size_action = self.calculate_synch_representation_size(self.n_synch_action)
         self.synch_representation_size_out = self.calculate_synch_representation_size(self.n_synch_out)
 

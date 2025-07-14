@@ -1964,6 +1964,10 @@ class OriginalCTMCore(nn.Module):
             n_synch = self.n_synch_out
             neuron_indices_left = self.out_neuron_indices_left
             neuron_indices_right = self.out_neuron_indices_right
+        elif synch_type == 'h':
+            n_synch = self.n_synch_h
+            neuron_indices_left = self.h_neuron_indices_left
+            neuron_indices_right = self.h_neuron_indices_right
 
         B = activated_state.size(0)
         selected_left = activated_state[:, neuron_indices_left]  # (B, n_synch)
@@ -2086,9 +2090,14 @@ class OriginalCTMCore(nn.Module):
         2. Set the parameters for learnable exponential decay when computing synchronisation between all
             neurons.
         """
-        assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
+        assert synch_type in ('out', 'action', 'h'), f"Invalid synch_type: {synch_type}"
         left, right = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
-        synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
+        if synch_type == 'action':
+            synch_representation_size = self.synch_representation_size_action
+        elif synch_type == 'out':
+            synch_representation_size = self.synch_representation_size_out
+        else: # 'h'
+            synch_representation_size = self.synch_representation_size_h
         self.register_buffer(f'{synch_type}_neuron_indices_left', left)
         self.register_buffer(f'{synch_type}_neuron_indices_right', right)
         self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
