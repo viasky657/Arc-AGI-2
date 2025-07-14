@@ -9,11 +9,16 @@ for efficient processing of voice data.
 import torch
 import numpy as np
 import pyaudio
+from typing import TYPE_CHECKING
 
-from .ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, DynamicEntropyPatcher, EnhancedCTMConfig
+from .ctm_Diffusion_NEWNEW import DynamicEntropyPatcher
+
+if TYPE_CHECKING:
+    from .ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, EnhancedCTMConfig
+
 
 class RealtimeVoiceStreamer:
-    def __init__(self, model: EnhancedCTMDiffusion, config: EnhancedCTMConfig):
+    def __init__(self, model: "EnhancedCTMDiffusion", config: "EnhancedCTMConfig"):
         self.model = model
         self.config = config
         self.patcher = DynamicEntropyPatcher(
@@ -79,6 +84,8 @@ class RealtimeVoiceStreamer:
         print("Streaming finished.")
 
 if __name__ == '__main__':
+    from .ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, EnhancedCTMConfig
+
     # Example usage of the new simultaneous generation method
     config = EnhancedCTMConfig()
     model = EnhancedCTMDiffusion(config)
