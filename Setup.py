@@ -1,25 +1,4 @@
 
-import os
-
-ARC_EVAL_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/evaluation"  #Evaluation Dataset Directory. # <<< IMPORTANT: SET THIS PATH
-# --- Configuration Variables ---
-# These variables define the ARC environment and MCMC behavior.
-# NOTE: You must provide the paths to your ARC dataset directories.
-ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/training/0a1d4ef5.json" # <<< IMPORTANT: SET THIS PATH
-
-
-
-MAX_GRID_SIZE = (30, 30)
-NUM_ARC_SYMBOLS = 10
-PADDING_VALUE = -1 # A value not in 0-9 to be ignored by the loss function
-
-# Configuration for ARC-AGI-2 Training (shared constants)
-ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
-
-print(f"Using MAX_GRID_SIZE: {MAX_GRID_SIZE}")
-print(f"Using NUM_ARC_SYMBOLS: {NUM_ARC_SYMBOLS}")
-print(f"Using ARC_INPUT_FLAT_DIM: {ARC_INPUT_FLAT_DIM}") 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +18,95 @@ from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 from accelerate import Accelerator
 
+WORKSPACE_ROOT = "/workspaces/Arc-AGI-2"
+
+ARC_TRAIN_DIR = os.path.join(WORKSPACE_ROOT, "contineous_thought_machines", "data", "training")
+ARC_EVAL_DIR = os.path.join(WORKSPACE_ROOT, "contineous_thought_machines", "data", "evaluation")
+
+def find_json_file(filename, search_dir):
+    """
+    Search for a specific JSON file by filename in a given directory tree.
+    """
+    for root, _, files in os.walk(search_dir):
+        if filename in files:
+            return os.path.join(root, filename)
+    return None
+
+def resolve_json_files(directory):
+    """
+    Collect all JSON files in the given directory.
+    If any is missing, try to find it elsewhere in the workspace.
+    Returns a list of absolute file paths.
+    """
+    json_files = []
+    # Get all JSON files that exist in the given directory
+    for file in os.listdir(directory):
+        if file.endswith(".json"):
+            abs_path = os.path.join(directory, file)
+            if os.path.exists(abs_path):
+                json_files.append(abs_path)
+            else:
+                # Try to find it in the workspace
+                print(f"[WARN] File not found in expected path: {abs_path}. Searching workspace...")
+                found = find_json_file(file, WORKSPACE_ROOT)
+                if found:
+                    print(f"[INFO] Found {file} at: {found}")
+                    json_files.append(found)
+                else:
+                    print(f"[ERROR] Could not find {file} anywhere in {WORKSPACE_ROOT}")
+    return json_files
+
+# Use the function for both training and evaluation dirs
+train_json_files = resolve_json_files(ARC_TRAIN_DIR)
+eval_json_files = resolve_json_files(ARC_EVAL_DIR)
+
+print(f"✅ Found {len(train_json_files)} training JSON files.")
+print(f"✅ Found {len(eval_json_files)} evaluation JSON files.")
+
+# Example: show first few
+print("Training files:", train_json_files[:3])
+print("Evaluation files:", eval_json_files[:3])
+
+
+MAX_GRID_SIZE = (30, 30)
+NUM_ARC_SYMBOLS = 10
+PADDING_VALUE = -1 # A value not in 0-9 to be ignored by the loss function
+
+# Configuration for ARC-AGI-2 Training (shared constants)
+ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
+
+print(f"Using MAX_GRID_SIZE: {MAX_GRID_SIZE}")
+print(f"Using NUM_ARC_SYMBOLS: {NUM_ARC_SYMBOLS}")
+print(f"Using ARC_INPUT_FLAT_DIM: {ARC_INPUT_FLAT_DIM}") 
+
+WORKSPACE_ROOT = "/workspaces/Arc-AGI-2"
+MODELS_DIR = os.path.join(WORKSPACE_ROOT, "contineous_thought_machines", "models")
+
+def add_directory_to_sys_path(directory):
+    """
+    Add the given directory to sys.path if not already there.
+    """
+    if directory not in sys.path:
+        sys.path.append(directory)
+        print(f"[INFO] Added {directory} to sys.path ✅")
+    else:
+        print(f"[INFO] Directory already in sys.path: {directory}")
+
+def list_python_files(directory):
+    """
+    List all .py files in the directory (non-recursive).
+    """
+    py_files = [f for f in os.listdir(directory) if f.endswith(".py")]
+    print(f"[INFO] Found {len(py_files)} Python files in {directory}:")
+    for f in py_files:
+        print(f"  - {f}")
+
+# --- Add models dir ---
+add_directory_to_sys_path(MODELS_DIR)
+
+# Optional: verify there are Python modules to import
+list_python_files(MODELS_DIR)
+
 # --- Path Setup ---
 if '/workspaces/Arc-AGI-2' not in sys.path:
     sys.path.insert(0, '/workspaces/Arc-AGI-2')
@@ -46,21 +114,6 @@ if '/workspaces/Arc-AGI-2' not in sys.path:
 models_dir = os.path.join('/workspaces/Arc-AGI-2', 'contineous_thought_machines', 'models')
 if models_dir not in sys.path:
     sys.path.append(models_dir)
-
-data_dir = os.path.join('/workspaces/Arc-AGI-2', 'contineous_thought_machines', 'data')
-if data_dir not in sys.path:
-    sys.path.append(data_dir)
-
-
-# --- Model Import ---
-EnhancedCTMDiffusion = None
-try:
-    from ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, SynapticEmpathy, MirrorNeuronLayer
-    from ctm_HRM import HierarchicalCTM, HRM_L_Module, HRM_H_Module, LongTermMemory, ConsciousnessController, WorkingMemoryBuffer
-    from Principles import principles
-except ImportError as e:
-    print(f"Error importing Enhanced CTM or related components: {e}")
-    EnhancedCTMDiffusion = None
 
 # --- Constants and Configs ---
 MAX_GRID_SIZE = (30, 30)
@@ -171,7 +224,17 @@ class NewCustomARCGridDataset(Dataset):
         self.tasks = []
         print(f"NewCustomARCGridDataset: Looking for tasks in: {data_dir}")
         if not self.task_files:
-            print(f"NewCustomARCGridDataset Warning: No JSON files found in {data_dir}. Dataset will be empty.")
+            print(f"NewCustomARCGridDataset Warning: No JSON files found in {data_dir}. Attempting fallback search.")
+            base_dir = '/workspaces/Arc-AGI-2'
+            self.task_files = []
+            for root, dirs, files in os.walk(base_dir):
+                for file in files:
+                    if file.endswith('.json'):
+                        self.task_files.append(os.path.join(root, file))
+            if self.task_files:
+                print(f"Found {len(self.task_files)} JSON files via fallback search in {base_dir}")
+            else:
+                print(f"No JSON files found via fallback search in {base_dir}. Dataset will be empty.")
         for task_file in self.task_files:
             try:
                 with open(task_file, 'r') as f:
