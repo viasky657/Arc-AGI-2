@@ -31,6 +31,7 @@ from .utils import compute_normalized_entropy
 from .long_term_memory import LongTermMemory, MemoryReplayPolicy
 from .program_synthesizer import ProgramSynthesizer
 from torch.nn import GRU
+from .mamba_block import Mamba2Block
 
 """Shared components for CTM models, moved to break circular imports."""
 
@@ -221,7 +222,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     ssl_noise_std: float = 0.1  # Noise standard deviation for contrastive augmentation
     
     # Spatiotemporal Processing
-    use_spatial: bool = True  # Enable spatial processing for image/video data
+    use_spatial: bool = False  # Enable spatial processing for image/video data in the ctm model (does not affect Diffusion Model)
     
     # WINA Attention
     use_wina_attention: bool = True  # Enable WINA sparse attention
@@ -388,10 +389,22 @@ class HRM_H_Module(nn.Module):
         super().__init__()
         self.config = config
         # This module integrates the result from the L-module (zL) into its own state (zH).
-        self.attn = WINAAttention(d_model=config.d_model, n_heads=config.n_heads, dropout=config.dropout)
-        self.mlp = WINAEnhancedMLP(d_model=config.d_model, d_ff=config.d_model * 4, dropout=config.dropout)
+        self.mamba = Mamba2Block(d_model=config.d_model)
+        self.sparse_attn = WINAAttention(d_model=config.d_model, n_heads=config.n_heads, dropout=config.dropout)
         self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
+        self.planning_mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model * 2),
+            nn.ReLU(),
+            nn.Linear(config.d_model * 2, config.d_model * 4),
+            nn.ReLU(),
+            nn.Linear(config.d_model * 4, config.d_model * 2),
+            nn.ReLU(),
+            nn.Linear(config.d_model * 2, config.d_model),
+            nn.ReLU(),
+            nn.Linear(config.d_model, config.d_model)
+        )
+        self.norm3 = nn.LayerNorm(config.d_model)
         # Project zL to match d_model for attention
         self.zl_proj = nn.Linear(config.d_model, config.d_model)  # Assuming zL has d_model
         patcher_config = {
@@ -468,16 +481,43 @@ class HRM_H_Module(nn.Module):
             # The retrieved_memory is now a single contextualized vector from the LTM's attention mechanism
             kv = self.zl_proj(zL) + retrieved_memory.squeeze(0) # Squeeze to remove the batch dim of 1
             # Attention step
-            attn_output = self.attn(q, kv, kv)
-            meta_input = torch.cat([attn_output, zL], dim=-1)
+            kv = (self.zl_proj(zL) + retrieved_memory.squeeze(0)).unsqueeze(1)
+            current_zH = current_zH.unsqueeze(1)
+            q = self.h_q_proj(sync_h).unsqueeze(1)
+            
+            # Dynamic routing: Compute WINA scores to decide per token
+            scores = self.sparse_attn.wina_sparsifier.compute_wina_scores(current_zH, self.sparse_attn.q_proj.weight)
+            route_to_attention = (scores > 0.5).float()  # Example threshold; make learnable
+            
+            # Mamba path (default/efficient)
+            mamba_out = self.mamba(current_zH)
+            
+            # Sparse attention path (selective)
+            attn_out = self.sparse_attn(current_zH, kv, kv)
+            
+            # Fuse based on routing
+            current_zH = current_zH + (mamba_out * (1 - route_to_attention) + attn_out * route_to_attention)
+            
+            # Repeat for second block (or loop for more)
+            scores = self.sparse_attn.wina_sparsifier.compute_wina_scores(current_zH, self.sparse_attn.q_proj.weight)
+            route_to_attention = (scores > 0.5).float()
+            
+            mamba_out = self.mamba(current_zH)
+            attn_out = self.sparse_attn(current_zH, kv, kv)
+            current_zH = current_zH + (mamba_out * (1 - route_to_attention) + attn_out * route_to_attention)
+            
+            current_zH = current_zH.squeeze(1)
+            
+            meta_input = torch.cat([current_zH, zL], dim=-1)
             # Dynamic meta-learning with hypernetwork
             weight, bias = self.hypernet(meta_input)
             meta_update = F.linear(meta_input, weight, bias)
             current_zH = current_zH + meta_update * 0.1  # Small meta-update step
-            current_zH = self.norm1(current_zH + attn_output)
-            # MLP step
-            mlp_output = self.mlp(current_zH)
-            current_zH = self.norm2(current_zH + mlp_output)
+            current_zH = self.norm1(current_zH)
+            
+            # Additional planning layer
+            planning_output = self.planning_mlp(current_zH)
+            current_zH = self.norm3(current_zH + planning_output)
             
             # Add foresight simulation
             foresight_adjust = self.foresight(current_zH)
@@ -528,6 +568,8 @@ class HRM_L_Module(nn.Module):
         self.d_model = config.ctm_d_model
         self.d_input = config.ctm_input_dim
         
+        self.mamba_encoder = Mamba2Block(d_model=self.d_input)
+        
         # Inherit synapse and NLM models from parent HierarchicalCTM
         # to ensure they are registered correctly under the main model.
         self.synapses = parent_ctm.synapses
@@ -536,6 +578,13 @@ class HRM_L_Module(nn.Module):
         # Projector for the query, derived from the low-level sync state
         self.q_proj = nn.Linear(parent_ctm.synch_representation_size_action, self.d_input)
         self.top_down_projector = nn.Linear(self.config.d_model, self.d_model)  # Project zH to modulation signal
+        
+        if self.config.use_spatial:
+            self.spatial_reasoning = SpatialReasoningModule(self.d_model)
+            self.three_d_spatial_reasoning = ThreeDSpatialReasoningModule(self.d_model)
+        else:
+            self.spatial_reasoning = None
+            self.three_d_spatial_reasoning = None
 
     def forward(self,
                 activated_zL: torch.Tensor,
@@ -545,17 +594,19 @@ class HRM_L_Module(nn.Module):
                 sync_action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs one step of the low-level CTM computation.
-
+    
         Args:
             activated_zL: Current post-activation state of the L-module. (B, D)
             zL_trace: History of pre-activations for the L-module. (B, D, M)
             zH: Current high-level state, provides top-down context. (B, D)
             x_context: External input, provides bottom-up context. (B, S, d_input)
             sync_action: Synchronization representation for generating attention query. (B, sync_dim)
-
+    
         Returns:
             A tuple of (next_activated_zL, next_zL_trace).
         """
+        x_context = self.mamba_encoder(x_context)
+    
         # 1. Interact with context via attention
         # Query is from L-module's own action synchronisation
         q = self.q_proj(sync_action).unsqueeze(1)
@@ -565,23 +616,33 @@ class HRM_L_Module(nn.Module):
         kv = x_context + zH.unsqueeze(1)
         attn_out, _ = self.attention(q, kv, kv)
         attn_out = attn_out.squeeze(1)
-
+    
         # 2. Form input for synapses
         pre_synapse_input = torch.cat((attn_out, activated_zL), dim=-1)
-
+    
         # 3. Apply Synapses to get pre-activation state
         state = self.synapses(pre_synapse_input)
         top_down_mod = self.top_down_projector(zH)  # (B, D)
         state = state + top_down_mod * 0.3  # Modulate with strength 0.3
-
+        
+        # Add parietal-inspired spatial reasoning
+        if self.config.use_spatial and self.spatial_reasoning is not None:
+            state = self.spatial_reasoning(state.unsqueeze(1)).squeeze(1)
+    
+        # Add 3D spatial reasoning - assume a 3D grid size, e.g., (4,4,4) if d_model=64
+        # Adjust based on actual d_model; here assuming d_model is cube-able
+        if self.config.use_spatial and self.three_d_spatial_reasoning is not None:
+            cube_root = int(self.d_model ** (1/3))
+            grid_3d = (cube_root, cube_root, cube_root)
+            state = self.three_d_spatial_reasoning(state.unsqueeze(1), grid_size=grid_3d).squeeze(1)
+    
         # 4. Update state trace (memory for NLMs)
         next_zL_trace = torch.cat((zL_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
-
+    
         # 5. Apply Neuron-Level Models (NLMs) to get next post-activation state
         next_activated_zL = self.trace_processor(next_zL_trace)
         
         return next_activated_zL, next_zL_trace
-
 
 def batched_bytes_to_numeric_tensor(byte_batch_tensor: torch.Tensor, item_size: int = 4, target_dtype: np.dtype = np.dtype(np.float32)) -> torch.Tensor:
     """
@@ -635,6 +696,96 @@ def batched_numeric_tensor_to_bytes(numeric_batch_tensor: torch.Tensor, source_d
     stacked_bytes = torch.stack(processed_list, dim=0).to(numeric_batch_tensor.device)
     return stacked_bytes
 
+class GroupEquivariantAttention(nn.Module):
+    def __init__(self, d_model, num_heads=8):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+
+    def forward(self, x, grid_size=None):
+        if grid_size is None:
+            return self.attn(x, x, x)[0]
+        h, w = grid_size
+        seq_len = x.shape[1]
+        if h * w != seq_len:
+            return self.attn(x, x, x)[0]
+        outputs = []
+        for rot in range(4):
+            x_rot = self.rotate_tensor(x, rot, h, w)
+            attn_out = self.attn(x_rot, x_rot, x_rot)[0]
+            attn_out_back = self.rotate_tensor(attn_out, 4 - rot, h, w)
+            outputs.append(attn_out_back)
+        return torch.mean(torch.stack(outputs), dim=0)
+
+    def rotate_tensor(self, tensor, k, h, w):
+        grid = tensor.reshape(tensor.shape[0], h, w, tensor.shape[-1])
+        rotated = torch.rot90(grid, k, [1, 2])
+        return rotated.reshape(tensor.shape[0], h * w, tensor.shape[-1])
+
+class SpatialReasoningModule(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.spatial_attn = GroupEquivariantAttention(d_model, num_heads=8)
+        self.spatial_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model)
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, grid_size=None):
+        attn_out = self.spatial_attn(x, grid_size=grid_size)
+        return self.norm(x + self.spatial_mlp(attn_out))
+
+class ThreeDEquivariantAttention(nn.Module):
+    def __init__(self, d_model, num_heads=8):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+
+    def forward(self, x, grid_size=None):
+        if grid_size is None:
+            return self.attn(x, x, x)[0]
+        h, w, d = grid_size
+        seq_len = x.shape[1]
+        if h * w * d != seq_len:
+            return self.attn(x, x, x)[0]
+        outputs = []
+        # Apply rotations along different axes
+        for axis in [0, 1, 2]:  # x, y, z axes
+            for rot in [1, 2, 3]:  # 90, 180, 270 degrees
+                x_rot = self.rotate_3d_tensor(x, axis, rot, h, w, d)
+                attn_out = self.attn(x_rot, x_rot, x_rot)[0]
+                # Rotate back
+                attn_out_back = self.rotate_3d_tensor(attn_out, axis, 4 - rot, h, w, d)
+                outputs.append(attn_out_back)
+        return torch.mean(torch.stack(outputs), dim=0)
+
+    def rotate_3d_tensor(self, tensor, axis, k, h, w, d):
+        dims = [h, w, d]
+        grid = tensor.reshape(tensor.shape[0], *dims, tensor.shape[-1])
+        # Rotate along the specified axis
+        if axis == 0:  # Rotate in yz-plane
+            rotated = torch.rot90(grid, k, [2, 3])
+        elif axis == 1:  # Rotate in xz-plane
+            rotated = torch.rot90(grid, k, [1, 3])
+        elif axis == 2:  # Rotate in xy-plane
+            rotated = torch.rot90(grid, k, [1, 2])
+        return rotated.reshape(tensor.shape[0], h * w * d, tensor.shape[-1])
+
+class ThreeDSpatialReasoningModule(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.spatial_attn = ThreeDEquivariantAttention(d_model, num_heads=8)
+        self.spatial_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.ReLU(),
+            nn.Linear(d_model * 2, d_model)
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x, grid_size=None):
+        attn_out = self.spatial_attn(x, grid_size=grid_size)
+        return self.norm(x + self.spatial_mlp(attn_out))
+            
 class BinarySparseAttention(nn.Module):
     """
     Sparse attention mechanism optimized for binary data processing.
@@ -808,7 +959,8 @@ class WINASparsifier:
                          hidden_states: torch.Tensor,
                          weight_matrix: torch.Tensor,
                          layer_name: str = "default",
-                         cache_key: str = None) -> torch.Tensor:
+                         cache_key: str = None,
+                         dynamic_sparsity: Optional[float] = None) -> torch.Tensor:
         """
         Apply WINA gating mechanism to hidden states.
         
@@ -824,6 +976,7 @@ class WINASparsifier:
             weight_matrix: Weight matrix of shape [out_features, in_features]
             layer_name: Name of the layer for layer-specific sparsity
             cache_key: Optional cache key for weight matrix norms
+            dynamic_sparsity: Optional dynamic sparsity ratio to override the fixed one
             
         Returns:
             Gated hidden states with same shape as input
@@ -840,11 +993,18 @@ class WINASparsifier:
             expand_dims = [1] * (len(hidden_states.shape) - 1) + [in_features]
             column_norms = column_norms.view(*expand_dims)
         
-        # Compute WINA criterion: |x_i * c_i| where c_i is column norm
-        wina_scores = torch.abs(hidden_states) * column_norms
+        # Compute surprise: deviation from mean hidden state
+        mean_hs = hidden_states.mean(dim=-1, keepdim=True)
+        surprise = torch.abs(hidden_states - mean_hs)
+        surprise = surprise / surprise.max(dim=-1, keepdim=True)[0].clamp(min=1e-6)
+        
+        # Compute WINA criterion: |x_i * c_i| * (1 + surprise_i) # where c_i is column norm
+        wina_scores = torch.abs(hidden_states) * column_norms * (1 + surprise)
         
         # Determine sparsity ratio for this layer
-        if self.use_layer_specific and layer_name in self.layer_sparsity_ratios:
+        if dynamic_sparsity is not None:
+            current_sparsity = dynamic_sparsity
+        elif self.use_layer_specific and layer_name in self.layer_sparsity_ratios:
             current_sparsity = self.layer_sparsity_ratios[layer_name]
         else:
             current_sparsity = self.sparsity_ratio
@@ -920,18 +1080,24 @@ class MetaWINASparsifier(WINASparsifier):
         self.control_net = nn.Sequential(
             nn.Linear(control_dim, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(128, 4),  # Extended to 4 signals: sparsity interp, window, dilation, sparsity adjust
             nn.Sigmoid()
         )
         self.control_dim = control_dim
         
     def apply_wina_gating(self, hidden_states, weight_matrix, layer_name="default", cache_key=None, control_input=None):
-        # First compute base WINA gating
-        base_gated = super().apply_wina_gating(hidden_states, weight_matrix, layer_name, cache_key)
+        # If control input provided, compute dynamic sparsity
+        dynamic_sparsity = None
+        if control_input is not None:
+            dynamic_sparsity = self.get_dynamic_sparsity(self.sparsity_ratio, control_input)
+        
+        # Call base method with dynamic sparsity
+        base_gated = super().apply_wina_gating(hidden_states, weight_matrix, layer_name, cache_key, dynamic_sparsity)
         
         # If control input provided, use it to adjust sparsity
         if control_input is not None:
-            control_signal = self.control_net(control_input)  # (batch_size, 1)
+            control_signals = self.control_net(control_input)  # (batch_size, 4)
+            control_signal = control_signals[:, 0]  # sparsity interpolation signal
             # Reshape control_signal to match hidden_states dimensions
             control_signal = control_signal.view(-1, *([1]*(hidden_states.dim()-1)))
             # Interpolate between original and gated based on control signal
@@ -940,6 +1106,21 @@ class MetaWINASparsifier(WINASparsifier):
             output = base_gated
             
         return output
+
+    def get_dynamic_sparsity(self, base_sparsity, control_input):
+        control_signals = self.control_net(control_input)
+        signal = control_signals[:, 3].mean().item()  # Use the 4th signal for sparsity adjustment
+        return base_sparsity * (0.5 + signal)  # Adjust between 0.5*base and 1.5*base
+
+    def get_dynamic_window(self, base_window, control_input):
+        control_signals = self.control_net(control_input)
+        signal = control_signals[:, 1].mean().item()
+        return int(base_window * (0.5 + 1.5 * signal))
+
+    def get_dynamic_dilation(self, base_dilation, control_input):
+        control_signals = self.control_net(control_input)
+        signal = control_signals[:, 2].mean().item()
+        return int(base_dilation * (0.5 + 1.5 * signal))
 
 
 class WINAAttention(nn.Module):
@@ -956,125 +1137,107 @@ class WINAAttention(nn.Module):
     """
     
     def __init__(self,
-                 d_model: int,
-                 n_heads: int,
-                 dropout: float = 0.1,
-                 sparsity_ratio: float = 0.5,
-                 use_adaptive_sparsity: bool = True):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_k = d_model // n_heads
-        self.use_adaptive_sparsity = use_adaptive_sparsity
-        
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.wina_sparsifier = MetaWINASparsifier(sparsity_ratio=sparsity_ratio)
-        
-        # Setup adaptive sparsity if enabled
-        if use_adaptive_sparsity:
-            layer_names = ["query", "key", "value", "attention", "output"]
-            self.wina_sparsifier.adaptive_sparsity_allocation(layer_names, sparsity_ratio)
-        self.locality_strength = nn.Parameter(torch.tensor(1.0))
-        self.locality_sigma = nn.Parameter(torch.tensor(10.0))
+                     d_model: int,
+                     n_heads: int,
+                     dropout: float = 0.1,
+                     sparsity_ratio: float = 0.5,
+                     use_adaptive_sparsity: bool = True,
+                     control_dim: int = 64):
+            super().__init__()
+            self.d_model = d_model
+            self.n_heads = n_heads
+            self.d_k = d_model // n_heads
+            self.use_adaptive_sparsity = use_adaptive_sparsity
+            
+            assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+            
+            self.q_proj = nn.Linear(d_model, d_model)
+            self.k_proj = nn.Linear(d_model, d_model)
+            self.v_proj = nn.Linear(d_model, d_model)
+            self.out_proj = nn.Linear(d_model, d_model)
+            
+            self.dropout = nn.Dropout(dropout)
+            self.wina_sparsifier = MetaWINASparsifier(sparsity_ratio=sparsity_ratio, control_dim=control_dim)
+            # Setup adaptive sparsity if enabled
+            if use_adaptive_sparsity:
+                layer_names = ["query", "key", "value", "attention", "output"]
+                self.wina_sparsifier.adaptive_sparsity_allocation(layer_names, sparsity_ratio)
+            self.locality_predictor = nn.Linear(d_model, 2 * n_heads)
+            self.control_proj = nn.Linear(d_model, control_dim)
         
     def forward(self,
                 query: torch.Tensor,
                 key: torch.Tensor,
                 value: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size, seq_len, _ = query.shape
-        
-        # Apply WINA sparsification to input representations
-        query_sparse = self.wina_sparsifier.apply_wina_gating(
-            query, self.q_proj.weight, "query", f"q_proj_{id(self.q_proj.weight)}"
-        )
-        key_sparse = self.wina_sparsifier.apply_wina_gating(
-            key, self.k_proj.weight, "key", f"k_proj_{id(self.k_proj.weight)}"
-        )
-        value_sparse = self.wina_sparsifier.apply_wina_gating(
-            value, self.v_proj.weight, "value", f"v_proj_{id(self.v_proj.weight)}"
-        )
-        
-        # Project to Q, K, V
+    
+        control_input = self.control_proj(query.mean(dim=1))
+         # Apply WINA sparsification to input representations
+    
+        query_sparse = self.wina_sparsifier.apply_wina_gating(query, self.q_proj.weight, "query", f"q_proj_{id(self.q_proj.weight)}", control_input)
+    
+        key_sparse = self.wina_sparsifier.apply_wina_gating(key, self.k_proj.weight, "key", f"k_proj_{id(self.k_proj.weight)}", control_input)
+    
+        value_sparse = self.wina_sparsifier.apply_wina_gating(value, self.v_proj.weight, "value", f"v_proj_{id(self.v_proj.weight)}", control_input)
+    
         Q = self.q_proj(query_sparse)
+    
         K = self.k_proj(key_sparse)
+    
         V = self.v_proj(value_sparse)
-        
-        # Reshape for multi-head attention
+    
         Q = Q.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+    
         K = K.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
+    
         V = V.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
-        
-        # Compute attention scores
-        # Check if flash_attention is available and no mask
-        if flash_attention is not None and mask is None:
-            # Permute to (batch, seq_len, n_heads, d_k)
-            Q_perm = Q.permute(0, 2, 1, 3)
-            K_perm = K.permute(0, 2, 1, 3)
-            V_perm = V.permute(0, 2, 1, 3)
-            
-            # Apply flash attention
-            context_perm = flash_attention(Q_perm, K_perm, V_perm, causal=False)
-            
-            # Permute back
-            context = context_perm.permute(0, 2, 1, 3)
-        else:
-            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-            
-            # Add learnable sliding window bias
-            positions = torch.arange(seq_len, device=scores.device)
-            dist = torch.abs(positions.unsqueeze(0) - positions.unsqueeze(1))  # (seq_len, seq_len)
-            locality_bias = torch.exp(-dist / self.locality_sigma.abs().clamp(min=1e-5)) * self.locality_strength.abs()
-            locality_bias = locality_bias.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
-            scores = scores + locality_bias
-            
-            if mask is not None:
-                scores = scores.masked_fill(mask == 0, -1e9)
-            
-            attention_weights = F.softmax(scores, dim=-1)
-            
-            # WINA on sparsification to attention_weights (same as original)
-            # Create identity matrix as proxy weight matrix for attention sparsification
-            device = attention_weights.device
-            dtype = attention_weights.dtype
-            attn_seq_len = attention_weights.shape[-1]
-            
-            identity_weight = torch.eye(attn_seq_len, device=device, dtype=dtype)
-            
-            # Apply WINA to attention weights (reshape for compatibility)
-            original_shape = attention_weights.shape
-            attention_weights_flat = attention_weights.view(-1, attn_seq_len)
-            
-            attention_weights_sparse = self.wina_sparsifier.apply_wina_gating(
-                attention_weights_flat, identity_weight, "attention", f"attn_identity_{attn_seq_len}"
-            )
-            
-            attention_weights_sparse = attention_weights_sparse.view(original_shape)
-            attention_weights_sparse = self.dropout(attention_weights_sparse)
-            
-            # Apply attention to values
-            context = torch.matmul(attention_weights_sparse, V)
-        
-        # Reshape and project output
-        context = context.transpose(1, 2).contiguous().view(
-            batch_size, seq_len, self.d_model
-        )
-        
-        # Apply WINA sparsification to output projection
-        context_sparse = self.wina_sparsifier.apply_wina_gating(
-            context, self.out_proj.weight, "output", f"out_proj_{id(self.out_proj.weight)}"
-        )
-        
+    
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+    
+        # Locality bias
+        locality_params = self.locality_predictor(query.mean(dim=1)).view(batch_size, self.n_heads, 2)
+    
+        locality_sigma = locality_params[..., 0].mean()
+    
+        locality_strength = locality_params[..., 1].mean()
+        # Add learnable locality bias to all heads
+        positions = torch.arange(seq_len, device=query.device)
+    
+        dist = torch.abs(positions.unsqueeze(0) - positions.unsqueeze(1))
+    
+        locality_bias = torch.exp(-dist / locality_sigma.clamp(min=1e-5)) * locality_strength
+    
+        locality_bias = locality_bias.unsqueeze(0).unsqueeze(0)
+    
+        scores = scores + locality_bias
+    
+        if attention_mask is not None:
+    
+            scores = scores.masked_fill(~attention_mask.unsqueeze(1), float('-inf'))
+    
+        attention_weights = F.softmax(scores, dim=-1)
+    
+        identity_weight = torch.eye(attention_weights.shape[-1], device=attention_weights.device, dtype=attention_weights.dtype)
+    
+        attention_weights_sparse = self.wina_sparsifier.apply_wina_gating(
+    
+            attention_weights.view(-1, seq_len), identity_weight, "attention", "attention_wina", control_input
+    
+        ).view(attention_weights.shape)
+    
+        attention_weights_sparse = self.dropout(attention_weights_sparse)
+    
+        context = torch.matmul(attention_weights_sparse, V)
+    
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+    
+        context_sparse = self.wina_sparsifier.apply_wina_gating(context, self.out_proj.weight, "output", f"out_proj_{id(self.out_proj.weight)}", control_input)
+    
         output = self.out_proj(context_sparse)
-        
+    
         return output
+    
     
     def get_sparsity_stats(self) -> Dict[str, Any]:
         """Get sparsity statistics and cache performance."""
@@ -3100,7 +3263,7 @@ class HierarchicalCTM(OriginalCTMCore):
         self.mirror_neuron = MirrorNeuronLayer(config.d_model, config.n_heads, config.dropout, config.num_emotion_dim, config.goal_dim)
         self.temporal_spatial_tracker = TemporalSpatialTracker(config)
         self.working_memory = WorkingMemoryBuffer(config.d_model)
-        
+        self.glial_support = GlialSupport(config.d_model)
         # --- Input/Output Layers ---
         self.input_encoder = nn.Linear(config.ctm_input_dim, self.d_input)
         self.output_projector = nn.Linear(self.synch_representation_size_out, config.ctm_out_dims)
@@ -3204,8 +3367,10 @@ class HierarchicalCTM(OriginalCTMCore):
 
             # End of low-level cycle, update high-level state using the final L-state
             # Fuse retrieved_memory with zL before passing to h_module
-            fused_input = torch.cat([activated_zL, retrieved_memory.squeeze(0)], dim=-1)
-            fused_input = self.fusion_proj(fused_input)
+            # Fuse retrieved_memory with zL before passing to h_module with bidirectional attention
+            fused_input = torch.cat([activated_zL.unsqueeze(1), retrieved_memory], dim=1)
+            attn_out, _ = nn.MultiheadAttention(self.d_model, num_heads=8, batch_first=True)(fused_input, fused_input, fused_input)
+            fused_input = self.fusion_proj(attn_out.mean(dim=1))
             
             zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance)
             modulation = self.consciousness_controller.get_attention_modulation()
@@ -3276,6 +3441,22 @@ class HierarchicalCTM(OriginalCTMCore):
             'programs': programs,
             'entropy_aux_loss': total_entropy_loss
         }
+
+class GlialSupport(nn.Module):
+            def __init__(self, d_model):
+                super().__init__()
+                self.adaptive_norm = nn.LayerNorm(d_model)
+                self.support_mlp = nn.Sequential(
+                    nn.Linear(d_model, d_model // 2),
+                    nn.ReLU(),
+                    nn.Linear(d_model // 2, d_model)
+                )
+        
+            def forward(self, x):
+                norm_x = self.adaptive_norm(x)
+                support = self.support_mlp(norm_x)
+                return x + support * 0.1
+
 
 class ForesightSimulator(nn.Module):
     def __init__(self, d_model, num_steps=3):
