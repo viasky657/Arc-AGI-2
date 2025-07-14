@@ -127,6 +127,7 @@ from .ctm_components import (
     HyperNetwork,
 )
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
+from .realtime_voice_module import RealtimeVoiceStreamer
 # Import original CTM modules to preserve exact behavior
 # try:
 from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D

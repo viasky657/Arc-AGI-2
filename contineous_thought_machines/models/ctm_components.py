@@ -34,7 +34,6 @@ from .mamba_block import Mamba2Block
 from .enhanced_neuron_selection import EnhancedNeuronSelector
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
 from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
-from .realtime_voice_module import RealtimeVoiceStreamer
 
 try:
     import sys

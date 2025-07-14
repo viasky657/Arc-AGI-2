@@ -11,7 +11,7 @@ import numpy as np
 import pyaudio
 from typing import TYPE_CHECKING
 
-from .ctm_Diffusion_NEWNEW import DynamicEntropyPatcher
+from .ctm_components import DynamicEntropyPatcher
 
 if TYPE_CHECKING:
     from .ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion, EnhancedCTMConfig
