@@ -475,6 +475,9 @@ class HierarchicalCTM(OriginalCTMCore):
             synaptic_modulation, empathy_reward = self.synaptic_empathy(activated_zL.unsqueeze(-1), zH.unsqueeze(-1), zH)
             zH = zH + synaptic_modulation * 0.1
             
+            # Apply Glial Support for state stabilization
+            zH = self.glial_support(zH)
+            
             # Apply Mirror Neuron Layer
             valence, arousal = self.mirror_neuron.get_valence_arousal(zH.unsqueeze(1))
             observed_valence, observed_arousal = self.mirror_neuron.get_valence_arousal(zH.unsqueeze(1))  # Placeholder for observed

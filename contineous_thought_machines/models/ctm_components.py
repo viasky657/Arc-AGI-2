@@ -3655,6 +3655,9 @@ class HierarchicalCTM(OriginalCTMCore):
             )
             zH = modulated_zH.squeeze(1)
             
+            # Apply Glial Support for state stabilization
+            zH = self.glial_support(zH)
+            
             # Apply Working Memory
             zH = self.working_memory.update(zH)
             

@@ -540,6 +540,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     enable_consciousness_controller: bool = True
     consciousness_max_attention_steps: int = 100
 
+    # --- Recursion Parameters ---
+    max_recursion: int = 3
+    early_stop_threshold: float = 1e-3
+    
     def __post_init__(self):
         # Validate output dimensions
         if len(self.output_dims) != self.num_outputs:
