@@ -3,8 +3,8 @@ import torch.nn as nn
 import math
 from typing import Tuple, List
 
-# Import DynamicEntropyPatcher and its dependencies from ctm_Diffusion_NEWNEW
-from .ctm_Diffusion_NEWNEW import DynamicEntropyPatcher, OriginalCTMCore, EnhancedCTMConfig
+# Import DynamicEntropyPatcher and its dependencies from ctm_components
+from .ctm_components import DynamicEntropyPatcher, OriginalCTMCore, EnhancedCTMConfig
 
 import torch.nn.functional as F
 
