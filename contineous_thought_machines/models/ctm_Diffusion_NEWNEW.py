@@ -32,7 +32,6 @@ import random
 import copy # For JEPA target encoder deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import queue
-from .realtime_voice_module import RealtimeVoiceStreamer
 #from diffusers.schedulers.scheduling_ddpm import DDPMScheduler #Need to install with pip #Replaced with DPMSOLVerMultistepScheduler
 from diffusers import DPMSolverMultistepScheduler  #Need to install with pip
 import numpy as np

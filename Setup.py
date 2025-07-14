@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 from accelerate import Accelerator
 
-WORKSPACE_ROOT = "/workspaces/Arc-AGI-2"
+WORKSPACE_ROOT = "/workspace/Arc-AGI-2"
 
 ARC_TRAIN_DIR = os.path.join(WORKSPACE_ROOT, "contineous_thought_machines", "data", "training")
 ARC_EVAL_DIR = os.path.join(WORKSPACE_ROOT, "contineous_thought_machines", "data", "evaluation")
@@ -79,41 +79,10 @@ print(f"Using MAX_GRID_SIZE: {MAX_GRID_SIZE}")
 print(f"Using NUM_ARC_SYMBOLS: {NUM_ARC_SYMBOLS}")
 print(f"Using ARC_INPUT_FLAT_DIM: {ARC_INPUT_FLAT_DIM}") 
 
-WORKSPACE_ROOT = "/workspaces/Arc-AGI-2"
-MODELS_DIR = os.path.join(WORKSPACE_ROOT, "contineous_thought_machines", "models")
-
-def add_directory_to_sys_path(directory):
-    """
-    Add the given directory to sys.path if not already there.
-    """
-    if directory not in sys.path:
-        sys.path.append(directory)
-        print(f"[INFO] Added {directory} to sys.path ✅")
-    else:
-        print(f"[INFO] Directory already in sys.path: {directory}")
-
-def list_python_files(directory):
-    """
-    List all .py files in the directory (non-recursive).
-    """
-    py_files = [f for f in os.listdir(directory) if f.endswith(".py")]
-    print(f"[INFO] Found {len(py_files)} Python files in {directory}:")
-    for f in py_files:
-        print(f"  - {f}")
-
-# --- Add models dir ---
-add_directory_to_sys_path(MODELS_DIR)
-
-# Optional: verify there are Python modules to import
-list_python_files(MODELS_DIR)
-
-# --- Path Setup ---
-if '/workspaces/Arc-AGI-2' not in sys.path:
-    sys.path.insert(0, '/workspaces/Arc-AGI-2')
-
-models_dir = os.path.join('/workspaces/Arc-AGI-2', 'contineous_thought_machines', 'models')
-if models_dir not in sys.path:
-    sys.path.append(models_dir)
+# Ensure the workspace root is in sys.path for correct module resolution.
+if WORKSPACE_ROOT not in sys.path:
+    sys.path.insert(0, WORKSPACE_ROOT)
+    print(f"[INFO] Added workspace root to sys.path: {WORKSPACE_ROOT}")
 
 # --- Constants and Configs ---
 MAX_GRID_SIZE = (30, 30)
@@ -123,7 +92,7 @@ ARC_INPUT_FLAT_DIM = MAX_GRID_SIZE[0] * MAX_GRID_SIZE[1]
 device = "cuda" if torch.cuda.is_available() else "cpu"
 LEARNING_RATE = 1e-4
 CHECKPOINT_DIR = "checkpoints"
-ARC_TRAIN_DIR = "/workspaces/Arc-AGI-2/contineous_thought_machines/data/training" #Training Dataset Directory
+ARC_TRAIN_DIR = "/workspace/Arc-AGI-2/contineous_thought_machines/data/training" #Training Dataset Directory
 
 ACCELERATE_AVAILABLE = True
 try:
@@ -225,7 +194,7 @@ class NewCustomARCGridDataset(Dataset):
         print(f"NewCustomARCGridDataset: Looking for tasks in: {data_dir}")
         if not self.task_files:
             print(f"NewCustomARCGridDataset Warning: No JSON files found in {data_dir}. Attempting fallback search.")
-            base_dir = '/workspaces/Arc-AGI-2'
+            base_dir = '/workspace/Arc-AGI-2'
             self.task_files = []
             for root, dirs, files in os.walk(base_dir):
                 for file in files:
@@ -358,6 +327,8 @@ VALID_POSITIONAL_EMBEDDING_TYPES = [
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Union, Any, List
 import math
+
+from contineous_thought_machines.models.ctm_Diffusion_NEWNEW import EnhancedCTMDiffusion
 
 @dataclass
 class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency in the target file
@@ -658,6 +629,13 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
                 raise ValueError("jepa_num_target_blocks must be positive.")
             if not self.use_dynamic_entropy_patcher:
                 print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
+        
+
+        # Validations for recursion parameters
+        if self.max_recursion < 1:
+            raise ValueError("max_recursion must be at least 1")
+        if self.early_stop_threshold <= 0:
+            raise ValueError("early_stop_threshold must be positive.")
 
 # --- Model Configuration ---
 config_arc_diffusion = EnhancedCTMConfig(
