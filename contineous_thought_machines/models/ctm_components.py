@@ -1617,7 +1617,7 @@ class ConsciousnessController(nn.Module):
             with torch.no_grad():
                 self.attention_level.fill_(target_attention) # Updated for PyTorch best practice
 
-            if target_attention >= 0.99:
+            if target_attention >= 1.0:
                 self.consciousness_state = 'awake'
                 print(f"  🌅 Model fully awakened (attention: {target_attention:.3f})")
             else:
@@ -3392,6 +3392,7 @@ class BasalGangliaMechanism(nn.Module):
             nn.Linear(d_model, d_model),
             nn.Sigmoid()
         )
+        self.reward_input_proj = nn.Linear(d_model + action_dim, d_model)
     
     def forward(self, thought_vector: torch.Tensor, context: torch.Tensor,
                 reward_signal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3450,7 +3451,8 @@ class BasalGangliaMechanism(nn.Module):
             
             # Predict reward for this gated action
             combined = torch.cat([thought_vector, gated_candidate], dim=-1)
-            pred_reward = self.dopamine_predictor(combined).squeeze(-1)  # (B,)
+            projected_input = self.reward_input_proj(combined)
+            pred_reward = self.dopamine_predictor(projected_input).squeeze(-1)
             predicted_rewards.append(pred_reward)
         
         # Stack rewards and select best
@@ -3613,7 +3615,7 @@ class HierarchicalCTM(OriginalCTMCore):
                 
                 if self.basal_ganglia:
                     action_candidates = [sync_action, sync_action * 0.5, sync_action * 1.5]
-                    sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, x_context)
+                    sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, activated_zL)
                 
                 # Run one step of the L-module
                 activated_zL, zL_trace = self.l_module(
