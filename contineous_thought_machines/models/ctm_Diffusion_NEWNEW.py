@@ -949,7 +949,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
                 
         # Add recurrent connections
         self.recurrent_cells = nn.ModuleDict()
-        for layer in range(config.num_layers):
+        for layer in range(config.n_layers):
             self.recurrent_cells[f"layer_{layer}"] = nn.GRUCell(
                 input_size=config.d_model,
                 hidden_size=config.d_model
@@ -966,7 +966,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # Replace WINA sparsifier with meta version
         self.wina_sparsifier = MetaWINASparsifier(
-            sparsity_ratio=config.sparsity_ratio,
+            sparsity_ratio=config.sparse_attention_ratio,
             control_dim=config.control_dim
         )
 

@@ -145,6 +145,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
 
     # Attention Mechanism Type
     attention_type: str = "WINA"  # Options: "standard", "binary_sparse", "WINA" #subquadratic was removed and the primary attention will now be WINA.
+    control_dim: int = 64  # for MetaWINASparsifier
 
     # Positional Embedding Parameters
     positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational-1d', 'learnable-fourier', multi-learnable-fourier' #Can set the value here. 
