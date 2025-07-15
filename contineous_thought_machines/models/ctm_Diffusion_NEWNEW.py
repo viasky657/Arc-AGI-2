@@ -2207,7 +2207,7 @@ class EnhancedCTMDiffusion(nn.Module):
         # Consciousness Controller
         if self.config.enable_consciousness_controller:
             self.consciousness_controller = ConsciousnessController(
-                model_dim=config.d_model,
+                model_dim=config.ctm_input_dim,
                 max_attention_steps=config.consciousness_max_attention_steps
             )
         else:
