@@ -957,7 +957,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
             
         # Add predictive coding modules
         self.predictive_coders = nn.ModuleDict()
-        for layer in range(1, config.num_layers):
+        for layer in range(1, config.n_layers):
             self.predictive_coders[f"layer_{layer}"] = nn.Sequential(
                 nn.Linear(config.d_model, config.d_model),
                 nn.ReLU()
@@ -2624,7 +2624,7 @@ class EnhancedCTMDiffusion(nn.Module):
         
         # Initialize hidden states for recurrent connections
         hidden_states = {}
-        for layer in range(self.config.num_layers):
+        for layer in range(self.config.n_layers):
             hidden_states[f"layer_{layer}"] = torch.zeros(
                 batch_size, self.config.d_model, device=device
             )
