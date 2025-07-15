@@ -200,8 +200,8 @@ class SuperLinear(nn.Module):
 
         # For multi-layer, we assume intermediate dims = out_dims, adjust if needed
         self.depth = max(1, depth)
-        self.weights = nn.ModuleList()
-        self.biases = nn.ModuleList()
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
         current_dim = in_dims
         for d in range(self.depth):
             next_dim = out_dims
