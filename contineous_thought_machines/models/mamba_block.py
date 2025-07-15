@@ -152,10 +152,10 @@ def ssd(a, B, C, x, chunk_size=256, h_init=None):
         y_list.append(y_ck)
         # update h
         for s in range(tc):
-            a_s = a_ck[:, s].unsqueeze(1).unsqueeze(1)
-            b_s = B_ck[:, s].unsqueeze(1).unsqueeze(2)
-            x_s = x_ck[:, s].unsqueeze(2).unsqueeze(1)
-            h = a_s * h + b_s * x_s
+            a_s = a_ck[:, s].view(-1, 1, 1)  # Reshape for broadcasting
+            # Update h in-place to avoid large intermediate tensor allocation
+            h.mul_(a_s)
+            h.addbmm_(x_ck[:, s].unsqueeze(2), B_ck[:, s].unsqueeze(1))
     y = torch.cat(y_list, dim=1)
     return y
 
