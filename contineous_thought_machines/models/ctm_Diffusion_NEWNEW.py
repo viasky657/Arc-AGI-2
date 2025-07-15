@@ -967,7 +967,7 @@ class CTMControlledDiffusionProcessor(nn.Module):
         # Replace WINA sparsifier with meta version
         self.wina_sparsifier = MetaWINASparsifier(
             sparsity_ratio=config.sparse_attention_ratio,
-            control_dim=config.control_dim
+            control_dim=getattr(config, 'control_dim', 64)
         )
 
         # Enhanced CTM guidance processors (from ctm_guided_integration_flow.py)

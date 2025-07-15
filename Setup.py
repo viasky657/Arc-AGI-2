@@ -433,6 +433,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
 
     # Attention Mechanism Type
     attention_type: str = "WINA"  # Options: "standard", "binary_sparse", "WINA" #Need to use WINA attention in place of "standard"
+    control_dim: int = 64 # Dimension for WINA control mechanism
 
     # Positional Embedding Parameters
     positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational', 'learnable-fourier', multi-learnable-fourier' #Can set the value here.
