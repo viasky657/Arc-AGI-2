@@ -117,8 +117,9 @@ class HRM_H_Module(nn.Module):
         self.thought_feedback_proj = nn.Linear(config.ctm_out_dims, config.d_model)
         
         # Add CTM-like components for H-module
-        self.h_synapses = SuperLinear(config.d_model * 2, config.d_model, depth=config.ctm_synapse_depth, dropout=config.ctm_dropout)
-        self.h_trace_processor = SuperLinear(config.d_model * config.ctm_memory_length, config.d_model, depth=config.ctm_deep_nlms, dropout=config.ctm_dropout)
+        # Using N=1 since it's used as a regular MLP, not per-neuron.
+        self.h_synapses = SuperLinear(2, 1, N=config.d_model, depth=config.ctm_synapse_depth, dropout=config.ctm_dropout)
+        self.h_trace_processor = SuperLinear(config.ctm_memory_length, 1, N=config.d_model, depth=config.ctm_deep_nlms, dropout=config.ctm_dropout)
         self.h_q_proj = nn.Linear(config.d_model, config.d_model)  # For H-module sync-based query
         
     def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor, thought_guidance: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -202,9 +203,9 @@ class HRM_H_Module(nn.Module):
             
             # Add CTM-like synapse and NLM processing
             h_pre_synapse = torch.cat([current_zH, retrieved_memory.squeeze(0)], dim=-1)
-            h_state = self.h_synapses(h_pre_synapse)
+            h_state = self.h_synapses(h_pre_synapse.view(h_pre_synapse.shape[0], self.config.d_model, 2))
             h_trace = torch.cat((h_trace[:, :, 1:], h_state.unsqueeze(-1)), dim=-1)
-            current_zH = self.h_trace_processor(h_trace.view(h_trace.shape[0], -1))
+            current_zH = self.h_trace_processor(h_trace)
             
             if not thought_guidance and self.program_synthesizer is not None:
                 # Synthesize a program using the new synthesizer
