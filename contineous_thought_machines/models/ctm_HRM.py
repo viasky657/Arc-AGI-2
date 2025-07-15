@@ -262,6 +262,7 @@ class HRM_L_Module(nn.Module):
         self.q_proj = nn.Linear(parent_ctm.synch_representation_size_action, self.d_input)
         self.top_down_projector = nn.Linear(self.config.d_model, self.d_model)  # Project zH to modulation signal
         
+        self.attention = WINAAttention(d_model=self.d_input, n_heads=config.n_heads, dropout=config.dropout)
         if self.config.use_spatial:
             self.spatial_reasoning = SpatialReasoningModule(self.d_model)
             self.three_d_spatial_reasoning = ThreeDSpatialReasoningModule(self.d_model)
@@ -288,7 +289,7 @@ class HRM_L_Module(nn.Module):
         Returns:
             A tuple of (next_activated_zL, next_zL_trace).
         """
-        x_context = self.mamba_encoder(x_context)
+        x_context = self.mamba_encoder(x_context).contiguous()
     
         # 1. Interact with context via attention
         # Query is from L-module's own action synchronisation

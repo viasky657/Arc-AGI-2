@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, List
 import math
 import random
 from enum import Enum
-from .mamba_block import MambaBlock, Mamba2Block
+from .mamba_block import Mamba2Block
 
 class MemoryReplayPolicy(Enum):
     SIMPLE_REPLAY = "simple_replay"
