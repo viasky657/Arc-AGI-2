@@ -454,7 +454,7 @@ class HierarchicalCTM(OriginalCTMCore):
                 
                 if self.basal_ganglia:
                     action_candidates = [sync_action, sync_action * 0.5, sync_action * 1.5]
-                    sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, x_context)
+                    sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, x_context.mean(dim=1))
                 
                 # Run one step of the L-module
                 activated_zL, zL_trace = self.l_module(
