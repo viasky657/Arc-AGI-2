@@ -2766,6 +2766,8 @@ class MirrorNeuronLayer(nn.Module):
         self.head_dim = d_model // num_heads
         self.num_emotion_dim = num_emotion_dim
         self.goal_dim = goal_dim
+
+        self.emotion_projection = nn.Linear(num_emotion_dim, d_model)
         
         # Emotion state trackers
         self.self_emotion_tracker = EmotionStateTracker(d_model, num_emotion_dim)
@@ -2775,7 +2777,7 @@ class MirrorNeuronLayer(nn.Module):
         self.goal_predictor = GoalPredictor(d_model, goal_dim)
         
         # Empathy computation
-        self.empathy_attention = nn.MultiheadAttention(num_emotion_dim, num_heads, dropout=dropout, batch_first=True)
+        self.empathy_attention = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         
         # Assistance generator
         self.assistance_net = nn.Sequential(
@@ -2842,9 +2844,9 @@ class MirrorNeuronLayer(nn.Module):
         
         # Compute empathy based on emotion similarity
         empathy, _ = self.empathy_attention(
-            query=current_self_emotion,
-            key=current_observed_emotion,
-            value=current_observed_emotion
+            query=self.emotion_projection(current_self_emotion),
+            key=self.emotion_projection(current_observed_emotion),
+            value=self.emotion_projection(current_observed_emotion)
         )
         
         # Generate assistance signal based on predicted goal and emotion
