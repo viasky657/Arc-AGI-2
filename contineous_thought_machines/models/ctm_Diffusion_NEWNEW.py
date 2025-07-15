@@ -2107,6 +2107,7 @@ class EnhancedCTMDiffusion(nn.Module):
             actual_noisy_input_dim=config.unet_input_feature_dim,
             task_analyzer=self.task_analyzer_instance # Pass the TaskAnalyzer instance
         )
+        self.target_noise_dim = config.unet_input_feature_dim
         self.ctm_contrastive_proj = nn.Linear(self.config.d_model, 128)
         self.diff_contrastive_proj = nn.Linear(self.target_noise_dim, 128)
 
