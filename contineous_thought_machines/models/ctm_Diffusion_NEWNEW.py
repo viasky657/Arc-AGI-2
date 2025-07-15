@@ -130,7 +130,7 @@ from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSel
 from .realtime_voice_module import RealtimeVoiceStreamer
 # Import original CTM modules to preserve exact behavior
 # try:
-from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D
+from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding
 from .utils import compute_normalized_entropy
 from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
 # except ImportError:
@@ -2180,8 +2180,8 @@ class EnhancedCTMDiffusion(nn.Module):
             elif config.positional_embedding_type == 'custom-rotational':
                 self.positional_embedding = CustomRotationalEmbedding(d_model=pe_dim)
             elif config.positional_embedding_type == 'custom-rotational-1d':
-                # This expects input (B, C, L), so ensure features are shaped accordingly before passing
-                self.positional_embedding = CustomRotationalEmbedding1D(d_model=pe_dim)
+                # Using 2D rotational embedding instead of 1D for more biological accuracy.
+                self.positional_embedding = CustomRotationalEmbedding(d_model=pe_dim)
             # Unknown positional_embedding_type; no positional embedding used
 
         self.enhanced_mcmc_sampler = None
@@ -2525,16 +2525,6 @@ class EnhancedCTMDiffusion(nn.Module):
                 encoded_features = grid_features_hw_d_with_pe.reshape(B, total_grid_elements, D)
                 # Reshaped patch sequence to grid and applied 2D PE
 
-            elif isinstance(self.positional_embedding, CustomRotationalEmbedding1D):
-                # 1D PE: Expects (B, C, L). `encoded_features` is (B, S, D)
-                # Permute to (B, D, S)
-                pe_input_1d = encoded_features.permute(0, 2, 1)
-                pos_emb_1d = self.positional_embedding(pe_input_1d) # Output (B, D, S)
-                pos_emb_1d = pos_emb_1d.permute(0, 2, 1) # (B, S, D)
-                if pos_emb_1d.shape == encoded_features.shape:
-                    encoded_features = encoded_features + pos_emb_1d
-                else:
-                    print(f"Warning: 1D Rotational PE shape {pos_emb_1d.shape} mismatch with features {encoded_features.shape}. Skipping PE.")
             
             elif isinstance(self.positional_embedding, (LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding)) and not self.config.reshape_patch_sequence_to_grid:
                  # 2D PE selected, but not reshaping. Apply as if 1D sequence with H=S, W=1 (or similar)

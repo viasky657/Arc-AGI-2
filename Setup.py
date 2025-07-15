@@ -320,7 +320,7 @@ VALID_NEURON_SELECT_TYPES = [
 
 VALID_POSITIONAL_EMBEDDING_TYPES = [
     'learnable-fourier', 'multi-learnable-fourier',
-    'custom-rotational', 'custom-rotational-1d'
+    'custom-rotational'
 ]
 
 # From contineous_thought_machines/models/ctm_Diffusion_NEWNEW.py
@@ -435,7 +435,7 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     attention_type: str = "WINA"  # Options: "standard", "binary_sparse", "WINA" #Need to use WINA attention in place of "standard"
 
     # Positional Embedding Parameters
-    positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational-1d', 'learnable-fourier', multi-learnable-fourier' #Can set the value here. 
+    positional_embedding_type: Optional[str] = 'multi-learnable-fourier' # e.g., 'custom-rotational', 'learnable-fourier', multi-learnable-fourier' #Can set the value here.
     positional_embedding_dim: Optional[int] = None  # Dimension of the positional embedding, defaults to ctm_input_dim if None
     reshape_patch_sequence_to_grid: bool = True # If True, reshape patch sequence to a 2D grid for 2D PEs. Must set to true if using 2D Grid for Positional Embeddings.
     patch_grid_width: Optional[int] = None       # Desired width of the patch grid if reshaping
@@ -671,7 +671,7 @@ config_arc_diffusion = EnhancedCTMConfig(
     ctm_neuron_select_type='bio_multi_objective',
     positional_embedding_type='multi-learnable-fourier',
     positional_embedding_dim=None,
-    reshape_patch_sequence_to_grid=False,
+    reshape_patch_sequence_to_grid=True,
     enable_pipeline_parallelism=True,
     pipeline_stages=4,
     pipeline_overlap_ratio=0.7,
