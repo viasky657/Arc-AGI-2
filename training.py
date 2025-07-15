@@ -237,7 +237,7 @@ if arc_eval_dataset and len(arc_eval_dataset) > 0:
 else:
     print("⚠️ ARC Evaluation DataLoader could not be initialized.")
 
-
+'''
 # --- Principles Dataset and DataLoader ---
 PRINCIPLES_FILE_PATH = "contineous-thought-machines/models/Principles/principles.txt"
 principles_dataset = PrinciplesDataset(PRINCIPLES_FILE_PATH)
@@ -251,7 +251,7 @@ if principles_dataset and len(principles_dataset) > 0:
     print(f"✓ Principles DataLoader initialized with {len(principles_dataset)} principles.")
 else:
     print("⚠️ Principles DataLoader could not be initialized.")
-
+'''
 
 # === DEBUG + RANK CHECK ===
 def get_rank_debug():
@@ -375,7 +375,7 @@ else:
 
     print("\n🎉 ARC-AGI-2 Meta-Learning Training Phase Completed!")
 
-
+'''
 # --- Principles Alignment Training Loop ---
 if principles_loader and NUM_EPOCHS_PRINCIPLES > 0 and 'ctm_model_arc' in globals() and ctm_model_arc is not None:
     print("\n" + "="*60)
@@ -465,7 +465,7 @@ if principles_loader and NUM_EPOCHS_PRINCIPLES > 0 and 'ctm_model_arc' in global
             ctm_model_arc.sleep_down()
 
     print("\n🎉 Principles Alignment Training Phase Completed!")
-
+'''
 #The Mixed Context training is not needed since the Program Synthesizer is not being used and the CTM Nueron Network is being used instead. 
 # --- Mixed Context Training ---
 '''

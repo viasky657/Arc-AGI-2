@@ -1975,7 +1975,7 @@ class OriginalCTMCore(nn.Module):
         selected_right = activated_state[:, neuron_indices_right]  # (B, n_synch)
 
         # Compute full outer product: (B, n_synch, n_synch)
-        outer = torch.bmm(selected_left.unsqueeze(2), selected_right.unsqueeze(1).transpose(-1, -2))
+        outer = torch.bmm(selected_left.unsqueeze(2), selected_right.unsqueeze(1))
 
         # Create mask based on type (computed once in init as buffer, but for simplicity here)
         mask = torch.zeros(B, n_synch, n_synch, device=activated_state.device)
