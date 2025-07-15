@@ -708,13 +708,24 @@ config_arc_diffusion = EnhancedCTMConfig(
     consciousness_max_attention_steps=100,
     use_hrm_core=True,
     attention_type="WINA",
-    inferred_task_latent_dim=512 #This does nothing in the model training but is included in a placeholder to avoid possible errors with initializing Torch for training.
+    inferred_task_latent_dim=512, #This does nothing in the model training but is included in a placeholder to avoid possible errors with initializing Torch for training.
+    ctm_use_qat=True,
+    ctm_adaptive_quantization=True,
+    ctm_quant_min_bits=2,
+    ctm_quant_max_bits=8,
+    ctm_quant_policy_search=True,
+    ctm_selective_quantization=True
 )
 print("✓ EnhancedCTMConfig for ARC (config_arc_diffusion) created.")
     
 if 'EnhancedCTMDiffusion' in globals() and EnhancedCTMDiffusion is not None:
     ctm_model_arc = EnhancedCTMDiffusion(config=config_arc_diffusion).to(device)
     print("✓ EnhancedCTMDiffusion model for ARC (ctm_model_arc) initialized.")
+
+    # Prepare model for QAT
+    ctm_model_arc.qconfig = torch.quantization.get_default_qat_qconfig('fbgemm')
+    torch.quantization.prepare_qat(ctm_model_arc, inplace=True)
+    print("✓ Model prepared for Quantization-Aware Training (QAT).")
 
     # The new EnhancedCTMDiffusion model is end-to-end and does not require an external output head.
     print("✓ ARC Output Head is disabled as it's not needed for the new model.")

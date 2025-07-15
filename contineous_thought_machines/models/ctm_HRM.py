@@ -62,6 +62,10 @@ class HRM_H_Module(nn.Module):
     def __init__(self, config: EnhancedCTMConfig):
         super().__init__()
         self.config = config
+        self.base_thresholds = {'critical': 0.99, 'medium': 0.8, 'low': 0.5}
+        self.confidence_thresholds = {k: 0.0 for k in self.base_thresholds}  # Start at 0
+        self.initial_epochs = 5  # Epochs before ramp-up starts
+        self.current_epoch = 0
         # This module integrates the result from the L-module (zL) into its own state (zH).
         self.mamba = Mamba2Block(d_model=config.d_model)
         self.sparse_attn = WINAAttention(d_model=config.d_model, n_heads=config.n_heads, dropout=config.dropout)
@@ -122,15 +126,16 @@ class HRM_H_Module(nn.Module):
         self.h_trace_processor = SuperLinear(config.ctm_memory_length, 1, N=config.d_model, depth=config.ctm_deep_nlms, dropout=config.ctm_dropout)
         self.h_q_proj = nn.Linear(config.d_model, config.d_model)  # For H-module sync-based query
         
-    def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor, thought_guidance: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor, thought_guidance: bool = True, confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             zH (torch.Tensor): Current high-level state.
             zL (torch.Tensor): Final low-level state from the L-cycle.
             retrieved_memory (torch.Tensor): Memory retrieved from the LTM.
             thought_guidance (bool): Flag to switch to direct CTM thought vector guidance. #Recommended on for most model usage.
+            confidence_level (str): 'critical', 'medium', or 'low'
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Next high-level state, encoded_patches (or None), patch_indices (or None), entropy_aux_loss (or 0).
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Next high-level state, encoded_patches (or None), patch_indices (or None), entropy_aux_loss (or 0), confidence.
         """
         current_zH = zH
         prev_zH = None
@@ -138,6 +143,7 @@ class HRM_H_Module(nn.Module):
         encoded_patches = None
         patch_indices = None
         entropy_aux_loss = torch.tensor(0.0, device=zH.device)
+        deltas = []
         
         # Initialize H-module trace
         h_trace = torch.zeros_like(current_zH.unsqueeze(-1).repeat(1, 1, self.config.ctm_memory_length))
@@ -168,7 +174,7 @@ class HRM_H_Module(nn.Module):
             route_to_attention = (scores > 0.5).float()  # Example threshold; make learnable
             
             # Mamba path (default/efficient)
-            mamba_out = self.mamba(current_zH)
+            mamba_out = self.mamba(current_zH, confidence_level=confidence_level)
             
             # Sparse attention path (selective)
             attn_out = self.sparse_attn(current_zH, kv, kv)
@@ -180,7 +186,7 @@ class HRM_H_Module(nn.Module):
             scores = self.sparse_attn.wina_sparsifier.compute_wina_scores(current_zH, self.sparse_attn.q_proj.weight)
             route_to_attention = (scores > 0.5).float()
             
-            mamba_out = self.mamba(current_zH)
+            mamba_out = self.mamba(current_zH, confidence_level=confidence_level)
             attn_out = self.sparse_attn(current_zH, kv, kv)
             current_zH = current_zH + (mamba_out * (1 - route_to_attention) + attn_out * route_to_attention)
             
@@ -220,6 +226,19 @@ class HRM_H_Module(nn.Module):
                 encoded_patches = None
                 patch_indices = None
                 entropy_aux_loss = torch.tensor(0.0, device=zH.device)
+            if self.config.ctm_adaptive_quantization and self.thought_ctm.bitwidth_adapter:
+                task_embedding = current_zH.mean(dim=0)
+                bits = self.thought_ctm.bitwidth_adapter(task_embedding)
+                
+                if self.config.ctm_quant_policy_search and self.thought_ctm.quant_policy_net:
+                    policy_params = self.thought_ctm.quant_policy_net(task_embedding)
+                    scale = policy_params[:, 1].mean()
+                    zero_point = policy_params[:, 2].mean()
+                    q_zH, _, _ = quantize_adaptive(current_zH, bits)
+                    current_zH = dequantize_adaptive(q_zH, scale, zero_point)
+                else:
+                    q_zH, scale, zero_point = quantize_adaptive(current_zH, bits)
+                    current_zH = dequantize_adaptive(q_zH, scale, zero_point)
             else:
                 # Direct CTM thought vector guidance
                 ctm_predictions, ctm_certainties, ctm_sync_out = self.thought_ctm(current_zH.unsqueeze(1))
@@ -233,15 +252,36 @@ class HRM_H_Module(nn.Module):
             # Early stopping check
             if prev_zH is not None:
                 delta = torch.norm(current_zH - prev_zH, dim=-1).mean()
+                deltas.append(delta)
                 if delta < self.early_stop_threshold:
                     break
             
             prev_zH = current_zH.clone()
             depth += 1
         
+        # Hallucination reduction: Compute confidence based on variance of deltas
+        if deltas:
+            variance = torch.var(torch.stack(deltas))
+            confidence = torch.exp(-variance)
+            threshold = self.confidence_thresholds.get(confidence_level, 0.8)
+            if not self.training and confidence < threshold:
+                current_zH = current_zH * 0  # Abstain only during inference
+        else:
+            confidence = torch.tensor(1.0, device=zH.device)
+        
         # The 'program' is now the sequence of encoded patches (or None in direct mode).
         # The other outputs might be used for loss calculation or debugging.
-        return current_zH, encoded_patches, patch_indices, entropy_aux_loss
+        return current_zH, encoded_patches, patch_indices, entropy_aux_loss, confidence
+    
+    def update_thresholds(self, epoch, total_epochs):
+        self.current_epoch = epoch
+        if epoch < self.initial_epochs:
+            factor = 0.0
+        else:
+            factor = (epoch - self.initial_epochs) / max(1, total_epochs - self.initial_epochs)
+        
+        for level in self.confidence_thresholds:
+            self.confidence_thresholds[level] = factor * self.base_thresholds[level]
 
 class HRM_L_Module(nn.Module):
     """The Low-Level, fast-updating CTM-based recurrent module for the HR-CTM."""
@@ -275,7 +315,8 @@ class HRM_L_Module(nn.Module):
                 zL_trace: torch.Tensor,
                 zH: torch.Tensor,
                 x_context: torch.Tensor,
-                sync_action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                sync_action: torch.Tensor,
+                confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs one step of the low-level CTM computation.
     
@@ -289,7 +330,7 @@ class HRM_L_Module(nn.Module):
         Returns:
             A tuple of (next_activated_zL, next_zL_trace).
         """
-        x_context = self.mamba_encoder(x_context).contiguous()
+        x_context = self.mamba_encoder(x_context, confidence_level=confidence_level).contiguous()
     
         # 1. Interact with context via attention
         # Query is from L-module's own action synchronisation
@@ -405,7 +446,8 @@ class HierarchicalCTM(OriginalCTMCore):
     def forward_with_full_tracking(self, x: torch.Tensor, thought_guidance: bool = True,
                                    voice1_id: Optional[torch.Tensor] = None,
                                    voice2_id: Optional[torch.Tensor] = None,
-                                   blend_degree: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                                   blend_degree: Optional[torch.Tensor] = None,
+                                   confidence_level: str = 'medium') -> Dict[str, torch.Tensor]:
         """
         The main forward pass implementing the hierarchical reasoning process.
         This method will replace the original CTM's iterative loop.
@@ -459,7 +501,7 @@ class HierarchicalCTM(OriginalCTMCore):
                 
                 # Run one step of the L-module
                 activated_zL, zL_trace = self.l_module(
-                    activated_zL, zL_trace, zH, x_context, sync_action
+                    activated_zL, zL_trace, zH, x_context, sync_action, confidence_level=confidence_level
                 )
                 
                 activated_zL = self.working_memory.update(activated_zL)
@@ -488,7 +530,7 @@ class HierarchicalCTM(OriginalCTMCore):
             attn_out, _ = nn.MultiheadAttention(self.d_model, num_heads=8, batch_first=True)(fused_input, fused_input, fused_input)
             fused_input = self.fusion_proj(attn_out.mean(dim=1))
             
-            zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance)
+            zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance, confidence_level=confidence_level)
             modulation = self.consciousness_controller.get_attention_modulation()
             zH = zH * modulation
             

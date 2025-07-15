@@ -1,6 +1,7 @@
 import sys
 import os
 import torch
+import torch.quantization
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -491,6 +492,8 @@ else:
             state_dict_ctm = load_file(ctm_checkpoint_path_eval, device="cpu")
             model_to_load_ctm = accelerator_arc.unwrap_model(ctm_model_arc) if ACCELERATE_AVAILABLE else ctm_model_arc
             model_to_load_ctm.load_state_dict(state_dict_ctm, strict=False)
+            model_to_load_ctm = torch.quantization.quantize_dynamic(model_to_load_ctm.eval(), dtype=torch.qint8, inplace=False)
+
             print(f"✓ Loaded CTM checkpoint from epoch {latest_epoch}.")
         else:
             print(f"⚠️ CTM Checkpoint not found at {ctm_checkpoint_path_eval}.")

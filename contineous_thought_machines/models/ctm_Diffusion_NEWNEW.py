@@ -1209,7 +1209,8 @@ class CTMControlledDiffusionProcessor(nn.Module):
         
         # If no CTM context, return base prediction
         if ctm_data is None:
-            return base_noise_pred
+            confidence = torch.tensor(1.0, device=base_noise_pred.device)
+            return base_noise_pred, confidence
         
         # Extract CTM influences
         ctm_influences = []
@@ -1288,6 +1289,8 @@ class CTMControlledDiffusionProcessor(nn.Module):
             state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros(batch_size_for_fallback, self.config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
             
             # Multi-stage refinement
+            deltas = []
+            prev_noise = current_noise.clone()
             for i, refinement_layer in enumerate(self.ctm_noise_refinement):
                 # CTM Feedback
                 if hasattr(self, 'ctm_feedback_module') and self.ctm_feedback_module is not None and ctm_data and 'final_sync_out' in ctm_data:
@@ -1307,8 +1310,19 @@ class CTMControlledDiffusionProcessor(nn.Module):
                 # Progressive residual connection with increasing CTM influence
                 ctm_strength = self.coupling_strength * (i + 1) / len(self.ctm_noise_refinement)
                 current_noise = current_noise + refinement * ctm_strength
+                delta = torch.norm(current_noise - prev_noise, dim=-1).mean()
+                deltas.append(delta)
+                prev_noise = current_noise.clone()
             
             # Final certainty-based scaling
+            if deltas:
+                variance = torch.var(torch.stack(deltas))
+                confidence = torch.exp(-variance)
+                threshold = self.confidence_thresholds.get(confidence_level, 0.8)
+                if not self.training and confidence < threshold:
+                    current_noise = current_noise * 0
+            else:
+                confidence = torch.tensor(1.0, device=current_noise.device)
             if 'certainties' in ctm_data:
                 final_certainty = ctm_data['certainties'][:, :, -1]
                 noise_scale = self.certainty_noise_scaler(final_certainty)
@@ -1367,9 +1381,9 @@ class CTMControlledDiffusionProcessor(nn.Module):
                 # Where abstained, use the base (unconditioned) noise prediction.
                 # Otherwise, use the CTM-guided prediction.
                 final_noise = torch.where(abstained_mask, base_noise_pred, current_noise)
-                return final_noise
+                return final_noise, confidence
             
-            return current_noise
+            return current_noise, confidence
         
         # If no CTM data, still apply Task-Aware HiPA if enabled
         if self.enable_task_aware_hipa:

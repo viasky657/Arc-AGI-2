@@ -34,6 +34,7 @@ from .mamba_block import Mamba2Block
 from .enhanced_neuron_selection import EnhancedNeuronSelector
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
 from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
+import torch.quantization as quant
 
 try:
     import sys
@@ -41,6 +42,8 @@ try:
     from flash_attn import flash_attention
 except ImportError:
     flash_attention = None
+
+
 
 @dataclass
 class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency in the target file
@@ -112,6 +115,12 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     # Hybrid: 'adaptive_random', 'performance_guided', 'task_aware'
     ctm_neuron_select_type: str = 'bio_multi_objective'
     ctm_n_random_pairing_self: int = 0
+    ctm_use_qat: bool = True #Turns quant-aware training off and on.
+    ctm_adaptive_quantization: bool = True
+    ctm_quant_min_bits: int = 2
+    ctm_quant_max_bits: int = 8
+    ctm_quant_policy_search: bool = True
+    ctm_selective_quantization: bool = True
     
     # Diffusion Parameters
     diffusion_steps: int = 1000
@@ -941,7 +950,8 @@ class WINASparsifier:
                          weight_matrix: torch.Tensor,
                          layer_name: str = "default",
                          cache_key: str = None,
-                         dynamic_sparsity: Optional[float] = None) -> torch.Tensor:
+                         dynamic_sparsity: Optional[float] = None,
+                         return_scores: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Apply WINA gating mechanism to hidden states.
         
@@ -1013,8 +1023,10 @@ class WINASparsifier:
             mask = torch.zeros_like(wina_scores)
             mask.scatter_(-1, top_k_indices, 1.0)
         
-        # Apply gating
-        return hidden_states * mask
+        gated_states = hidden_states * mask
+        if return_scores:
+            return gated_states, wina_scores
+        return gated_states
     
     def set_layer_sparsity(self, layer_name: str, sparsity_ratio: float):
         """Set layer-specific sparsity ratio."""
@@ -1120,6 +1132,7 @@ class WINAAttention(nn.Module):
     def __init__(self,
                      d_model: int,
                      n_heads: int,
+                     config: EnhancedCTMConfig,
                      dropout: float = 0.1,
                      sparsity_ratio: float = 0.5,
                      use_adaptive_sparsity: bool = True,
@@ -1129,6 +1142,8 @@ class WINAAttention(nn.Module):
             self.n_heads = n_heads
             self.d_k = d_model // n_heads
             self.use_adaptive_sparsity = use_adaptive_sparsity
+
+            self.config = config
             
             assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
             
@@ -1145,6 +1160,23 @@ class WINAAttention(nn.Module):
                 self.wina_sparsifier.adaptive_sparsity_allocation(layer_names, sparsity_ratio)
             self.locality_predictor = nn.Linear(d_model, 2 * n_heads)
             self.control_proj = nn.Linear(d_model, control_dim)
+    
+            if self.config.ctm_selective_quantization:
+                self.selective_quantizer = SelectiveQuantizer(
+                    min_bits=self.config.ctm_quant_min_bits,
+                    max_bits=self.config.ctm_quant_max_bits,
+                )
+            else:
+                self.selective_quantizer = None
+
+            if self.config.ctm_selective_quantization:
+                self.selective_quantizer = SelectiveQuantizer(
+                    min_bits=self.config.ctm_quant_min_bits,
+                    max_bits=self.config.ctm_quant_max_bits,
+                )
+            else:
+                self.selective_quantizer = None
+
         
     def forward(self,
                 query: torch.Tensor,
@@ -1155,18 +1187,23 @@ class WINAAttention(nn.Module):
     
         control_input = self.control_proj(query.mean(dim=1))
          # Apply WINA sparsification to input representations
-    
-        query_sparse = self.wina_sparsifier.apply_wina_gating(query, self.q_proj.weight, "query", f"q_proj_{id(self.q_proj.weight)}", control_input)
-    
-        key_sparse = self.wina_sparsifier.apply_wina_gating(key, self.k_proj.weight, "key", f"k_proj_{id(self.k_proj.weight)}", control_input)
-    
-        value_sparse = self.wina_sparsifier.apply_wina_gating(value, self.v_proj.weight, "value", f"v_proj_{id(self.v_proj.weight)}", control_input)
-    
-        Q = self.q_proj(query_sparse)
-    
-        K = self.k_proj(key_sparse)
-    
-        V = self.v_proj(value_sparse)
+        query_sparse, query_scores = self.wina_sparsifier.apply_wina_gating(query, self.q_proj.weight, "query", f"q_proj_{id(self.q_proj.weight)}", control_input, return_scores=True)
+        key_sparse, key_scores = self.wina_sparsifier.apply_wina_gating(key, self.k_proj.weight, "key", f"k_proj_{id(self.k_proj.weight)}", control_input, return_scores=True)
+        value_sparse, value_scores = self.wina_sparsifier.apply_wina_gating(value, self.v_proj.weight, "value", f"v_proj_{id(self.v_proj.weight)}", control_input, return_scores=True)
+
+        q_weight = self.q_proj.weight
+        k_weight = self.k_proj.weight
+        v_weight = self.v_proj.weight
+        out_weight = self.out_proj.weight
+
+        if self.selective_quantizer:
+            q_weight = self.selective_quantizer(q_weight, query_scores.mean(dim=(0,1)))
+            k_weight = self.selective_quantizer(k_weight, key_scores.mean(dim=(0,1)))
+            v_weight = self.selective_quantizer(v_weight, value_scores.mean(dim=(0,1)))
+
+        Q = F.linear(query_sparse, q_weight)
+        K = F.linear(key_sparse, k_weight)
+        V = F.linear(value_sparse, v_weight)
     
         Q = Q.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
     
@@ -1213,9 +1250,12 @@ class WINAAttention(nn.Module):
     
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
     
-        context_sparse = self.wina_sparsifier.apply_wina_gating(context, self.out_proj.weight, "output", f"out_proj_{id(self.out_proj.weight)}", control_input)
-    
-        output = self.out_proj(context_sparse)
+        context_sparse, context_scores = self.wina_sparsifier.apply_wina_gating(context, self.out_proj.weight, "output", f"out_proj_{id(self.out_proj.weight)}", control_input, return_scores=True)
+        
+        if self.selective_quantizer:
+            out_weight = self.selective_quantizer(out_weight, context_scores.mean(dim=(0,1)))
+
+        output = F.linear(context_sparse, out_weight)
     
         return output
     
@@ -2201,6 +2241,8 @@ class OriginalCTMCore(nn.Module):
     def forward(self, x, track=False):
         B = x.size(0)
         device = x.device
+        if self.config.ctm_use_qat and self.training:
+            x = self.quant(x)
 
         # --- Tracking Initialization ---
         pre_activations_tracking = []
@@ -2316,6 +2358,10 @@ class OriginalCTMCore(nn.Module):
                 synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
 
         # --- Return Values ---
+        if self.config.ctm_use_qat and self.training:
+            predictions = self.dequant(predictions)
+        if self.config.ctm_use_qat and self.training:
+            predictions = self.dequant(predictions)
         if track:
             tracking_results = (np.array(synch_out_tracking), np.array(synch_action_tracking)), \
                                np.array(pre_activations_tracking), np.array(post_activations_tracking), \
@@ -2324,7 +2370,6 @@ class OriginalCTMCore(nn.Module):
                 return predictions, certainties, tracking_results, np.array(dopamine_error_tracking)
             return predictions, certainties, tracking_results
         return predictions, certainties, synchronisation_out
-
     def compute_predictive_coding_loss(self, activated_state: torch.Tensor) -> torch.Tensor:
         """
         Computes the predictive coding loss based on hierarchical layers
@@ -2494,6 +2539,8 @@ class OriginalCTMCore(nn.Module):
         # Reshape predictions and certainties to be compatible with downstream logic
         final_predictions = predictions.unsqueeze(-1)
         final_certainties = certainties.unsqueeze(-1)
+        if self.config.ctm_use_qat and self.training:
+            predictions = self.dequant(predictions)
 
         return {
             'predictions': predictions,
@@ -3571,6 +3618,30 @@ class HierarchicalCTM(OriginalCTMCore):
         self.synch_representation_size_h = self.calculate_synch_representation_size(self.n_synch_h)
         self.set_synchronisation_parameters('h', self.n_synch_h, config.ctm_n_random_pairing_self)
 
+        # --- Quantization Stubs for QAT ---
+        self.quant = quant.QuantStub()
+        self.dequant = quant.DeQuantStub()
+
+        # --- Bitwidth Adapter for adaptive quantization ---
+        if config.ctm_adaptive_quantization:
+            self.bitwidth_adapter = BitwidthAdapter(
+                self.d_model,
+                min_bits=config.ctm_quant_min_bits,
+                max_bits=config.ctm_quant_max_bits
+            )
+        else:
+            self.bitwidth_adapter = None
+
+        if config.ctm_quant_policy_search:
+            # Assuming num_components is related to d_model or another config param
+            # For now, let's use a fixed number, e.g., 16 components
+            num_quant_components = 16
+            self.quant_policy_net = QuantizationPolicyNetwork(
+                self.d_model, num_components=num_quant_components
+            )
+        else:
+            self.quant_policy_net = None
+
     def forward_with_full_tracking(self, x: torch.Tensor, thought_guidance: bool = True,
                                    voice1_id: Optional[torch.Tensor] = None,
                                    voice2_id: Optional[torch.Tensor] = None,
@@ -3660,6 +3731,21 @@ class HierarchicalCTM(OriginalCTMCore):
             zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance)
             modulation = self.consciousness_controller.get_attention_modulation()
             zH = zH * modulation
+
+            if self.config.ctm_adaptive_quantization and self.bitwidth_adapter:
+                task_embedding = zH.mean(dim=0)
+                bits = self.bitwidth_adapter(task_embedding)
+                
+                if self.config.ctm_quant_policy_search and self.quant_policy_net:
+                    policy_params = self.quant_policy_net(task_embedding)
+                    # For simplicity, we'll use the average params for the whole tensor
+                    scale = policy_params[:, 1].mean()
+                    zero_point = policy_params[:, 2].mean()
+                    q_zH, _, _ = quantize_adaptive(zH, bits)
+                    zH = dequantize_adaptive(q_zH, scale, zero_point)
+                else:
+                    q_zH, scale, zero_point = quantize_adaptive(zH, bits)
+                    zH = dequantize_adaptive(q_zH, scale, zero_point)
             
             # Apply Synaptic Empathy
             synaptic_modulation, empathy_reward = self.synaptic_empathy(activated_zL.unsqueeze(-1), zH.unsqueeze(-1), zH)
@@ -3949,3 +4035,167 @@ class ProgramSynthesizer(nn.Module):
         encoded_patches, patch_indices, entropy_aux_loss = self.patcher(generated_bytes.byte())
         
         return encoded_patches, patch_indices, entropy_aux_loss
+
+def quantize_adaptive(tensor, bits):
+    """Dynamically quantizes a tensor to a given bitwidth."""
+    q_min = -(2**(bits - 1))
+    q_max = 2**(bits - 1) - 1
+    scale = (tensor.max() - tensor.min()) / (q_max - q_min)
+    zero_point = q_min - tensor.min() / scale
+    q_tensor = torch.quantize_per_tensor(tensor, scale, zero_point.round().int(), torch.quint8)
+    return q_tensor, scale, zero_point
+
+def dequantize_adaptive(q_tensor, scale, zero_point):
+    """Dequantizes a tensor using its scale and zero-point."""
+    return q_tensor.dequantize()
+
+class BitwidthAdapter(nn.Module):
+    def __init__(self, d_model, min_bits=4, max_bits=8):
+        super().__init__()
+        self.bitwidth_predictor = nn.Linear(d_model, 1)
+        self.min_bits = min_bits
+        self.max_bits = max_bits
+
+    def forward(self, task_embedding):
+        bitwidth_logit = self.bitwidth_predictor(task_embedding)
+        bitwidth = self.min_bits + (self.max_bits - self.min_bits) * torch.sigmoid(bitwidth_logit)
+        return bitwidth.round().int()
+
+class QuantizationPolicyNetwork(nn.Module):
+    def __init__(self, input_dim, num_components=10):
+        super().__init__()
+        self.policy_net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_components * 3)  # bitwidth, scale, zero_point per component
+        )
+        self.num_components = num_components
+
+    def forward(self, task_embedding):
+        params = self.policy_net(task_embedding)
+        return params.view(-1, self.num_components, 3)  # (batch, components, [bitwidth, scale, zero_point])
+
+def load_quantized_state(self, quantized_state_dict):
+    """
+    Load pre-quantized state dict while preparing for meta-learning.
+    """
+    # Load the quantized weights
+    self.load_state_dict(quantized_state_dict, strict=False)
+    
+    # Prepare for dequantization during adaptation
+    self.quantized = True
+    print("Loaded quantized model. Use dequantize_for_adaptation() for meta-learning tasks.")
+
+def dequantize_for_adaptation(self):
+    """
+    Temporarily dequantize the model for meta-learning adaptation.
+    """
+    if hasattr(self, 'quantized') and self.quantized:
+        # Convert parameters to float32 for full precision adaptation
+        for param in self.parameters():
+            param.data = param.data.float()
+        self.quantized = False
+        print("Model dequantized for adaptation.")
+    else:
+        print("Model is already in full precision.")
+
+def quantize_after_adaptation(self, task_embedding=None):
+    """
+    Re-quantize the model after adaptation, optionally using adaptive bitwidth and policy.
+    """
+    if not hasattr(self, 'quantized') or not self.quantized:
+        if task_embedding is not None:
+            # Use BitwidthAdapter for dynamic bitwidth
+            bitwidth = self.bitwidth_adapter(task_embedding)
+            
+            # Use QuantizationPolicyNetwork for per-component params
+            quant_params = self.quant_policy_net(task_embedding)
+            
+            # Apply dynamic quantization with custom params
+            # Note: This is a placeholder; actual implementation would use these params
+            # For example, custom quantize_dynamic with per-component bitwidth/scale/zero_point
+            print(f"Applying adaptive quantization with bitwidth {bitwidth} and custom params")
+        else:
+            # Default post-training quantization
+            self.qconfig = quant.get_default_qconfig('fbgemm')
+            quantized_model = quant.quantize_dynamic(self, {nn.Linear}, dtype=torch.qint8)
+            self.load_state_dict(quantized_model.state_dict())
+        
+        self.quantized = True
+        print("Model re-quantized after adaptation.")
+    else:
+        print("Model is already quantized.")
+
+class SelectiveQuantizer(nn.Module):
+    """Enhanced selective quantizer with variable bitwidth and adaptive threshold."""
+    def __init__(self, min_bits=2, max_bits=8, num_bins=3):
+        super().__init__()
+        self.min_bits = min_bits
+        self.max_bits = max_bits
+        self.num_bins = num_bins  # Number of quantization levels
+
+    def forward(self, weight, scores):
+        """
+        Apply enhanced selective quantization with variable bitwidth.
+        
+        Args:
+            weight (torch.Tensor): Weight tensor [out_features, in_features]
+            scores (torch.Tensor): Importance scores [in_features]
+            
+        Returns:
+            torch.Tensor: Selectively quantized weights
+        """
+        # Adaptive threshold: use median for robustness
+        adaptive_threshold = torch.median(scores)
+        
+        # Sort scores and create bins
+        sorted_scores, indices = torch.sort(scores)
+        bin_size = len(sorted_scores) // self.num_bins
+        bin_thresholds = [sorted_scores[i * bin_size] for i in range(1, self.num_bins)]
+        
+        # Assign bitwidths: higher scores get more bits
+        bitwidths = torch.linspace(self.min_bits, self.max_bits, self.num_bins + 1).int()
+        
+        # Create per-column bitwidth assignment
+        column_bits = torch.zeros_like(scores, dtype=torch.int)
+        for i in range(self.num_bins):
+            if i == 0:
+                mask = scores <= bin_thresholds[0]
+            elif i == self.num_bins - 1:
+                mask = scores > bin_thresholds[-1]
+            else:
+                mask = (scores > bin_thresholds[i-1]) & (scores <= bin_thresholds[i])
+            column_bits[mask] = bitwidths[i]
+        
+        # Group-wise quantization per column
+        new_weight = weight.clone()
+        for col in range(weight.shape[1]):
+            col_weight = weight[:, col:col+1]  # Keep as 2D for consistency
+            bits = column_bits[col]
+            
+            if bits == self.max_bits:  # Skip quantization for most important
+                continue
+                
+            q_min = -(2**(bits - 1))
+            q_max = 2**(bits - 1) - 1
+            
+            col_min = col_weight.min()
+            col_max = col_weight.max()
+            scale = (col_max - col_min) / (q_max - q_min)
+            scale = scale.clamp(min=1e-8)  # Prevent zero scale
+            
+            zero_point = q_min - (col_min / scale).round()
+            zero_point = zero_point.clamp(q_min, q_max)
+            
+            # Quantize
+            q_col = torch.round((col_weight / scale) + zero_point)
+            q_col = q_col.clamp(q_min, q_max)
+            
+            # Dequantize
+            deq_col = (q_col - zero_point) * scale
+            
+            new_weight[:, col:col+1] = deq_col
+        
+        return new_weight

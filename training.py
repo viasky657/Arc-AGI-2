@@ -272,6 +272,7 @@ else:
     print("✓ All components ready for ARC training.")
     
     for epoch in range(NUM_EPOCHS_ARC):
+        ctm_model_arc.h_module.update_thresholds(epoch, NUM_EPOCHS_ARC)
         ctm_model_arc.train()
         if hasattr(ctm_model_arc, 'wake_up'):
             ctm_model_arc.wake_up()
@@ -360,13 +361,16 @@ else:
                 accelerator_arc.wait_for_everyone()
                 unwrapped_model = accelerator_arc.unwrap_model(ctm_model_arc)
                 
+                # Convert to quantized model after QAT
+                quantized_model = torch.quantization.convert(unwrapped_model.eval(), inplace=False)
+                
                 # --- DeepSpeed Check ---
                 if hasattr(accelerator_arc.state, 'deepspeed_plugin') and accelerator_arc.state.deepspeed_plugin is not None:
                     # DeepSpeed handles checkpointing via accelerator.save_state
                     accelerator_arc.save_state(os.path.join(CHECKPOINT_DIR_ARC, f"epoch_{epoch+1}"))
                 else:
                     # For other setups, save with safetensors on rank 0
-                    save_file(unwrapped_model.state_dict(), os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{epoch+1}.safetensors"))
+                    save_file(quantized_model.state_dict(), os.path.join(CHECKPOINT_DIR_ARC, f"ctm_model_arc_epoch_{epoch+1}.safetensors"))
                 
                 print(f"✓ Checkpoint saved for epoch {epoch+1} to {CHECKPOINT_DIR_ARC}")
 
