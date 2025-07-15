@@ -1928,7 +1928,8 @@ class OriginalCTMCore(nn.Module):
             self.basal_ganglia = BasalGangliaMechanism(
                 d_model=self.d_model,
                 action_dim=self.synch_representation_size_action,
-                dopamine_dim=config.ctm_bg_dopamine_dim
+                dopamine_dim=config.ctm_bg_dopamine_dim,
+                context_dim=self.d_model
             )
         else:
             self.basal_ganglia = None
@@ -3357,11 +3358,14 @@ class BasalGangliaMechanism(nn.Module):
         action_dim (int): The dimensionality of the action representation to be gated.
         dopamine_dim (int): The dimensionality of the internal dopamine prediction network.
     """
-    def __init__(self, d_model: int, action_dim: int, dopamine_dim: int = 32):
+    def __init__(self, d_model: int, action_dim: int, dopamine_dim: int = 32, context_dim: Optional[int] = None):
         super().__init__()
         self.d_model = d_model
         self.action_dim = action_dim
         self.dopamine_dim = dopamine_dim
+        if context_dim is None:
+            context_dim = d_model
+        self.context_dim = context_dim
         
         # Direct pathway (Go signal)
         self.direct_pathway = nn.Sequential(
@@ -3389,7 +3393,7 @@ class BasalGangliaMechanism(nn.Module):
         
         # Contextual biasing
         self.context_gating = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(self.context_dim, d_model),
             nn.Sigmoid()
         )
         self.reward_input_proj = nn.Linear(d_model + action_dim, d_model)

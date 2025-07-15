@@ -375,7 +375,12 @@ class HierarchicalCTM(OriginalCTMCore):
         self.h_module = HRM_H_Module(config)
         self.ltm = LongTermMemory(config.d_model, config.ltm_size, config.ltm_top_k, MemoryReplayPolicy[config.replay_policy.upper()])
         self.consciousness_controller = ConsciousnessController(config.d_model, config.consciousness_max_attention_steps)
-        self.basal_ganglia = BasalGangliaMechanism(config.d_model, config.ctm_n_synch_action, config.ctm_bg_dopamine_dim)
+        self.basal_ganglia = BasalGangliaMechanism(
+            d_model=config.d_model,
+            action_dim=config.ctm_n_synch_action,
+            dopamine_dim=config.ctm_bg_dopamine_dim,
+            context_dim=self.d_input
+        )
         self.synaptic_empathy = SynapticEmpathy(config.d_model, config.ctm_memory_length, config.n_heads, config.dropout)
         self.mirror_neuron = MirrorNeuronLayer(config.d_model, config.n_heads, config.dropout, config.num_emotion_dim, config.goal_dim)
         self.temporal_spatial_tracker = TemporalSpatialTracker(config)
