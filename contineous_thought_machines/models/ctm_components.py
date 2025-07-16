@@ -266,6 +266,19 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     # --- Recursion Parameters ---
     max_recursion: int = 3
     early_stop_threshold: float = 1e-3
+
+    #---Quantinization Adaptive Dynamic Stuff---
+    ctm_use_qat: bool = True
+
+    ctm_adaptive_quantization: bool = True
+
+    ctm_quant_min_bits: int = 2
+
+    ctm_quant_max_bits: int = 8
+
+    ctm_quant_policy_search: bool = True
+
+    ctm_selective_quantization: bool = True
     
     def __post_init__(self):
        # Validate output dimensions
