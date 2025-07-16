@@ -43,8 +43,6 @@ try:
 except ImportError:
     flash_attention = None
 
-
-
 @dataclass
 class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency in the target file
     """Enhanced configuration for continual learning CTM-diffusion model,
@@ -2941,6 +2939,7 @@ class MirrorNeuronLayer(nn.Module):
         """
         Starts the real-time voice streaming session.
         """
+        from .realtime_voice_module import RealtimeVoiceStreamer
         streamer = RealtimeVoiceStreamer(self, self.config)
         streamer.run(duration=duration)
         
