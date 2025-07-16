@@ -109,6 +109,20 @@ class Mamba2Block(nn.Module):
         self.initial_epochs = 5
         self.current_epoch = 0
 
+        # Quantization setup
+        if config.ctm_use_qat:
+            self.quant = torch.quantization.QuantStub()
+            self.dequant = torch.quantization.DeQuantStub()
+        
+        if config.ctm_adaptive_quantization:
+            self.bitwidth_adapter = BitwidthAdapter(config.d_model, config.ctm_quant_min_bits, config.ctm_quant_max_bits)
+        
+        if config.ctm_quant_policy_search:
+            self.quant_policy_net = QuantizationPolicyNetwork(config.d_model)
+        
+        if config.ctm_selective_quantization:
+            self.selective_quantizer = SelectiveQuantizer(config.ctm_quant_min_bits, config.ctm_quant_max_bits)
+
 
     def forward(self, x: torch.Tensor, hidden_state: torch.Tensor = None, confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         b, l, d = x.shape
@@ -155,6 +169,27 @@ class Mamba2Block(nn.Module):
             output = self.output_fake_quant(output)
 
         final_h = final_h_flat.reshape(b, self.n_heads, self.d_state, self.d_head)
+
+        # Quantization in forward
+        if self.config.ctm_use_qat and self.training:
+            x = self.quant(x)
+        
+        if self.config.ctm_adaptive_quantization and self.bitwidth_adapter:
+            task_embedding = x.mean(dim=0)
+            bits = self.bitwidth_adapter(task_embedding)
+            
+            if self.config.ctm_quant_policy_search and self.quant_policy_net:
+                policy_params = self.quant_policy_net(task_embedding)
+                scale = policy_params[:, 1].mean()
+                zero_point = policy_params[:, 2].mean()
+            else:
+                scale, zero_point = 1.0, 0.0  # Defaults
+            
+            q_x = torch.quantize_per_tensor(x, scale, zero_point, torch.qint8)
+            x = q_x.dequantize()
+        
+        if self.config.ctm_use_qat and self.training:
+            output = self.dequant(output)
 
         return output, final_h, confidence
 

@@ -103,7 +103,7 @@ def batched_numeric_tensor_to_bytes(numeric_batch_tensor: torch.Tensor, source_d
 
 
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
-from .ctm_HRM import HierarchicalCTM
+from .ctm_components import HierarchicalCTM
 from .ctm_components import (
     EnhancedCTMConfig,
     OriginalCTMCore,
