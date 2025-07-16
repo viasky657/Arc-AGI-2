@@ -2110,7 +2110,7 @@ class EnhancedCTMDiffusion(nn.Module):
 
         # Core CTM: Conditionally instantiate either Original or Hierarchical core
         if config.use_hrm_core:
-            from .ctm_HRM import HierarchicalCTM
+            from .ctm_components import HierarchicalCTM
             self.ctm_core = HierarchicalCTM(config)
             # Using HierarchicalCTM (HRM) core if configured
         
