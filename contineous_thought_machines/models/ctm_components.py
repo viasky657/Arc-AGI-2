@@ -35,7 +35,20 @@ from .enhanced_neuron_selection import EnhancedNeuronSelector
 from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSelectionConfig
 from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
 import torch.quantization as quant
+from .mamba_block import quantize_adaptive, dequantize_adaptive, BitwidthAdapter, QuantizationPolicyNetwork, SelectiveQuantizer, load_quantized_state, dequantize_for_adaptation, quantize_after_adaptation
 
+from .neuromodulators import (
+    BaseNeuromodulator,
+    DopamineModulator,
+    SerotoninModulator,
+    OxytocinModulator,
+    NorepinephrineModulator,
+    AcetylcholineModulator,
+    EndorphinsModulator,
+    CortisolModulator,
+    GABAModulator,
+    GlutamateModulator
+)
 try:
     import sys
     sys.path.append("/workspaces/Arc-AGI-2/contineous_thought_machines/models/flash-attention-3")
@@ -101,6 +114,14 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     ctm_deep_nlms: bool = True
     ctm_memory_hidden_dims: int = 2048
     ctm_do_layernorm_nlm: bool = False
+
+    # Neuromodulator Configuration
+    enable_neuromodulators: bool = True
+    neuromodulator_dim: int = 512  # Dimension for neuromodulator computations
+    active_neuromodulators: List[str] = field(default_factory=lambda: [
+        'dopamine', 'serotonin', 'oxytocin', 'norepinephrine', 'acetylcholine',
+        'endorphins', 'cortisol', 'gaba', 'glutamate'
+    ])
     ctm_out_dims: int = 512  # Output dimension of CTM's own projector
     ctm_prediction_reshaper: list = field(default_factory=lambda: [-1])
     ctm_dropout: float = 0.1
@@ -119,6 +140,8 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     ctm_quant_max_bits: int = 8
     ctm_quant_policy_search: bool = True
     ctm_selective_quantization: bool = True
+    quant_enabled_training: bool = False
+    quant_enabled_inference: bool = False
     
     # Diffusion Parameters
     diffusion_steps: int = 1000
@@ -255,127 +278,109 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     goal_dim: int = 8 # Dimensionality of the predicted goal vector
     mirror_reward_weight: float = 0.2 # Weight for the selfless reward signal
 
-
-    # --- Confidence Thresholding Parameters ---
-    confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
-
-        # --- Consciousness Controller Parameters ---
-    enable_consciousness_controller: bool = True
-    consciousness_max_attention_steps: int = 100
-  
-    # --- Recursion Parameters ---
+  # --- Recursion Parameters ---
     max_recursion: int = 3
     early_stop_threshold: float = 1e-3
-
-    #---Quantinization Adaptive Dynamic Stuff---
-    ctm_use_qat: bool = True
-
-    ctm_adaptive_quantization: bool = True
-
-    ctm_quant_min_bits: int = 2
-
-    ctm_quant_max_bits: int = 8
-
-    ctm_quant_policy_search: bool = True
-
-    ctm_selective_quantization: bool = True
     
+# --- Confidence Thresholding Parameters ---
+    confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
+
     def __post_init__(self):
-       # Validate output dimensions
-       if len(self.output_dims) != self.num_outputs:
-           raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")
-    
-       # Merged content from the second __post_init__
-       if hasattr(self, 'ctm_prediction_reshaper') and self.ctm_prediction_reshaper == [-1] and self.vocab_size is not None:
-           pass
-       if hasattr(self, 'ctm_dropout_nlm') and self.ctm_dropout_nlm is None and hasattr(self, 'ctm_dropout'):
-           self.ctm_dropout_nlm = self.ctm_dropout
-       
-       if hasattr(self, 'ctm_neuron_select_type') and \
-          VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
-           print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEURON_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
-    
-       if hasattr(self, 'positional_embedding_type') and self.positional_embedding_type is not None:
-           if VALID_POSITIONAL_EMBEDDING_TYPES is None: # Fallback if import failed
-               print(f"Warning: VALID_POSITIONAL_EMBEDDING_TYPES not available for validation.")
-           elif self.positional_embedding_type not in VALID_POSITIONAL_EMBEDDING_TYPES:
-               print(f"Warning: positional_embedding_type '{self.positional_embedding_type}' is not in VALID_POSITIONAL_EMBEDDING_TYPES ({VALID_POSITIONAL_EMBEDDING_TYPES}).")
-           if self.positional_embedding_dim is not None and self.positional_embedding_dim <= 0:
-               raise ValueError("positional_embedding_dim must be positive if set.")
-           
-           if self.reshape_patch_sequence_to_grid:
-               if self.patch_grid_width is None or self.patch_grid_width <= 0:
-                   raise ValueError("patch_grid_width must be a positive integer if reshape_patch_sequence_to_grid is True.")
-               if self.positional_embedding_type not in ['learnable-fourier', 'multi-learnable-fourier', 'custom-rotational']:
-                   print(f"Warning: reshape_patch_sequence_to_grid is True, but positional_embedding_type ('{self.positional_embedding_type}') is not a typical 2D PE. Ensure compatibility.")
-    
-       # Validations for new patch encoder
-       if self.use_dynamic_entropy_patcher:
-           if self.patch_embedding_dim <= 0:
-               raise ValueError("patch_embedding_dim must be positive if use_dynamic_entropy_patcher is True.")
-           if self.entropy_patcher_min_patch_size <= 0:
-               raise ValueError("entropy_patcher_min_patch_size must be positive.")
-           if self.entropy_patcher_max_patch_size < self.entropy_patcher_min_patch_size:
-               raise ValueError("entropy_patcher_max_patch_size must be >= entropy_patcher_min_patch_size.")
-           if self.entropy_patcher_threshold_type not in ["global", "relative_monotonic"]:
-               raise ValueError("entropy_patcher_threshold_type must be 'global' or 'relative_monotonic'.")
-       elif self.multi_granularity and self.multi_granularity_output_dim <= 0:
-           print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
-       
-       if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim is None:
-           print("Warning: inferred_task_latent_dim not found or is None in config, defaulting to 64.")
-           self.inferred_task_latent_dim = 512
-       elif self.inferred_task_latent_dim <= 0: # This check is now safe
-           raise ValueError("inferred_task_latent_dim must be positive.")
-    
-       if hasattr(self, 'use_hipa_attention') and self.use_hipa_attention and \
+        # Validate output dimensions
+        if len(self.output_dims) != self.num_outputs:
+            raise ValueError(f"output_dims length ({len(self.output_dims)}) must match num_outputs ({self.num_outputs})")
+
+        # Merged content from the second __post_init__
+        if hasattr(self, 'ctm_prediction_reshaper') and self.ctm_prediction_reshaper == [-1] and self.vocab_size is not None:
+            pass
+        if hasattr(self, 'ctm_dropout_nlm') and self.ctm_dropout_nlm is None and hasattr(self, 'ctm_dropout'):
+            self.ctm_dropout_nlm = self.ctm_dropout
+
+        if hasattr(self, 'ctm_neuron_select_type') and \
+           VALID_NEURON_SELECT_TYPES is not None and self.ctm_neuron_select_type not in VALID_NEURON_SELECT_TYPES:
+            print(f"Warning: ctm_neuron_select_type '{self.ctm_neuron_select_type}' is not in VALID_NEuron_SELECT_TYPES ({VALID_NEURON_SELECT_TYPES}).")
+
+        if hasattr(self, 'positional_embedding_type') and self.positional_embedding_type is not None:
+            if VALID_POSITIONAL_EMBEDDING_TYPES is None: # Fallback if import failed
+                print(f"Warning: VALID_POSITIONAL_EMBEDDING_TYPES not available for validation.")
+            elif self.positional_embedding_type not in VALID_POSITIONAL_EMBEDDING_TYPES:
+                print(f"Warning: positional_embedding_type '{self.positional_embedding_type}' is not in VALID_POSITIONAL_EMBEDDING_TYPES ({VALID_POSITIONAL_EMBEDDING_TYPES}).")
+            if self.positional_embedding_dim is not None and self.positional_embedding_dim <= 0:
+                raise ValueError("positional_embedding_dim must be positive if set.")
+
+            if self.reshape_patch_sequence_to_grid:
+                if self.patch_grid_width is None or self.patch_grid_width <= 0:
+                    raise ValueError("patch_grid_width must be a positive integer if reshape_patch_sequence_to_grid is True.")
+                if self.positional_embedding_type not in ['learnable-fourier', 'multi-learnable-fourier', 'custom-rotational']:
+                    print(f"Warning: reshape_patch_sequence_to_grid is True, but positional_embedding_type ('{self.positional_embedding_type}') is not a typical 2D PE. Ensure compatibility.")
+
+        # Validations for new patch encoder
+        if self.use_dynamic_entropy_patcher:
+            if self.patch_embedding_dim <= 0:
+                raise ValueError("patch_embedding_dim must be positive if use_dynamic_entropy_patcher is True.")
+            if self.entropy_patcher_min_patch_size <= 0:
+                raise ValueError("entropy_patcher_min_patch_size must be positive.")
+            if self.entropy_patcher_max_patch_size < self.entropy_patcher_min_patch_size:
+                raise ValueError("entropy_patcher_max_patch_size must be >= entropy_patcher_min_patch_size.")
+            if self.entropy_patcher_threshold_type not in ["global", "relative_monotonic"]:
+                raise ValueError("entropy_patcher_threshold_type must be 'global' or 'relative_monotonic'.")
+        elif self.multi_granularity and self.multi_granularity_output_dim <= 0:
+            print("Warning: multi_granularity_output_dim might not be correctly set for validation if not using a patcher and MGP is active.")
+
+        if not hasattr(self, 'inferred_task_latent_dim') or self.inferred_task_latent_dim is None:
+            print("Warning: inferred_task_latent_dim not found or is None in config, defaulting to 64.")
+            self.inferred_task_latent_dim = 512
+        elif self.inferred_task_latent_dim <= 0: # This check is now safe
+            raise ValueError("inferred_task_latent_dim must be positive.")
+
+        if hasattr(self, 'use_hipa_attention') and self.use_hipa_attention and \
            (not hasattr(self, 'hipa_num_heads') or self.hipa_num_heads <= 0):
-            raise ValueError("hipa_num_heads must be positive if use_hipa_attention is True.")
-    
-       if hasattr(self, 'audio_output_dtype_str'):
-           if self.audio_output_dtype_str == "float32":
-               self.audio_output_item_size = 4
-           elif self.audio_output_dtype_str == "int16":
-               self.audio_output_item_size = 2
-           else:
-               if hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
-                   raise ValueError(f"Unsupported audio_output_dtype_str: {self.audio_output_dtype_str} when output_audio_bytes is True.")
-               else:
-                   self.audio_output_item_size = 4
-       elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
-           if not hasattr(self, 'audio_output_dtype_str') or self.audio_output_dtype_str is None:
-               raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
-       else:
-           self.audio_output_item_size = 4
-    
-       # Calculate unet_input_feature_dim if not set
-       if self.unet_input_feature_dim is None:
-           if self.max_sequence_length <= 0 or self.audio_output_item_size <= 0:
-               raise ValueError("max_sequence_length and audio_output_item_size must be positive to calculate unet_input_feature_dim.")
-           self.unet_input_feature_dim = self.max_sequence_length // self.audio_output_item_size
-           if self.unet_input_feature_dim <= 0:
-               raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
-       elif self.unet_input_feature_dim <= 0:
-           raise ValueError("unet_input_feature_dim, if set, must be positive.")
-    
-       if self.use_jepa_training:
-           if not (0 < self.jepa_mask_ratio_min < 1 and 0 < self.jepa_mask_ratio_max < 1 and self.jepa_mask_ratio_min <= self.jepa_mask_ratio_max):
-               raise ValueError("JEPA mask ratios must be between 0 and 1, with min <= max.")
-           if not (0 < self.jepa_context_scale_min < 1 and 0 < self.jepa_context_scale_max < 1 and self.jepa_context_scale_min <= self.jepa_context_scale_max):
-               raise ValueError("JEPA context scales must be between 0 and 1, with min <= max.")
-           if not (0 <= self.jepa_momentum_beta < 1):
-               raise ValueError("jepa_momentum_beta must be between 0 and 1.")
-           if self.jepa_num_target_blocks <= 0:
-               raise ValueError("jepa_num_target_blocks must be positive.")
-           if not self.use_dynamic_entropy_patcher:
-               print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
-    
-       # Validate quantization params
-       if self.ctm_use_qat:
-           if self.ctm_quant_min_bits >= self.ctm_quant_max_bits:
-               raise ValueError("ctm_quant_min_bits must be < ctm_quant_max_bits")
-           if self.ctm_adaptive_quantization and not self.ctm_quant_policy_search:
-               print("Warning: Adaptive quantization enabled without policy search.")
+             raise ValueError("hipa_num_heads must be positive if use_hipa_attention is True.")
+
+        if hasattr(self, 'audio_output_dtype_str'):
+            if self.audio_output_dtype_str == "float32":
+                self.audio_output_item_size = 4
+            elif self.audio_output_dtype_str == "int16":
+                self.audio_output_item_size = 2
+            else:
+                if hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
+                    raise ValueError(f"Unsupported audio_output_dtype_str: {self.audio_output_dtype_str} when output_audio_bytes is True.")
+                else:
+                    self.audio_output_item_size = 4
+        elif hasattr(self, 'output_audio_bytes') and self.output_audio_bytes:
+            if not hasattr(self, 'audio_output_dtype_str') or self.audio_output_dtype_str is None:
+                raise ValueError("audio_output_dtype_str must be defined in config if output_audio_bytes is True.")
+        else:
+            self.audio_output_item_size = 4
+
+        # Calculate unet_input_feature_dim if not set
+        if self.unet_input_feature_dim is None:
+            if self.max_sequence_length <= 0 or self.audio_output_item_size <= 0:
+                raise ValueError("max_sequence_length and audio_output_item_size must be positive to calculate unet_input_feature_dim.")
+            self.unet_input_feature_dim = self.max_sequence_length // self.audio_output_item_size
+            if self.unet_input_feature_dim <= 0:
+                raise ValueError(f"Calculated unet_input_feature_dim ({self.unet_input_feature_dim}) must be positive. Check max_sequence_length and audio_output_item_size.")
+        elif self.unet_input_feature_dim <= 0:
+            raise ValueError("unet_input_feature_dim, if set, must be positive.")
+
+        if self.use_jepa_training:
+            if not (0 < self.jepa_mask_ratio_min < 1 and 0 < self.jepa_mask_ratio_max < 1 and self.jepa_mask_ratio_min <= self.jepa_mask_ratio_max):
+                raise ValueError("JEPA mask ratios must be between 0 and 1, with min <= max.")
+            if not (0 < self.jepa_context_scale_min < 1 and 0 < self.jepa_context_scale_max < 1 and self.jepa_context_scale_min <= self.jepa_context_scale_max):
+                raise ValueError("JEPA context scales must be between 0 and 1, with min <= max.")
+            if not (0 <= self.jepa_momentum_beta < 1):
+                raise ValueError("jepa_momentum_beta must be between 0 and 1.")
+            if self.jepa_num_target_blocks <= 0:
+                raise ValueError("jepa_num_target_blocks must be positive.")
+            if not self.use_dynamic_entropy_patcher:
+                print("Warning: JEPA training is enabled but use_dynamic_entropy_patcher is False. JEPA relies on the patch embeddings from LearnedBytePatcherEncoder.")
+
+        # Validate quantization params
+        if self.ctm_use_qat:
+            if self.ctm_quant_min_bits >= self.ctm_quant_max_bits:
+                raise ValueError("ctm_quant_min_bits must be < ctm_quant_max_bits")
+            if self.ctm_adaptive_quantization and not self.ctm_quant_policy_search:
+                print("Warning: Adaptive quantization enabled without policy search.")
 
 class WorkingMemoryBuffer(nn.Module):
     def __init__(self, d_model, capacity=5):
@@ -391,6 +396,23 @@ class WorkingMemoryBuffer(nn.Module):
             self.buffer = torch.cat([self.buffer, item.unsqueeze(1)], dim=1)[:, -self.capacity:]
         return self.proj(self.buffer.mean(dim=1))
 
+class NeuromodulatorManager(nn.Module):
+    def __init__(self, config: EnhancedCTMConfig):
+        super().__init__()
+        self.neuromodulators = nn.ModuleDict()
+        for mod_name in config.active_neuromodulators:
+            mod_class = globals()[f"{mod_name.capitalize()}Modulator"]
+            self.neuromodulators[mod_name] = mod_class(config.neuromodulator_dim)
+        self.fusion_layer = nn.Linear(len(config.active_neuromodulators) * config.neuromodulator_dim, config.neuromodulator_dim)
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        outputs = []
+        for mod in self.neuromodulators.values():
+            outputs.append(mod(input_tensor))
+        concatenated = torch.cat(outputs, dim=-1)
+        fused = self.fusion_layer(concatenated)
+        return fused
+    
 class HRM_H_Module(nn.Module):
     """The High-Level, slow-updating recurrent module for the HR-CTM."""
     def __init__(self, config: EnhancedCTMConfig):
@@ -1215,13 +1237,6 @@ class WINAAttention(nn.Module):
             else:
                 self.selective_quantizer = None
 
-            if self.config.ctm_selective_quantization:
-                self.selective_quantizer = SelectiveQuantizer(
-                    min_bits=self.config.ctm_quant_min_bits,
-                    max_bits=self.config.ctm_quant_max_bits,
-                )
-            else:
-                self.selective_quantizer = None
 
         
     def forward(self,
@@ -1242,10 +1257,13 @@ class WINAAttention(nn.Module):
         v_weight = self.v_proj.weight
         out_weight = self.out_proj.weight
 
-        if self.selective_quantizer:
-            q_weight = self.selective_quantizer(q_weight, query_scores.mean(dim=(0,1)))
-            k_weight = self.selective_quantizer(k_weight, key_scores.mean(dim=(0,1)))
-            v_weight = self.selective_quantizer(v_weight, value_scores.mean(dim=(0,1)))
+        quantize = (self.config.quant_enabled_training and self.training) or \
+                   (self.config.quant_enabled_inference and not self.training)
+
+        if quantize and self.selective_quantizer:
+            q_weight = self.selective_quantizer(q_weight, query_scores.mean(dim=[0, 1]))
+            k_weight = self.selective_quantizer(k_weight, key_scores.mean(dim=[0, 1]))
+            v_weight = self.selective_quantizer(v_weight, value_scores.mean(dim=[0, 1]))
 
         Q = F.linear(query_sparse, q_weight)
         K = F.linear(key_sparse, k_weight)
@@ -1298,8 +1316,8 @@ class WINAAttention(nn.Module):
     
         context_sparse, context_scores = self.wina_sparsifier.apply_wina_gating(context, self.out_proj.weight, "output", f"out_proj_{id(self.out_proj.weight)}", control_input, return_scores=True)
         
-        if self.selective_quantizer:
-            out_weight = self.selective_quantizer(out_weight, context_scores.mean(dim=(0,1)))
+        if quantize and self.selective_quantizer:
+            out_weight = self.selective_quantizer(out_weight, context_scores.mean(dim=[0, 1]))
 
         output = F.linear(context_sparse, out_weight)
     
@@ -1867,9 +1885,16 @@ class OriginalCTMCore(nn.Module):
 
     """
 
-    def __init__(self, config: EnhancedCTMConfig):
+    def __init__(self, config: EnhancedCTMConfig, neuromodulator_manager: Optional[NeuromodulatorManager] = None):
         super(OriginalCTMCore, self).__init__()
         self.config = config
+        if config.enable_neuromodulators:
+            self.neuromodulators = nn.ModuleDict({
+                name: globals()[name.capitalize() + 'Modulator'](config.neuromodulator_dim)
+                for name in config.active_neuromodulators
+            })
+            num_mods = len(self.neuromodulators)
+            self.mod_fusion = nn.Linear(num_mods * config.neuromodulator_dim, config.ctm_d_model)
 
         # --- Core Parameters from Config ---
         self.iterations = config.ctm_iterations
@@ -2287,7 +2312,10 @@ class OriginalCTMCore(nn.Module):
     def forward(self, x, track=False):
         B = x.size(0)
         device = x.device
-        if self.config.ctm_use_qat and self.training:
+        quantize = (self.config.quant_enabled_training and self.training) or \
+                   (self.config.quant_enabled_inference and not self.training)
+
+        if quantize and self.config.ctm_use_qat:
             x = self.quant(x)
 
         # --- Tracking Initialization ---
@@ -2372,6 +2400,14 @@ class OriginalCTMCore(nn.Module):
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace) # (B, d_model)
 
+            # Apply Neuromodulators
+            if self.config.enable_neuromodulators and hasattr(self, 'neuromodulators'):
+                mod_outputs = [mod(activated_state) for mod in self.neuromodulators.values()]
+                if mod_outputs:
+                    concatenated_mods = torch.cat(mod_outputs, dim=-1)
+                    fused_mod = self.mod_fusion(concatenated_mods)
+                    activated_state = activated_state * fused_mod
+
             # --- Apply Internal CTM Feedback (Self-Modulation) ---
             if self.use_internal_feedback and self.internal_feedback_module is not None:
                 # The current state provides the query (thought) and key/value (context)
@@ -2404,9 +2440,7 @@ class OriginalCTMCore(nn.Module):
                 synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
 
         # --- Return Values ---
-        if self.config.ctm_use_qat and self.training:
-            predictions = self.dequant(predictions)
-        if self.config.ctm_use_qat and self.training:
+        if quantize and self.config.ctm_use_qat:
             predictions = self.dequant(predictions)
         if track:
             tracking_results = (np.array(synch_out_tracking), np.array(synch_action_tracking)), \
@@ -2585,7 +2619,7 @@ class OriginalCTMCore(nn.Module):
         # Reshape predictions and certainties to be compatible with downstream logic
         final_predictions = predictions.unsqueeze(-1)
         final_certainties = certainties.unsqueeze(-1)
-        if self.config.ctm_use_qat and self.training:
+        if quantize and self.config.ctm_use_qat:
             predictions = self.dequant(predictions)
 
         return {
@@ -2662,12 +2696,21 @@ class GoalPredictor(nn.Module):
             nn.Linear(d_model * 2, goal_dim)
         )
         self.goal_update = nn.GRU(d_model, goal_dim, batch_first=True)
+        # Integrate neuromodulators for biological-like goal prediction
+        self.neuromodulators = nn.ModuleDict({
+            'dopamine': DopamineModulator(d_model),
+            'serotonin': SerotoninModulator(d_model),
+            'norepinephrine': NorepinephrineModulator(d_model)
+        })
         
-    def forward(self, current_state: torch.Tensor, prev_goal: torch.Tensor) -> torch.Tensor:
+    def forward(self, current_state: torch.Tensor, prev_goal: torch.Tensor, reward_error: Optional[torch.Tensor] = None, uncertainty: Optional[torch.Tensor] = None, novelty: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             current_state: Current neural state [batch, seq_len, d_model]
             prev_goal: Previous goal state [batch, seq_len, goal_dim]
+            reward_error: Optional reward prediction error for dopamine
+            uncertainty: Optional uncertainty for serotonin
+            novelty: Optional novelty signal for norepinephrine
             
         Returns:
             Predicted goal state [batch, seq_len, goal_dim]
@@ -2676,6 +2719,16 @@ class GoalPredictor(nn.Module):
         context = current_state.mean(dim=1, keepdim=True).expand(-1, current_state.size(1), -1)
         goal_input = torch.cat([current_state, context], dim=-1)
         goal_pred = self.goal_net(goal_input)
+        
+        # Apply neuromodulators
+        modulation = torch.ones_like(goal_pred)
+        if reward_error is not None:
+            modulation *= self.neuromodulators['dopamine'](goal_pred, reward_error)
+        if uncertainty is not None:
+            modulation *= self.neuromodulators['serotonin'](goal_pred, uncertainty)
+        if novelty is not None:
+            modulation *= self.neuromodulators['norepinephrine'](goal_pred, novelty)
+        goal_pred = goal_pred * modulation
         
         # Update goal state using GRU
         updated_goal, _ = self.goal_update(goal_pred, prev_goal.unsqueeze(0))
@@ -2690,18 +2743,37 @@ class EmotionStateTracker(nn.Module):
         self.emotion_proj = nn.Linear(d_model, num_emotion_dim)
         self.emotion_update = nn.GRU(num_emotion_dim, num_emotion_dim, batch_first=True)
         self.amygdala = AmygdalaSimulator(num_emotion_dim)
+        # Integrate neuromodulators for biological-like emotion processing
+        self.neuromodulators = nn.ModuleDict({
+            'oxytocin': OxytocinModulator(num_emotion_dim),
+            'endorphins': EndorphinsModulator(num_emotion_dim),
+            'cortisol': CortisolModulator(num_emotion_dim)
+        })
         
-    def forward(self, neural_state: torch.Tensor, prev_emotion: torch.Tensor) -> torch.Tensor:
+    def forward(self, neural_state: torch.Tensor, prev_emotion: torch.Tensor, social_context: Optional[torch.Tensor] = None, penalty: Optional[torch.Tensor] = None, threat_level: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
             neural_state: Current neural state [batch, seq_len, d_model]
             prev_emotion: Previous emotion state [batch, seq_len, num_emotion_dim]
+            social_context: Optional social context for oxytocin
+            penalty: Optional penalty signal for endorphins
+            threat_level: Optional threat level for cortisol
             
         Returns:
             Updated emotion state [batch, seq_len, num_emotion_dim]
         """
         # Project neural state to emotion space
         current_emotion = self.emotion_proj(neural_state)
+        
+        # Apply neuromodulators
+        modulation = torch.ones_like(current_emotion)
+        if social_context is not None:
+            modulation *= self.neuromodulators['oxytocin'](current_emotion, social_context)
+        if penalty is not None:
+            modulation *= self.neuromodulators['endorphins'](current_emotion, penalty)
+        if threat_level is not None:
+            modulation *= self.neuromodulators['cortisol'](current_emotion, threat_level)
+        current_emotion = current_emotion * modulation
         
         # Update emotion state using GRU
         updated_emotion, _ = self.emotion_update(current_emotion, prev_emotion.unsqueeze(0))
@@ -2713,13 +2785,23 @@ class AmygdalaSimulator(nn.Module):
         self.intensity_proj = nn.Linear(emotion_dim, 1)
         self.response_net = nn.Linear(emotion_dim, emotion_dim)
         self.threshold = nn.Parameter(torch.tensor(0.8))
+        # Integrate neuromodulators for biological emotion regulation
+        self.serotonin = SerotoninModulator(emotion_dim)
+        self.cortisol = CortisolModulator(emotion_dim)
+        self.gaba = GABAModulator(emotion_dim)
 
     def forward(self, emotion_state):
         intensity = torch.sigmoid(self.intensity_proj(torch.abs(emotion_state).mean(dim=-1, keepdim=True)))
         response = torch.tanh(self.response_net(emotion_state)) * (intensity > self.threshold).float()
+        
+        # Apply neuromodulators based on intensity
+        uncertainty = intensity  # Use intensity as proxy for uncertainty/stress
+        emotion_state = self.serotonin(emotion_state, uncertainty)
+        emotion_state = self.cortisol(emotion_state, uncertainty)
+        emotion_state = self.gaba(emotion_state, torch.norm(emotion_state, dim=-1))
+        
         emotion_state = emotion_state + response * 0.1
         return emotion_state
-        
 class SynapticEmpathy(nn.Module):
     """
     Simulates a low-level, neuron-based form of empathy.
@@ -2774,16 +2856,25 @@ class SynapticEmpathy(nn.Module):
             nn.Linear(d_model // 2, 1),
             nn.Sigmoid()
         )
+        # Integrate neuromodulators for enhanced empathy processing
+        self.neuromodulators = nn.ModuleDict({
+            'oxytocin': OxytocinModulator(d_model),
+            'serotonin': SerotoninModulator(d_model)
+        })
 
-    def forward(self, 
-                self_state_trace: torch.Tensor, 
+    def forward(self,
+                self_state_trace: torch.Tensor,
                 observed_state_trace: torch.Tensor,
-                self_activated_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                self_activated_state: torch.Tensor,
+                social_context: Optional[torch.Tensor] = None,
+                uncertainty: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             self_state_trace: The agent's own neural activation history (B, D, M)
             observed_state_trace: The observed agent's neural history (B, D, M)
             self_activated_state: The agent's current post-activation state (B, D)
+            social_context: Optional social context for oxytocin
+            uncertainty: Optional uncertainty for serotonin
 
         Returns:
             synaptic_modulation: A modulation vector for the CTM's internal state. (B, D)
@@ -2820,6 +2911,14 @@ class SynapticEmpathy(nn.Module):
             value=observed_current_state.unsqueeze(1)
         )
         mirrored_state = mirrored_state.squeeze(1) # (B, D)
+
+        # Apply neuromodulators to mirrored_state
+        modulation = torch.ones_like(mirrored_state)
+        if social_context is not None:
+            modulation *= self.neuromodulators['oxytocin'](mirrored_state, social_context)
+        if uncertainty is not None:
+            modulation *= self.neuromodulators['serotonin'](mirrored_state, uncertainty)
+        mirrored_state = mirrored_state * modulation
 
         # 3. Generate Synaptic Modulation
         # The modulation is guided by the mirrored state and gated by resonance
@@ -2904,6 +3003,11 @@ class MirrorNeuronLayer(nn.Module):
         
         # Emotional regulation
         self.regulation_gru = nn.GRU(num_emotion_dim, num_emotion_dim, num_layers=1, batch_first=True)
+        # Integrate neuromodulators for enhanced mirror neuron processing
+        self.neuromodulators = nn.ModuleDict({
+            'oxytocin': OxytocinModulator(d_model),
+            'dopamine': DopamineModulator(d_model)
+        })
 
     def regulate_emotion(self, emotion, num_steps=2):
         h = torch.zeros(1, emotion.size(0), self.num_emotion_dim, device=emotion.device)
@@ -2913,7 +3017,9 @@ class MirrorNeuronLayer(nn.Module):
 
     def forward(self, self_state: torch.Tensor, observed_state: torch.Tensor,
                 prev_self_emotion: torch.Tensor, prev_observed_emotion: torch.Tensor,
-                prev_observed_goal: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                prev_observed_goal: torch.Tensor,
+                social_context: Optional[torch.Tensor] = None,
+                reward_error: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             self_state: Current agent's neural state [batch, seq_len, d_model]
@@ -2921,6 +3027,8 @@ class MirrorNeuronLayer(nn.Module):
             prev_self_emotion: Previous self emotion state [batch, seq_len, num_emotion_dim]
             prev_observed_emotion: Previous observed emotion [batch, seq_len, num_emotion_dim]
             prev_observed_goal: Previous observed goal [batch, seq_len, goal_dim]
+            social_context: Optional social context for oxytocin
+            reward_error: Optional reward error for dopamine
             
         Returns:
             modulated_state: Modulated neural state [batch, seq_len, d_model]
@@ -2944,6 +3052,14 @@ class MirrorNeuronLayer(nn.Module):
             value=self.emotion_projection(current_observed_emotion)
         )
         
+        # Apply neuromodulators to empathy
+        modulation = torch.ones_like(empathy)
+        if social_context is not None:
+            modulation *= self.neuromodulators['oxytocin'](empathy, social_context)
+        if reward_error is not None:
+            modulation *= self.neuromodulators['dopamine'](empathy, reward_error)
+        empathy = empathy * modulation
+        
         # Generate assistance signal based on predicted goal and emotion
         goal_emotion = torch.cat([current_observed_goal, current_observed_emotion], dim=-1)
         assistance = self.assistance_net(goal_emotion)
@@ -2964,7 +3080,7 @@ class MirrorNeuronLayer(nn.Module):
         output_state = self.layer_norm(self_state + modulated)
         
         return output_state, current_self_emotion, current_observed_goal, reward
-    
+        
     @torch.no_grad()
     def _update_jepa_target_encoder(self):
         """
@@ -3491,6 +3607,10 @@ class BasalGangliaMechanism(nn.Module):
             nn.Sigmoid()
         )
         self.reward_input_proj = nn.Linear(d_model + action_dim, d_model)
+        self.dopamine_mod = DopamineModulator(self.dopamine_dim)
+        self.serotonin_mod = SerotoninModulator(self.action_dim)
+        self.norepi_mod = NorepinephrineModulator(self.context_dim)
+        self.gaba_mod = GABAModulator(self.action_dim)
     
     def forward(self, thought_vector: torch.Tensor, context: torch.Tensor,
                 reward_signal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3524,6 +3644,20 @@ class BasalGangliaMechanism(nn.Module):
         dopamine_error = -predicted_reward # By default, the error is the negative predicted reward
         if reward_signal is not None:
             dopamine_error = reward_signal - predicted_reward
+        
+        # Apply neuromodulators as enhancements
+        activity_level = gated_thought.norm(dim=-1)
+        novelty = (thought_vector - context).norm(dim=-1)
+        uncertainty = activity_level  # Using activity as proxy for uncertainty
+        
+        predicted_reward = self.dopamine_mod(predicted_reward, dopamine_error)
+        selection_gate = self.dopamine_mod(selection_gate, dopamine_error)
+        inhibition_gate = self.serotonin_mod(inhibition_gate, uncertainty)
+        inhibition_gate = self.gaba_mod(inhibition_gate, activity_level)
+        context_gate = self.norepi_mod(context_gate, novelty)
+        
+        # Recompute net_action_gate with modulated values
+        net_action_gate = selection_gate * (1 - inhibition_gate)
         
         return net_action_gate, dopamine_error
 
@@ -3672,7 +3806,8 @@ class HRM_H_Module(nn.Module):
         self.max_recursion = config.max_recursion
         self.early_stop_threshold = config.early_stop_threshold
         self.program_feedback_proj = nn.Linear(config.d_model, config.d_model)
-        self.thought_ctm = OriginalCTMCore(config)
+        self.shared_neuromodulator_manager = NeuromodulatorManager(config)
+        self.thought_ctm = OriginalCTMCore(config, neuromodulator_manager=self.shared_neuromodulator_manager)
         self.thought_feedback_proj = nn.Linear(config.ctm_out_dims, config.d_model)
         
         # Add CTM-like components for H-module
@@ -3781,28 +3916,32 @@ class HRM_H_Module(nn.Module):
                 encoded_patches = None
                 patch_indices = None
                 entropy_aux_loss = torch.tensor(0.0, device=zH.device)
-            if self.config.ctm_adaptive_quantization and self.thought_ctm.bitwidth_adapter:
-                task_embedding = current_zH.mean(dim=0)
-                bits = self.thought_ctm.bitwidth_adapter(task_embedding)
+            quantize = (self.config.quant_enabled_training and self.training) or \
+                       (self.config.quant_enabled_inference and not self.training)
+            if quantize and self.config.ctm_adaptive_quantization and self.thought_ctm.bitwidth_adapter:
+                with torch.no_grad():
+                    task_embedding = current_zH.mean(dim=0)
+                    bits = self.thought_ctm.bitwidth_adapter(task_embedding)
                 
-                if self.config.ctm_quant_policy_search and self.thought_ctm.quant_policy_net:
-                    policy_params = self.thought_ctm.quant_policy_net(task_embedding)
-                    scale = policy_params[:, 1].mean()
-                    zero_point = policy_params[:, 2].mean()
+                if quantize and self.config.ctm_quant_policy_search and self.thought_ctm.quant_policy_net:
+                    with torch.no_grad():
+                        policy_params = self.thought_ctm.quant_policy_net(task_embedding)
+                        scale = policy_params[:, 1].mean()
+                        zero_point = policy_params[:, 2].mean()
                     q_zH, _, _ = quantize_adaptive(current_zH, bits)
                     current_zH = dequantize_adaptive(q_zH, scale, zero_point)
                 else:
                     q_zH, scale, zero_point = quantize_adaptive(current_zH, bits)
                     current_zH = dequantize_adaptive(q_zH, scale, zero_point)
-            else:
-                # Direct CTM thought vector guidance
-                ctm_predictions, ctm_certainties, ctm_sync_out = self.thought_ctm(current_zH.unsqueeze(1))
-                thought_feedback = self.thought_feedback_proj(ctm_sync_out)
-                current_zH = current_zH + thought_feedback * 0.1
-                # Set placeholders for return values
-                encoded_patches = None
-                patch_indices = None
-                entropy_aux_loss = torch.tensor(0.0, device=zH.device)
+
+            # Direct CTM thought vector guidance
+            ctm_predictions, ctm_certainties, ctm_sync_out = self.thought_ctm(current_zH.unsqueeze(1))
+            thought_feedback = self.thought_feedback_proj(ctm_sync_out)
+            current_zH = current_zH + thought_feedback * 0.1
+            # Set placeholders for return values
+            encoded_patches = None
+            patch_indices = None
+            entropy_aux_loss = torch.tensor(0.0, device=zH.device)
             
             # Early stopping check
             if prev_zH is not None:
@@ -3826,6 +3965,7 @@ class HRM_H_Module(nn.Module):
         
         # The 'program' is now the sequence of encoded patches (or None in direct mode).
         # The other outputs might be used for loss calculation or debugging.
+        current_zH = current_zH * self.shared_neuromodulator_manager(current_zH)
         return current_zH, encoded_patches, patch_indices, entropy_aux_loss, confidence
     
     def update_thresholds(self, epoch, total_epochs):
@@ -3934,8 +4074,7 @@ class HierarchicalCTM(OriginalCTMCore):
     def __init__(self, config: EnhancedCTMConfig):
         # We call nn.Module's init directly to avoid OriginalCTMCore's full init,
         # as we are building a different structure.
-        super(OriginalCTMCore, self).__init__()
-        self.config = config
+        super().__init__(config)
         self.replay_batch_size = getattr(config, 'replay_batch_size', 4)
         self.d_model = config.ctm_d_model
         self.d_input = config.ctm_input_dim
@@ -4044,8 +4183,11 @@ class HierarchicalCTM(OriginalCTMCore):
        b, s, _ = x.shape
        device = x.device
        self.consciousness_controller.wake_up(0)
-    
-       if self.training and self.config.ctm_use_qat:
+   
+       quantize = (self.config.quant_enabled_training and self.training) or \
+                  (self.config.quant_enabled_inference and not self.training)
+
+       if quantize and self.config.ctm_use_qat:
            x = self.quant(x)
     
        # 1. Project input
@@ -4095,8 +4237,15 @@ class HierarchicalCTM(OriginalCTMCore):
                    activated_zL, zL_trace, zH, x_context, sync_action, confidence_level=confidence_level
                )
                
+               # Apply Neuromodulators to activated_zL
+               if self.config.enable_neuromodulators:
+                   mod_outputs = [mod(activated_zL) for mod in self.neuromodulators.values()]
+                   concatenated_mods = torch.cat(mod_outputs, dim=-1)
+                   fused_mod = self.mod_fusion(concatenated_mods)
+                   activated_zL = activated_zL * fused_mod
+               
                activated_zL = self.working_memory.update(activated_zL)
-    
+   
                # Early stopping if change is small
                
                delta = torch.norm(activated_zL - prev_zL)
@@ -4122,24 +4271,34 @@ class HierarchicalCTM(OriginalCTMCore):
            fused_input = self.fusion_proj(attn_out.mean(dim=1))
            
            zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance, confidence_level=confidence_level)
+           
+           # Apply Neuromodulators to zH
+           if self.config.enable_neuromodulators:
+               mod_outputs = [mod(zH) for mod in self.neuromodulators.values()]
+               concatenated_mods = torch.cat(mod_outputs, dim=-1)
+               fused_mod = self.mod_fusion(concatenated_mods)
+               zH = zH * fused_mod
+           
            modulation = self.consciousness_controller.get_attention_modulation()
            zH = zH * modulation
-    
-           if self.config.ctm_adaptive_quantization and self.bitwidth_adapter:
-               task_embedding = zH.mean(dim=0)
-               bits = self.bitwidth_adapter(task_embedding)
+   
+           if quantize and self.config.ctm_adaptive_quantization and self.bitwidth_adapter:
+               with torch.no_grad():
+                   task_embedding = zH.mean(dim=1)  # Per-sample mean
+                   bits = self.bitwidth_adapter(task_embedding)
                
                if self.config.ctm_quant_policy_search and self.quant_policy_net:
-                   policy_params = self.quant_policy_net(task_embedding)
-                   # For simplicity, we'll use the average params for the whole tensor
-                   scale = policy_params[:, 1].mean()
-                   zero_point = policy_params[:, 2].mean()
+                   with torch.no_grad():
+                       policy_params = self.quant_policy_net(task_embedding)
+                       # For simplicity, we'll use the average params for the whole tensor
+                       scale = policy_params[:, :, 1].mean()
+                       zero_point = policy_params[:, :, 2].mean().round().int()
                    q_zH, _, _ = quantize_adaptive(zH, bits)
                    zH = dequantize_adaptive(q_zH, scale, zero_point)
                else:
                    q_zH, scale, zero_point = quantize_adaptive(zH, bits)
                    zH = dequantize_adaptive(q_zH, scale, zero_point)
-               if self.training and self.config.ctm_use_qat:
+               if self.config.ctm_use_qat:
                    zH = self.dequant(zH)
            
            # Apply Synaptic Empathy
@@ -4432,166 +4591,4 @@ class ProgramSynthesizer(nn.Module):
         
         return encoded_patches, patch_indices, entropy_aux_loss
 
-def quantize_adaptive(tensor, bits):
-    """Dynamically quantizes a tensor to a given bitwidth."""
-    q_min = -(2**(bits - 1))
-    q_max = 2**(bits - 1) - 1
-    scale = (tensor.max() - tensor.min()) / (q_max - q_min)
-    zero_point = q_min - tensor.min() / scale
-    q_tensor = torch.quantize_per_tensor(tensor, scale, zero_point.round().int(), torch.quint8)
-    return q_tensor, scale, zero_point
-
-def dequantize_adaptive(q_tensor, scale, zero_point):
-    """Dequantizes a tensor using its scale and zero-point."""
-    return q_tensor.dequantize()
-
-class BitwidthAdapter(nn.Module):
-    def __init__(self, d_model, min_bits=4, max_bits=8):
-        super().__init__()
-        self.bitwidth_predictor = nn.Linear(d_model, 1)
-        self.min_bits = min_bits
-        self.max_bits = max_bits
-
-    def forward(self, task_embedding):
-        bitwidth_logit = self.bitwidth_predictor(task_embedding)
-        bitwidth = self.min_bits + (self.max_bits - self.min_bits) * torch.sigmoid(bitwidth_logit)
-        return bitwidth.round().int()
-
-class QuantizationPolicyNetwork(nn.Module):
-    def __init__(self, input_dim, num_components=10):
-        super().__init__()
-        self.policy_net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_components * 3)  # bitwidth, scale, zero_point per component
-        )
-        self.num_components = num_components
-
-    def forward(self, task_embedding):
-        params = self.policy_net(task_embedding)
-        return params.view(-1, self.num_components, 3)  # (batch, components, [bitwidth, scale, zero_point])
-
-def load_quantized_state(self, quantized_state_dict):
-    """
-    Load pre-quantized state dict while preparing for meta-learning.
-    """
-    # Load the quantized weights
-    self.load_state_dict(quantized_state_dict, strict=False)
     
-    # Prepare for dequantization during adaptation
-    self.quantized = True
-    print("Loaded quantized model. Use dequantize_for_adaptation() for meta-learning tasks.")
-
-def dequantize_for_adaptation(self):
-    """
-    Temporarily dequantize the model for meta-learning adaptation.
-    """
-    if hasattr(self, 'quantized') and self.quantized:
-        # Convert parameters to float32 for full precision adaptation
-        for param in self.parameters():
-            param.data = param.data.float()
-        self.quantized = False
-        print("Model dequantized for adaptation.")
-    else:
-        print("Model is already in full precision.")
-
-def quantize_after_adaptation(self, task_embedding=None):
-    """
-    Re-quantize the model after adaptation, optionally using adaptive bitwidth and policy.
-    """
-    if not hasattr(self, 'quantized') or not self.quantized:
-        if task_embedding is not None:
-            # Use BitwidthAdapter for dynamic bitwidth
-            bitwidth = self.bitwidth_adapter(task_embedding)
-            
-            # Use QuantizationPolicyNetwork for per-component params
-            quant_params = self.quant_policy_net(task_embedding)
-            
-            # Apply dynamic quantization with custom params
-            # Note: This is a placeholder; actual implementation would use these params
-            # For example, custom quantize_dynamic with per-component bitwidth/scale/zero_point
-            print(f"Applying adaptive quantization with bitwidth {bitwidth} and custom params")
-        else:
-            # Default post-training quantization
-            self.qconfig = quant.get_default_qconfig('fbgemm')
-            quantized_model = quant.quantize_dynamic(self, {nn.Linear}, dtype=torch.qint8)
-            self.load_state_dict(quantized_model.state_dict())
-        
-        self.quantized = True
-        print("Model re-quantized after adaptation.")
-    else:
-        print("Model is already quantized.")
-
-class SelectiveQuantizer(nn.Module):
-    """Enhanced selective quantizer with variable bitwidth and adaptive threshold."""
-    def __init__(self, min_bits=2, max_bits=8, num_bins=3):
-        super().__init__()
-        self.min_bits = min_bits
-        self.max_bits = max_bits
-        self.num_bins = num_bins  # Number of quantization levels
-
-    def forward(self, weight, scores):
-        """
-        Apply enhanced selective quantization with variable bitwidth.
-        
-        Args:
-            weight (torch.Tensor): Weight tensor [out_features, in_features]
-            scores (torch.Tensor): Importance scores [in_features]
-            
-        Returns:
-            torch.Tensor: Selectively quantized weights
-        """
-        # Adaptive threshold: use median for robustness
-        adaptive_threshold = torch.median(scores)
-        
-        # Sort scores and create bins
-        sorted_scores, indices = torch.sort(scores)
-        bin_size = len(sorted_scores) // self.num_bins
-        bin_thresholds = [sorted_scores[i * bin_size] for i in range(1, self.num_bins)]
-        
-        # Assign bitwidths: higher scores get more bits
-        bitwidths = torch.linspace(self.min_bits, self.max_bits, self.num_bins + 1).int()
-        
-        # Create per-column bitwidth assignment
-        column_bits = torch.zeros_like(scores, dtype=torch.int)
-        for i in range(self.num_bins):
-            if i == 0:
-                mask = scores <= bin_thresholds[0]
-            elif i == self.num_bins - 1:
-                mask = scores > bin_thresholds[-1]
-            else:
-                mask = (scores > bin_thresholds[i-1]) & (scores <= bin_thresholds[i])
-            column_bits[mask] = bitwidths[i]
-        
-        # Group-wise quantization per column
-        new_weight = weight.clone()
-        for col in range(weight.shape[1]):
-            col_weight = weight[:, col:col+1]  # Keep as 2D for consistency
-            bits = column_bits[col]
-            
-            if bits == self.max_bits:  # Skip quantization for most important
-                continue
-                
-            q_min = -(2**(bits - 1))
-            q_max = 2**(bits - 1) - 1
-            
-            col_min = col_weight.min()
-            col_max = col_weight.max()
-            scale = (col_max - col_min) / (q_max - q_min)
-            scale = scale.clamp(min=1e-8)  # Prevent zero scale
-            
-            zero_point = q_min - (col_min / scale).round()
-            zero_point = zero_point.clamp(q_min, q_max)
-            
-            # Quantize
-            q_col = torch.round((col_weight / scale) + zero_point)
-            q_col = q_col.clamp(q_min, q_max)
-            
-            # Dequantize
-            deq_col = (q_col - zero_point) * scale
-            
-            new_weight[:, col:col+1] = deq_col
-        
-        return new_weight

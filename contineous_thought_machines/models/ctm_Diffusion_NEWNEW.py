@@ -133,6 +133,18 @@ from .realtime_voice_module import RealtimeVoiceStreamer
 from .modules import SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding
 from .utils import compute_normalized_entropy
 from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
+from .neuromodulators import (
+    BaseNeuromodulator,
+    DopamineModulator,
+    SerotoninModulator,
+    OxytocinModulator,
+    NorepinephrineModulator,
+    AcetylcholineModulator,
+    EndorphinsModulator,
+    CortisolModulator,
+    GABAModulator,
+    GlutamateModulator
+)
 # except ImportError:
 #     print("Warning: Could not import original CTM modules (e.g. from .modules). Using fallback implementations.")
 #     SynapseUNET = None
@@ -1173,6 +1185,24 @@ class CTMControlledDiffusionProcessor(nn.Module):
             )
         else:
             self.ctm_feedback_module = None
+
+        # Neuromodulator Initialization
+        modulator_classes = {
+            'dopamine': DopamineModulator,
+            'serotonin': SerotoninModulator,
+            'oxytocin': OxytocinModulator,
+            'norepinephrine': NorepinephrineModulator,
+            'acetylcholine': AcetylcholineModulator,
+            'endorphins': EndorphinsModulator,
+            'cortisol': CortisolModulator,
+            'gaba': GABAModulator,
+            'glutamate': GlutamateModulator
+        }
+        self.neuromodulators = nn.ModuleDict()
+        if config.enable_neuromodulators:
+            for mod_name in config.active_neuromodulators:
+                if mod_name in modulator_classes:
+                    self.neuromodulators[mod_name] = modulator_classes[mod_name](config.neuromodulator_dim)
     
     def forward(self, noisy_input: torch.Tensor, timestep: torch.Tensor,
                 ctm_data: Optional[Dict[str, torch.Tensor]] = None,
@@ -1313,6 +1343,14 @@ class CTMControlledDiffusionProcessor(nn.Module):
                 delta = torch.norm(current_noise - prev_noise, dim=-1).mean()
                 deltas.append(delta)
                 prev_noise = current_noise.clone()
+
+                # Apply Neuromodulators
+                if self.config.enable_neuromodulators:
+                    modulation = torch.ones_like(current_noise)
+                    for name, mod in self.neuromodulators.items():
+                        mod_input = current_noise  # Using current noise as input
+                        modulation = modulation * mod(mod_input)
+                    current_noise = current_noise * modulation
             
             # Final certainty-based scaling
             if deltas:
