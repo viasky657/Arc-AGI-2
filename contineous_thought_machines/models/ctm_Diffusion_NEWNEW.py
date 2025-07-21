@@ -1203,10 +1203,15 @@ class CTMControlledDiffusionProcessor(nn.Module):
             for mod_name in config.active_neuromodulators:
                 if mod_name in modulator_classes:
                     self.neuromodulators[mod_name] = modulator_classes[mod_name](config.neuromodulator_dim)
-    
+        self.confidence_thresholds = {
+        'critical': 0.99,
+        'medium': 0.8,
+        'low': 0.5
+        }
+
     def forward(self, noisy_input: torch.Tensor, timestep: torch.Tensor,
                 ctm_data: Optional[Dict[str, torch.Tensor]] = None,
-                hipa_control_signal: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]: # Added hipa_control_signal, updated return type
+                hipa_control_signal: Optional[torch.Tensor] = None, confidence_level: str = 'medium') -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]: # Added hipa_control_signal, updated return type
         self.forward = torch.compile(self.forward)
         """
         Predict noise with DEEP CTM control and influence.
@@ -1841,11 +1846,10 @@ class CTMControlledDiffusionProcessor(nn.Module):
 
     def denoise_one_step(self, x_t: torch.Tensor, timestep: torch.Tensor,
                          ctm_data: Optional[Dict[str, torch.Tensor]] = None,
-                         inferred_task_latent: Optional[torch.Tensor] = None,
                          hipa_control_signal: Optional[torch.Tensor] = None,
                          eta: float = 0.0, # For DDIM
-                         generator: Optional[torch.Generator] = None # For stochasticity if needed by scheduler
-                         ) -> torch.Tensor:
+                         generator: Optional[torch.Generator] = None, # For stochasticity if needed by scheduler
+                         confidence_level: str = 'medium') -> torch.Tensor:
         """
         Performs one step of denoising using the diffusion model, conditioned by CTM.
         This encapsulates calling the model's forward pass and then using the scheduler.
@@ -1872,8 +1876,8 @@ class CTMControlledDiffusionProcessor(nn.Module):
             noisy_input=x_t,
             timestep=timestep, # Pass the potentially batched timestep tensor
             ctm_data=ctm_data,
-            inferred_task_latent=inferred_task_latent,
-            hipa_control_signal=hipa_control_signal
+            hipa_control_signal=hipa_control_signal,
+            confidence_level=confidence_level
         )
         
         # The forward method returns a tuple: (prediction, ctm_guidance_info)
@@ -2409,7 +2413,8 @@ class EnhancedCTMDiffusion(nn.Module):
     
     def forward_with_pipeline_optimization(self, byte_sequence: torch.Tensor, task_name: str,
                                          target_diffusion_output: Optional[torch.Tensor] = None,
-                                         timestep: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                                         timestep: Optional[torch.Tensor] = None,
+                                         confidence_level: str = 'medium') -> Dict[str, torch.Tensor]:
         """Forward pass using pipeline parallelism optimization."""
         if self.pipeline_processor and self.config.enable_pipeline_parallelism:
             # Prepare inputs for pipeline processing
@@ -2439,8 +2444,9 @@ class EnhancedCTMDiffusion(nn.Module):
             }
         else:
             # Fallback to standard forward pass
-            return self.forward(byte_sequence, task_name, target_diffusion_output,
-                              'ctm_controlled_diffusion', timestep)
+            return self.forward(byte_sequence, target_diffusion_output=target_diffusion_output,
+                                mode='ctm_controlled_diffusion', timestep=timestep,
+                                task_name=task_name, confidence_level=confidence_level)
     
     def _prepare_input_features(self, byte_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -2640,7 +2646,8 @@ class EnhancedCTMDiffusion(nn.Module):
                 mode: str = 'ctm_controlled_diffusion', timestep: Optional[torch.Tensor] = None,
                 current_epoch: int = 0,
                 current_batch: int = 0, task_name: Optional[str] = None,
-                observed_byte_sequence: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                observed_byte_sequence: Optional[torch.Tensor] = None,
+                confidence_level: str = 'medium') -> Dict[str, torch.Tensor]:
         
         """
         Forward pass of the CTMDiffusionModel using byte sequences.
@@ -2888,7 +2895,6 @@ class EnhancedCTMDiffusion(nn.Module):
 
         # Convert final output back to bytes if needed
         if mode in ['ctm_controlled_diffusion', 'diffusion_only']:
-            # PARALLEL PATCH GENERATION MODIFICATION
             # Output is already in flattened form, convert directly
             if final_output.dtype != torch.uint8:
                 final_output = (final_output * 0.5 + 0.5) * 255.0
@@ -2916,6 +2922,11 @@ class EnhancedCTMDiffusion(nn.Module):
                 # It needs the noisy input, timestep, and CTM conditioning data.
                 # kv_features_for_ctm was prepared earlier from byte_sequence.
                 ctm_data_for_diffusion_conditioning = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
+                
+                high_end_chunk_summary = ctm_data_for_diffusion_conditioning.get('high_end_chunk_summary')
+                if high_end_chunk_summary is not None:
+                     ctm_data_for_diffusion_conditioning['final_sync_out'] = ctm_data_for_diffusion_conditioning['final_sync_out'] + high_end_chunk_summary
+
 
                 # Get the prediction from the diffusion processor
                 # The diffusion processor's forward method is CTMControlledDiffusionProcessor.forward
@@ -2923,7 +2934,8 @@ class EnhancedCTMDiffusion(nn.Module):
                     noisy_input=noisy_input_for_diffusion_processor,
                     timestep=timestep,
                     ctm_data=ctm_data_for_diffusion_conditioning,
-                    hipa_control_signal=hipa_control_signal # Pass HIPA signal
+                    hipa_control_signal=hipa_control_signal, # Pass HIPA signal
+                    confidence_level=confidence_level
                 )
 
                 if isinstance(prediction_output_tuple, tuple): # If it returns (prediction, guidance_info)
@@ -3140,7 +3152,8 @@ class EnhancedCTMDiffusion(nn.Module):
                 noisy_input=diffusion_input_arg, # Corrected argument name
                 timestep=effective_timestep,
                 ctm_data=guidance_data_for_diffusion,
-                hipa_control_signal=hipa_control_signal # Pass the signal
+                hipa_control_signal=hipa_control_signal, # Pass the signal
+                confidence_level=confidence_level
             )
             if isinstance(diffusion_call_output, tuple): # Assuming (prediction, guidance_info)
                 noise_pred_or_x0 = diffusion_call_output[0]
@@ -3162,7 +3175,8 @@ class EnhancedCTMDiffusion(nn.Module):
                 noisy_input=kv_features_for_ctm, # This is the initial x_t (e.g. noise)
                 timestep=timestep,
                 ctm_data=simplified_ctm_data_for_diffusion_only,
-                hipa_control_signal=hipa_control_signal # Pass the signal
+                hipa_control_signal=hipa_control_signal, # Pass the signal
+                confidence_level=confidence_level
             )
             if isinstance(diffusion_call_output, tuple):
                 noise_pred_or_x0 = diffusion_call_output[0]
@@ -3206,6 +3220,13 @@ class EnhancedCTMDiffusion(nn.Module):
             dopamine_loss = output_dict['ctm_core_data'].get('dopamine_loss', torch.tensor(0.0, device=device))
             output_dict['dopamine_loss'] = dopamine_loss
             current_total_loss += dopamine_loss * 0.1 # Add with some weight
+
+        # --- Inverse Reasoning Loss ---
+        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'inverse_reasoning_loss' in output_dict['ctm_core_data']:
+            inverse_loss = output_dict['ctm_core_data']['inverse_reasoning_loss']
+            if torch.is_tensor(inverse_loss) and not torch.isnan(inverse_loss) and not torch.isinf(inverse_loss):
+                output_dict['inverse_reasoning_loss'] = inverse_loss
+                current_total_loss += inverse_loss
 
         if self.training and 'diffusion_output' in output_dict and output_dict['diffusion_output'] is not None and 'final_sync_out' in ctm_data:
             ctm_proj = self.ctm_contrastive_proj(ctm_data['final_sync_out'])
@@ -3341,10 +3362,10 @@ class EnhancedCTMDiffusion(nn.Module):
                 x_t=x,
                 timestep=current_timestep_batched,
                 ctm_data=ctm_data_guidance, # Dynamic CTM output based on current x
-                inferred_task_latent=overall_inferred_latent_for_guidance, # Static from initial condition (if any)
                 hipa_control_signal=overall_hipa_signal_for_guidance,     # Static from initial condition (if any)
                 eta=eta,
-                generator=generator
+                generator=generator,
+                confidence_level='medium'
             )
                 
             # External feedback: Feed diffusion output back to CTM
@@ -3381,7 +3402,7 @@ class EnhancedCTMDiffusion(nn.Module):
         noisy_x = self.diffusion.add_noise(x_start, noise, timesteps)
         
         # Predict noise with CTM control
-        predicted_noise, ctm_data = self.forward(noisy_x, timesteps, task_id, mode='ctm_controlled_diffusion')
+        predicted_noise, ctm_data = self.forward(noisy_x, timesteps, task_id, mode='ctm_controlled_diffusion', confidence_level='medium')
         
         # Main diffusion loss
         diffusion_loss = nn.functional.mse_loss(predicted_noise, noise)

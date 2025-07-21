@@ -25,7 +25,8 @@ try:
         ctm_quant_max_bits=8,
         ctm_quant_policy_search=True,
         ctm_selective_quantization=True,
-        output_audio_bytes=True
+        output_audio_bytes=True,
+        enable_inverse_reasoning=True
     )
     
     print("✅ Configuration created successfully!")
@@ -36,13 +37,14 @@ try:
     print(f"   Policy search: {config.ctm_quant_policy_search}")
     print(f"   Selective quantization: {config.ctm_selective_quantization}")
     print(f"   Output audio bytes: {config.output_audio_bytes}")
+    print(f"   Inverse reasoning enabled: {config.enable_inverse_reasoning}")
     
     # Test that all required attributes exist
     required_attrs = [
         'd_model', 'n_heads', 'n_layers', 'max_sequence_length',
         'ctm_use_qat', 'ctm_adaptive_quantization', 'ctm_quant_min_bits',
         'ctm_quant_max_bits', 'ctm_quant_policy_search', 'ctm_selective_quantization',
-        'output_audio_bytes', 'inferred_task_latent_dim'
+        'output_audio_bytes', 'inferred_task_latent_dim', 'enable_inverse_reasoning'
     ]
     
     missing_attrs = []

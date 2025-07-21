@@ -5,24 +5,7 @@ import math
 from typing import Tuple
 from torch.quantization import FakeQuantize
 
-def quantize_adaptive(tensor, bits):
-    """Dynamically quantizes a tensor to a given bitwidth."""
-    if bits <= 0:
-        raise ValueError("bits must be positive")
-    q_min = -(1 << (bits - 1))
-    q_max = (1 << (bits - 1)) - 1
-    min_val, max_val = tensor.min(), tensor.max()
-    scale = (max_val - min_val) / (q_max - q_min)
-    if scale.abs() < 1e-6:
-        scale = 1e-6
-    zero_point = q_min - (min_val / scale)
-    zero_point = torch.clamp(zero_point.round(), q_min, q_max).int()
-    q_tensor = torch.quantize_per_tensor(tensor, scale, zero_point, torch.qint8)
-    return q_tensor, scale, zero_point
 
-def dequantize_adaptive(q_tensor, scale, zero_point):
-    """Dequantizes a tensor using its scale and zero-point."""
-    return q_tensor.dequantize()
 
 class BitwidthAdapter(nn.Module):
     def __init__(self, d_model, min_bits=4, max_bits=8):
@@ -52,66 +35,6 @@ class QuantizationPolicyNetwork(nn.Module):
         params = self.policy_net(task_embedding)
         return params.view(-1, self.num_components, 3)  # (batch, components, [bitwidth, scale, zero_point])
 
-def load_quantized_state(self, quantized_state_dict):
-    """
-    Load pre-quantized state dict while preparing for meta-learning.
-    """
-    # Load the quantized weights
-    self.load_state_dict(quantized_state_dict, strict=False)
-    
-    # Prepare for dequantization during adaptation
-    self.quantized = True
-    print("Loaded quantized model. Use dequantize_for_adaptation() for meta-learning tasks.")
-
-def dequantize_for_adaptation(self):
-    """
-    Temporarily dequantize the model for meta-learning adaptation.
-    """
-    if hasattr(self, 'quantized') and self.quantized:
-        # Convert parameters to float32 for full precision adaptation
-        for param in self.parameters():
-            param.data = param.data.float()
-        self.quantized = False
-        print("Model dequantized for adaptation.")
-    else:
-        print("Model is already in full precision.")
-
-def quantize_after_adaptation(self, task_embedding=None):
-    """
-    Re-quantize the model after adaptation, optionally using adaptive bitwidth and policy.
-    """
-    if not hasattr(self, 'quantized') or not self.quantized:
-        if task_embedding is not None and hasattr(self, 'bitwidth_adapter'):
-            # Use BitwidthAdapter for dynamic bitwidth
-            bitwidth = self.bitwidth_adapter(task_embedding)
-            
-            # Use QuantizationPolicyNetwork for per-component params
-            if hasattr(self, 'quant_policy_net') and self.quant_policy_net:
-                quant_params = self.quant_policy_net(task_embedding)
-                # Note: This is a placeholder for a more sophisticated policy application
-                scale = quant_params[:, :, 1].mean()
-                zero_point = quant_params[:, :, 2].mean().round().int()
-            else:
-                scale, zero_point = 1.0, 0
-            
-            print(f"Applying adaptive quantization with bitwidth {bitwidth.item()} and custom params")
-            quantized_model = self
-            for name, mod in quantized_model.named_modules():
-                if isinstance(mod, nn.Linear):
-                    q_weight, _, _ = quantize_adaptive(mod.weight.data, bitwidth)
-                    mod.weight.data = dequantize_adaptive(q_weight, scale, zero_point)
-        else:
-            # Default post-training quantization
-            quantized_model = torch.quantization.quantize_dynamic(
-                self, {nn.Linear}, dtype=torch.qint8
-            )
-        
-        self.load_state_dict(quantized_model.state_dict())
-        self.quantized = True
-        print("Model re-quantized after adaptation.")
-    else:
-        print("Model is already quantized.")
-
 class SelectiveQuantizer(nn.Module):
     """Enhanced selective quantizer with variable bitwidth and adaptive threshold."""
     def __init__(self, min_bits=2, max_bits=8, num_bins=3):
@@ -121,53 +44,53 @@ class SelectiveQuantizer(nn.Module):
         self.num_bins = num_bins  # Number of quantization levels
 
     def forward(self, weight, scores):
-        """
-        Apply enhanced selective quantization with variable bitwidth using quantize_adaptive.
-        
-        Args:
-            weight (torch.Tensor): Weight tensor [out_features, in_features]
-            scores (torch.Tensor): Importance scores [in_features]
+            """
+            Apply enhanced selective quantization with variable bitwidth using quantize_adaptive.
             
-        Returns:
-            torch.Tensor: Selectively quantized weights
-        """
-        # Adaptive threshold: use median for robustness
-        adaptive_threshold = torch.median(scores)
-        
-        # Sort scores and create bins
-        sorted_scores, indices = torch.sort(scores)
-        bin_size = len(sorted_scores) // self.num_bins
-        bin_thresholds = [sorted_scores[i * bin_size] for i in range(1, self.num_bins)]
-        
-        # Assign bitwidths: higher scores get more bits
-        bitwidths = torch.linspace(self.min_bits, self.max_bits, self.num_bins + 1).int()
-        
-        # Create per-column bitwidth assignment
-        column_bits = torch.zeros_like(scores, dtype=torch.int)
-        for i in range(self.num_bins):
-            if i == 0:
-                mask = scores <= bin_thresholds[0]
-            elif i == self.num_bins - 1:
-                mask = scores > bin_thresholds[-1]
-            else:
-                mask = (scores > bin_thresholds[i-1]) & (scores <= bin_thresholds[i])
-            column_bits[mask] = bitwidths[i]
-        
-        # Group-wise quantization per column using quantize_adaptive
-        new_weight = weight.clone()
-        for col in range(weight.shape[1]):
-            col_weight = weight[:, col]  # 1D tensor
-            bits = column_bits[col]
-            
-            if bits == self.max_bits:  # Skip quantization for most important
-                continue
+            Args:
+                weight (torch.Tensor): Weight tensor [out_features, in_features]
+                scores (torch.Tensor): Importance scores [in_features]
                 
-            q_col, scale, zero_point = quantize_adaptive(col_weight, bits)
-            deq_col = dequantize_adaptive(q_col, scale, zero_point)
+            Returns:
+                torch.Tensor: Selectively quantized weights
+            """
+            # Adaptive threshold: use median for robustness
+            adaptive_threshold = torch.median(scores)
             
-            new_weight[:, col] = deq_col
-        
-        return new_weight
+            # Sort scores and create bins
+            sorted_scores, indices = torch.sort(scores)
+            bin_size = len(sorted_scores) // self.num_bins
+            bin_thresholds = [sorted_scores[i * bin_size] for i in range(1, self.num_bins)]
+            
+            # Assign bitwidths: higher scores get more bits
+            bitwidths = torch.linspace(self.min_bits, self.max_bits, self.num_bins + 1).int()
+            
+            # Create per-column bitwidth assignment
+            column_bits = torch.zeros_like(scores, dtype=torch.int)
+            for i in range(self.num_bins):
+                if i == 0:
+                    mask = scores <= bin_thresholds[0]
+                elif i == self.num_bins - 1:
+                    mask = scores > bin_thresholds[-1]
+                else:
+                    mask = (scores > bin_thresholds[i-1]) & (scores <= bin_thresholds[i])
+                column_bits[mask] = bitwidths[i]
+            
+            # Group-wise quantization per column using quantize_adaptive
+            new_weight = weight.clone()
+            for col in range(weight.shape[1]):
+                col_weight = weight[:, col]  # 1D tensor
+                bits = column_bits[col]
+                
+                if bits == self.max_bits:  # Skip quantization for most important
+                    continue
+                    
+                q_col, scale, zero_point = self.quantize_adaptive(col_weight, bits)
+                deq_col = self.dequantize_adaptive(q_col, scale, zero_point)
+                
+                new_weight[:, col] = deq_col
+            
+            return new_weight
 
 def ssd(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, x: torch.Tensor, chunk_size: int, initial_h: torch.Tensor = None, confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, seq_len, p = x.shape
@@ -290,7 +213,7 @@ class Mamba2Block(nn.Module):
             self.quant_policy_net = None
 
         if self.config and getattr(self.config, 'ctm_selective_quantization', False):
-            self.selective_quantizer = SelectiveQuantizer(self.config.ctm_quant_min_bits, self.config.ctm_quant_max_bits)
+            self.selective_quantizer = SelectiveQuantizer(self.config.ctm_quant_min_bits, self.config.ctm_quant_max_bits, parent=self)
         else:
             self.selective_quantizer = None
 
@@ -338,9 +261,9 @@ class Mamba2Block(nn.Module):
         x_flat = input_x.reshape(new_b, l, self.d_head)
     
         if self.training:
-            y_flat, final_h_flat, confidence = ssd(a_flat, B_flat, C_flat, x_flat, self.chunk_size, initial_h=hidden_state_flat, confidence_level=confidence_level)
+            y_flat, final_h_flat, confidence = self.ssd(a_flat, B_flat, C_flat, x_flat, self.chunk_size, initial_h=hidden_state_flat, confidence_level=confidence_level)
         else:
-            y_flat, final_h_flat, confidence = recurrent_ssd(a_flat, B_flat, C_flat, x_flat, initial_h=hidden_state_flat, confidence_level=confidence_level)
+            y_flat, final_h_flat, confidence = self.recurrent_ssd(a_flat, B_flat, C_flat, x_flat, initial_h=hidden_state_flat, confidence_level=confidence_level)
     
         y = y_flat.view(b, l, self.n_heads, self.d_head)
         y = y.reshape(b, l, self.d_inner)
@@ -379,8 +302,8 @@ class Mamba2Block(nn.Module):
                 else:
                     scale, zero_point = 1.0, 0.0  # Defaults
                 
-                q_x, _, _ = quantize_adaptive(x, bits)
-                x = dequantize_adaptive(q_x, scale, zero_point)
+                q_x, _, _ = self.quantize_adaptive(x, bits)
+                x = self.dequantize_adaptive(q_x, scale, zero_point)
             
             if self.config.ctm_use_qat:
                 output = self.dequant(output)

@@ -282,8 +282,31 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     max_recursion: int = 3
     early_stop_threshold: float = 1e-3
     
-# --- Confidence Thresholding Parameters ---
+
+    # Dynamic Chunking Parameters
+    use_dynamic_chunking: bool = True
+    chunk_size: int = 256
+    dc_routing_model_type: str = 'mlp' # or 'attention'
+    dc_smoothing_sigma: float = 1.0
+    dc_target_compression_ratio: float = 4.0 # Target bytes per chunk
+    dc_ratio_loss_weight: float = 0.1
+
+    # H-Net Parameters
+    use_h_net_core: bool = True
+    hnet_encoder_stages: int = 3
+    hnet_main_stages: int = 4
+    hnet_decoder_stages: int = 3
+    hnet_ssm_type: str = 'mamba2' # or 's4'
+    hnet_transformer_type: str = 'wina' # or 'standard'
+    hnet_use_signal_propagation: bool = True
+    # --- Confidence Thresholding Parameters ---
     confidence_threshold: float = 0.0 # Confidence threshold for abstaining. If > 0, model can abstain.
+    
+    # --- Inverse Reasoning (SAGE-nano inspired) Parameters ---
+    enable_inverse_reasoning: bool = True
+    inverse_reasoning_attempts: int = 1 # Set to 1 for check without refinement loop
+    inverse_reasoning_threshold: float = 0.5 # Cosine similarity threshold
+    inverse_reasoning_loss_weight: float = 0.1
 
     def __post_init__(self):
         # Validate output dimensions
@@ -382,6 +405,26 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
             if self.ctm_adaptive_quantization and not self.ctm_quant_policy_search:
                 print("Warning: Adaptive quantization enabled without policy search.")
 
+        # Validate dynamic chunking params
+        if self.use_dynamic_chunking:
+            if self.dc_routing_model_type not in ['mlp', 'attention']:
+                raise ValueError("dc_routing_model_type must be 'mlp' or 'attention'")
+            if self.dc_smoothing_sigma < 0:
+                raise ValueError("dc_smoothing_sigma must be non-negative")
+            if self.dc_target_compression_ratio <= 1:
+                raise ValueError("dc_target_compression_ratio should be >1 for compression")
+            if self.dc_ratio_loss_weight < 0:
+                raise ValueError("dc_ratio_loss_weight must be non-negative")
+
+        # Validate H-Net params
+        if self.use_h_net_core:
+            if self.hnet_encoder_stages < 1 or self.hnet_main_stages < 1 or self.hnet_decoder_stages < 1:
+                raise ValueError("H-Net stages must be at least 1")
+            if self.hnet_ssm_type not in ['mamba2', 's4']:
+                raise ValueError("hnet_ssm_type must be 'mamba2' or 's4'")
+            if self.hnet_transformer_type not in ['wina', 'standard']:
+                raise ValueError("hnet_transformer_type must be 'wina' or 'standard'")
+
 class WorkingMemoryBuffer(nn.Module):
     def __init__(self, d_model, capacity=5):
         super().__init__()
@@ -423,8 +466,8 @@ class HRM_H_Module(nn.Module):
         self.initial_epochs = 5  # Epochs before ramp-up starts
         self.current_epoch = 0
         # This module integrates the result from the L-module (zL) into its own state (zH).
-        self.mamba = Mamba2Block(d_model=config.d_model)
-        self.sparse_attn = WINAAttention(d_model=config.d_model, n_heads=config.n_heads, dropout=config.dropout)
+        self.mamba = Mamba2Block(d_model=config.d_model, config=config)
+        self.sparse_attn = WINAAttention(d_model=config.d_model, n_heads=config.n_heads, config=config, dropout=config.dropout)
         self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
         self.planning_mlp = nn.Sequential(
@@ -488,7 +531,7 @@ class HRM_H_Module(nn.Module):
         for level in self.confidence_thresholds:
             self.confidence_thresholds[level] = factor * self.base_thresholds[level]
 
-    def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor, thought_guidance: bool = True, confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor, thought_guidance: bool = True, confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             zH (torch.Tensor): Current high-level state.
@@ -497,7 +540,7 @@ class HRM_H_Module(nn.Module):
             thought_guidance (bool): Flag to switch to direct CTM thought vector guidance. #Recommended on for most model usage.
             confidence_level (str): 'critical', 'medium', or 'low'
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Next high-level state, encoded_patches (or None), patch_indices (or None), entropy_aux_loss (or 0).
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Next high-level state, encoded_patches (or None), patch_indices (or None), entropy_aux_loss (or 0), confidence.
         """
         current_zH = zH
         prev_zH = None
@@ -615,6 +658,7 @@ class HRM_H_Module(nn.Module):
         
         # The 'program' is now the sequence of encoded patches (or None in direct mode).
         # The other outputs might be used for loss calculation or debugging.
+        current_zH = current_zH * self.shared_neuromodulator_manager(current_zH)
         return current_zH, encoded_patches, patch_indices, entropy_aux_loss, confidence
 
 class HRM_L_Module(nn.Module):
@@ -625,7 +669,7 @@ class HRM_L_Module(nn.Module):
         self.d_model = config.ctm_d_model
         self.d_input = config.ctm_input_dim
         
-        self.mamba_encoder = Mamba2Block(d_model=self.d_input)
+        self.mamba_encoder = Mamba2Block(d_model=self.d_input, config=config)
         
         # Inherit synapse and NLM models from parent HierarchicalCTM
         # to ensure they are registered correctly under the main model.
@@ -2046,6 +2090,10 @@ class OriginalCTMCore(nn.Module):
             self.basal_ganglia = None
             self.compute_synchronisation = torch.compile(self.compute_synchronisation)
             self.forward_with_full_tracking = torch.compile(self.forward_with_full_tracking)
+            
+        # --- Quantization Stubs for QAT ---
+        self.quant = quant.QuantStub()
+        self.dequant = quant.DeQuantStub()
 
 
     # --- Core CTM Methods ---
@@ -2504,6 +2552,8 @@ class OriginalCTMCore(nn.Module):
         """
         B = kv_features.size(0)
         device = kv_features.device
+        quantize = (self.config.quant_enabled_training and self.training) or \
+                   (self.config.quant_enabled_inference and not self.training)
         
         # Initialize tracking dictionaries and lists
         tracking_data = {
@@ -3756,8 +3806,8 @@ class HRM_H_Module(nn.Module):
         self.initial_epochs = 5  # Epochs before ramp-up starts
         self.current_epoch = 0
         # This module integrates the result from the L-module (zL) into its own state (zH).
-        self.mamba = Mamba2Block(d_model=config.d_model)
-        self.sparse_attn = WINAAttention(d_model=config.d_model, n_heads=config.n_heads, dropout=config.dropout)
+        self.mamba = Mamba2Block(d_model=config.d_model, config=config)
+        self.sparse_attn = WINAAttention(d_model=config.d_model, n_heads=config.n_heads, config=config, dropout=config.dropout)
         self.norm1 = nn.LayerNorm(config.d_model)
         self.norm2 = nn.LayerNorm(config.d_model)
         self.planning_mlp = nn.Sequential(
@@ -3807,7 +3857,7 @@ class HRM_H_Module(nn.Module):
         self.early_stop_threshold = config.early_stop_threshold
         self.program_feedback_proj = nn.Linear(config.d_model, config.d_model)
         self.shared_neuromodulator_manager = NeuromodulatorManager(config)
-        self.thought_ctm = OriginalCTMCore(config, neuromodulator_manager=self.shared_neuromodulator_manager)
+        self.thought_ctm = HNetCore(config)
         self.thought_feedback_proj = nn.Linear(config.ctm_out_dims, config.d_model)
         
         # Add CTM-like components for H-module
@@ -3816,7 +3866,7 @@ class HRM_H_Module(nn.Module):
         self.h_trace_processor = SuperLinear(config.ctm_memory_length, 1, N=config.d_model, depth=config.ctm_deep_nlms, dropout=config.ctm_dropout)
         self.h_q_proj = nn.Linear(config.d_model, config.d_model)  # For H-module sync-based query
         
-    def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor, thought_guidance: bool = True, confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, zH: torch.Tensor, zL: torch.Tensor, retrieved_memory: torch.Tensor, thought_guidance: bool = True, confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             zH (torch.Tensor): Current high-level state.
@@ -3825,7 +3875,7 @@ class HRM_H_Module(nn.Module):
             thought_guidance (bool): Flag to switch to direct CTM thought vector guidance. #Recommended on for most model usage.
             confidence_level (str): 'critical', 'medium', or 'low'
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Next high-level state, encoded_patches (or None), patch_indices (or None), entropy_aux_loss (or 0), confidence.
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Next high-level state, encoded_patches (or None), patch_indices (or None), entropy_aux_loss (or 0).
         """
         current_zH = zH
         prev_zH = None
@@ -3935,7 +3985,10 @@ class HRM_H_Module(nn.Module):
                     current_zH = dequantize_adaptive(q_zH, scale, zero_point)
 
             # Direct CTM thought vector guidance
-            ctm_predictions, ctm_certainties, ctm_sync_out = self.thought_ctm(current_zH.unsqueeze(1))
+            hnet_output = self.thought_ctm.forward_with_full_tracking(current_zH.unsqueeze(1))
+            ctm_predictions = hnet_output['predictions']
+            ctm_certainties = hnet_output['certainties']
+            ctm_sync_out = hnet_output['final_sync_out']
             thought_feedback = self.thought_feedback_proj(ctm_sync_out)
             current_zH = current_zH + thought_feedback * 0.1
             # Set placeholders for return values
@@ -3965,8 +4018,7 @@ class HRM_H_Module(nn.Module):
         
         # The 'program' is now the sequence of encoded patches (or None in direct mode).
         # The other outputs might be used for loss calculation or debugging.
-        current_zH = current_zH * self.shared_neuromodulator_manager(current_zH)
-        return current_zH, encoded_patches, patch_indices, entropy_aux_loss, confidence
+        return current_zH, encoded_patches, patch_indices, entropy_aux_loss
     
     def update_thresholds(self, epoch, total_epochs):
         self.current_epoch = epoch
@@ -3986,7 +4038,7 @@ class HRM_L_Module(nn.Module):
         self.d_model = config.ctm_d_model
         self.d_input = config.ctm_input_dim
         
-        self.mamba_encoder = Mamba2Block(d_model=self.d_input)
+        self.mamba_encoder = Mamba2Block(d_model=self.d_input, config=config)
         
         # Inherit synapse and NLM models from parent HierarchicalCTM
         # to ensure they are registered correctly under the main model.
@@ -3997,7 +4049,7 @@ class HRM_L_Module(nn.Module):
         self.q_proj = nn.Linear(parent_ctm.synch_representation_size_action, self.d_input)
         self.top_down_projector = nn.Linear(self.config.d_model, self.d_model)  # Project zH to modulation signal
         
-        self.attention = WINAAttention(d_model=self.d_input, n_heads=config.n_heads, dropout=config.dropout)
+        self.attention = WINAAttention(d_model=self.d_input, n_heads=config.n_heads, config=config, dropout=config.dropout)
         if self.config.use_spatial:
             self.spatial_reasoning = SpatialReasoningModule(self.d_model)
             self.three_d_spatial_reasoning = ThreeDSpatialReasoningModule(self.d_model)
@@ -4064,24 +4116,60 @@ class HRM_L_Module(nn.Module):
         
         return next_activated_zL, next_zL_trace
     
+class InverseReasoningModule(nn.Module):
+    """
+    SAGE-nano inspired inverse reasoning. It takes a model's
+    final "answer" (thought vector) and tries to predict the initial "question"
+    (input representation).
+    """
+    def __init__(self, answer_dim: int, config: EnhancedCTMConfig):
+        super().__init__()
+        self.config = config
+        self.answer_dim = answer_dim
+        self.question_dim = config.ctm_input_dim
+        self.max_seq_len = config.max_sequence_length
 
-  
+        self.decoder = nn.Sequential(
+            nn.Linear(self.answer_dim, config.d_model * 2),
+            nn.ReLU(),
+            nn.Linear(config.d_model * 2, config.d_model * 4),
+            nn.ReLU(),
+            nn.Linear(config.d_model * 4, self.max_seq_len * self.question_dim)
+        )
+
+    def forward(self, answer_vector: torch.Tensor) -> torch.Tensor:
+        predicted_question_flat = self.decoder(answer_vector)
+        predicted_question = predicted_question_flat.view(
+            answer_vector.size(0),
+            self.max_seq_len,
+            self.question_dim
+        )
+        return predicted_question
+
+
 class HierarchicalCTM(OriginalCTMCore):
     """
-    The main Hierarchical Reasoning CTM model.
-    Inherits from OriginalCTMCore to reuse helper methods for initialization."
+    The main Hierarchical Reasoning CTM model with optional H-Net integration.
+        Inherits from OriginalCTMCore to reuse helper methods for initialization.
     """
     def __init__(self, config: EnhancedCTMConfig):
-        # We call nn.Module's init directly to avoid OriginalCTMCore's full init,
-        # as we are building a different structure.
-        super().__init__(config)
+        # We need to call nn.Module's __init__ first
+        super(OriginalCTMCore, self).__init__()
+        self.config = config
+
+        if config.use_h_net_core:
+            self.core = HNetCore(config)
+        else:
+            self.core = OriginalCTMCore(config)
+            
         self.replay_batch_size = getattr(config, 'replay_batch_size', 4)
         self.d_model = config.ctm_d_model
         self.d_input = config.ctm_input_dim
         self.memory_length = config.ctm_memory_length
-        
+
         # --- Instantiate CTM components needed for the L-module ---
-        # These methods are borrowed from OriginalCTMCore
+        # These methods are borrowed from OriginalCTMCore, which is why we call super().__init__ early
+        # We pass self to HRM_L_Module so it can access these shared components
         self.synapses = self.get_synapses(
             config.ctm_synapse_depth, self.d_input + self.d_model, self.d_model, config.ctm_dropout
         )
@@ -4089,35 +4177,37 @@ class HierarchicalCTM(OriginalCTMCore):
             config.ctm_deep_nlms, config.ctm_do_layernorm_nlm, config.ctm_memory_length,
             config.ctm_memory_hidden_dims, self.d_model, config.ctm_dropout_nlm or config.ctm_dropout
         )
+
+        # --- Instantiate HRM Modules (only if not using H-Net) ---
+        if not config.use_h_net_core:
+            self.l_module = HRM_L_Module(config, self)
+            self.h_module = HRM_H_Module(config)
+            self.ltm = LongTermMemory(config.d_model, config.ltm_size, config.ltm_top_k, MemoryReplayPolicy[config.replay_policy.upper()])
+            self.consciousness_controller = ConsciousnessController(config.d_model, config.consciousness_max_attention_steps)
+            self.basal_ganglia = BasalGangliaMechanism(
+                d_model=config.d_model,
+                action_dim=config.ctm_n_synch_action,
+                dopamine_dim=config.ctm_bg_dopamine_dim,
+                context_dim=self.d_input
+            )
+            self.synaptic_empathy = SynapticEmpathy(config.d_model, config.ctm_memory_length, config.n_heads, config.dropout)
+            self.mirror_neuron = MirrorNeuronLayer(config.d_model, config.n_heads, config.dropout, config.num_emotion_dim, config.goal_dim)
+            self.temporal_spatial_tracker = TemporalSpatialTracker(config)
+            self.working_memory = WorkingMemoryBuffer(config.d_model)
+            self.glial_support = GlialSupport(config.d_model)
         
-        # --- Instantiate HRM Modules ---
-        self.l_module = HRM_L_Module(config, self)
-        self.h_module = HRM_H_Module(config)
-        self.ltm = LongTermMemory(config.d_model, config.ltm_size, config.ltm_top_k, MemoryReplayPolicy[config.replay_policy.upper()])
-        self.consciousness_controller = ConsciousnessController(config.d_model, config.consciousness_max_attention_steps)
-        self.basal_ganglia = BasalGangliaMechanism(
-            d_model=config.d_model,
-            action_dim=config.ctm_n_synch_action,
-            dopamine_dim=config.ctm_bg_dopamine_dim,
-            context_dim=self.d_input
-        )
-        self.synaptic_empathy = SynapticEmpathy(config.d_model, config.ctm_memory_length, config.n_heads, config.dropout)
-        self.mirror_neuron = MirrorNeuronLayer(config.d_model, config.n_heads, config.dropout, config.num_emotion_dim, config.goal_dim)
-        self.temporal_spatial_tracker = TemporalSpatialTracker(config)
-        self.working_memory = WorkingMemoryBuffer(config.d_model)
-        self.glial_support = GlialSupport(config.d_model)
         # --- Input/Output Layers ---
         self.input_encoder = nn.Linear(config.ctm_input_dim, self.d_input)
-        self.output_projector = nn.Linear(self.synch_representation_size_out, config.ctm_out_dims)
-        
-        # --- Initial States ---
-        self.start_activated_zL = nn.Parameter(torch.zeros(self.d_model))
-        self.start_trace_zL = nn.Parameter(torch.zeros(self.d_model, self.memory_length))
-        self.start_zH = nn.Parameter(torch.zeros(self.d_model))
-        nn.init.uniform_(self.start_activated_zL, -math.sqrt(1/self.d_model), math.sqrt(1/self.d_model))
-        nn.init.uniform_(self.start_trace_zL, -math.sqrt(1/(self.d_model+self.memory_length)), math.sqrt(1/(self.d_model+self.memory_length)))
-        nn.init.uniform_(self.start_zH, -math.sqrt(1/self.d_model), math.sqrt(1/self.d_model))
-        
+
+        # --- Initial States (for non-H-Net path) ---
+        if not config.use_h_net_core:
+            self.start_activated_zL = nn.Parameter(torch.zeros(self.d_model))
+            self.start_trace_zL = nn.Parameter(torch.zeros(self.d_model, self.memory_length))
+            self.start_zH = nn.Parameter(torch.zeros(self.d_model))
+            nn.init.uniform_(self.start_activated_zL, -math.sqrt(1/self.d_model), math.sqrt(1/self.d_model))
+            nn.init.uniform_(self.start_trace_zL, -math.sqrt(1/(self.d_model+self.memory_length)), math.sqrt(1/(self.d_model+self.memory_length)))
+            nn.init.uniform_(self.start_zH, -math.sqrt(1/self.d_model), math.sqrt(1/self.d_model))
+
         # --- Synchronisation Setup (reusing logic from OriginalCTMCore) ---
         self.neuron_select_type = config.ctm_neuron_select_type
         self.verify_args() # verify neuron selection compatibility
@@ -4125,20 +4215,28 @@ class HierarchicalCTM(OriginalCTMCore):
         self.n_synch_action = config.ctm_n_synch_action
         self.synch_representation_size_action = self.calculate_synch_representation_size(self.n_synch_action)
         self.synch_representation_size_out = self.calculate_synch_representation_size(self.n_synch_out)
-        
         self.set_synchronisation_parameters('action', self.n_synch_action, config.ctm_n_random_pairing_self)
         self.set_synchronisation_parameters('out', self.n_synch_out, config.ctm_n_random_pairing_self)
         self.output_projector = nn.Linear(self.synch_representation_size_out, config.ctm_out_dims)
         self.fusion_proj = nn.Linear(2 * self.d_model, self.d_model)
         
-        # Add synchronization parameters for H-module
-        self.n_synch_h = config.ctm_n_synch_action  # Reuse action size
-        self.synch_representation_size_h = self.calculate_synch_representation_size(self.n_synch_h)
-        self.set_synchronisation_parameters('h', self.n_synch_h, config.ctm_n_random_pairing_self)
-        
+        # Add synchronization parameters for H-module if needed
+        if not config.use_h_net_core:
+            self.n_synch_h = config.ctm_n_synch_action  # Reuse action size
+            self.synch_representation_size_h = self.calculate_synch_representation_size(self.n_synch_h)
+            self.set_synchronisation_parameters('h', self.n_synch_h, config.ctm_n_random_pairing_self)
+
         # --- Quantization Stubs for QAT ---
         self.quant = quant.QuantStub()
         self.dequant = quant.DeQuantStub()
+
+        if config.enable_inverse_reasoning:
+            self.inverse_reasoning_module = InverseReasoningModule(
+                answer_dim=self.synch_representation_size_out,
+                config=config
+            )
+        else:
+            self.inverse_reasoning_module = None
         
         # --- Bitwidth Adapter for adaptive quantization ---
         if config.ctm_adaptive_quantization:
@@ -4149,10 +4247,8 @@ class HierarchicalCTM(OriginalCTMCore):
             )
         else:
             self.bitwidth_adapter = None
-        
+
         if config.ctm_quant_policy_search:
-            # Assuming num_components is related to d_model or another config param
-            # For now, let's use a fixed number, e.g., 16 components
             num_quant_components = 16
             self.quant_policy_net = QuantizationPolicyNetwork(
                 self.d_model, num_components=num_quant_components
@@ -4168,223 +4264,263 @@ class HierarchicalCTM(OriginalCTMCore):
         else:
             self.selective_quantizer = None
 
+    def _process_sequence(self, z: torch.Tensor, thought_guidance: bool, confidence_level: str) -> torch.Tensor:
+            # Initial states
+            zH = torch.zeros(z.shape[0], self.config.d_model, device=self.device)
+            zL = z
+            
+            # Long-term memory retrieval
+            retrieved_memory, _ = self.long_term_memory.retrieve(z, top_k=3)
+            retrieved_memory = retrieved_memory.mean(dim=1) # Average retrieved memories
+            
+            programs = []
+            for i in range(self.config.ctm_iterations):
+                # H-Module update
+                h_output, h_programs, _, _ = self.h_module(zH, zL, retrieved_memory, thought_guidance, confidence_level)
+                zH = h_output
+                programs.append(h_programs)
+                
+                # L-Module update
+                l_output, l_programs, _, _, _ = self.l_module(zH, zL, retrieved_memory, thought_guidance, confidence_level)
+                zL = l_output
+                programs.append(l_programs)
+                # Gating mechanism
+                h_gate_val = torch.sigmoid(self.h_gate(zH))
+                l_gate_val = torch.sigmoid(self.l_gate(torch.cat([zL, retrieved_memory], dim=1)))
+                z = h_gate_val * zH + l_gate_val * zL
+                self.short_term_memory.update(z)
+                self.long_term_memory.add(z.detach())
+            return z
+        
     def forward_with_full_tracking(self,
-                                   x: torch.Tensor,
-                                   thought_guidance: bool = True,
-                                   confidence_level: str = 'medium',
-                                   voice1_id: Optional[torch.Tensor] = None,
-                                   voice2_id: Optional[torch.Tensor] = None,
-                                   blend_degree: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-       """
-        The main forward pass implementing the hierarchical reasoning process.
-        This method will replace the original CTM's iterative loop.
-       """
-       self.fusion_proj = nn.Linear(2 * self.d_model, self.d_model)
-       b, s, _ = x.shape
-       device = x.device
-       self.consciousness_controller.wake_up(0)
-   
-       quantize = (self.config.quant_enabled_training and self.training) or \
-                  (self.config.quant_enabled_inference and not self.training)
+                                    x: torch.Tensor,
+                                    thought_guidance: bool = True,
+                                    confidence_level: str = 'medium',
+                                    voice1_id: Optional[torch.Tensor] = None,
+                                    voice2_id: Optional[torch.Tensor] = None,
+                                    blend_degree: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Main forward pass that routes to either the H-Net core or the original
+        HRM logic based on the configuration.
+        """
+        if self.config.use_h_net_core:
+            # Use the HNetCore for processing
+            return self.core.forward_with_full_tracking(x)
+        else:
+            # Fallback to the original Hierarchical CTM logic
+            return self.hrm_forward_with_full_tracking(x, thought_guidance, confidence_level, voice1_id, voice2_id, blend_degree)
 
-       if quantize and self.config.ctm_use_qat:
-           x = self.quant(x)
+    def hrm_forward_with_full_tracking(self,
+                                        x: torch.Tensor,
+                                        thought_guidance: bool = True,
+                                        confidence_level: str = 'medium',
+                                        voice1_id: Optional[torch.Tensor] = None,
+                                        voice2_id: Optional[torch.Tensor] = None,
+                                        blend_degree: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        The original hierarchical reasoning process.
+        """
+        b, s, _ = x.shape
+        device = x.device
+        self.consciousness_controller.wake_up(0)
+
+        quantize = (self.config.quant_enabled_training and self.training) or \
+                   (self.config.quant_enabled_inference and not self.training)
+
+        if quantize and self.config.ctm_use_qat:
+            x = self.quant(x)
     
-       # 1. Project input
-       x_context = self.input_encoder(x)
-       
-       # 2. Initialize states
-       activated_zL = self.start_activated_zL.unsqueeze(0).expand(b, -1)
-       zL_trace = self.start_trace_zL.unsqueeze(0).expand(b, -1, -1)
-       zH = self.start_zH.unsqueeze(0).expand(b, -1)
-       
-       # Optional voice blending
-       if voice1_id is not None and voice2_id is not None and blend_degree is not None:
-           blended_voice = self.voice_blender(voice1_id, voice2_id, blend_degree)
-           zH = zH + blended_voice  # Add blended voice to high-level state
-       
-       # 3. Initialize sync recurrent values
-       decay_alpha_action, decay_beta_action = None, None
-       decay_alpha_out, decay_beta_out = None, None
-       decay_alpha_h, decay_beta_h = None, None
-       r_action = torch.exp(-self.decay_params_action).unsqueeze(0).expand(b, -1)
-       r_out = torch.exp(-self.decay_params_out).unsqueeze(0).expand(b, -1)
-       r_h = torch.exp(-self.decay_params_h).unsqueeze(0).expand(b, -1)
+        # 1. Project input
+        x_context = self.input_encoder(x)
+        
+        # 2. Initialize states
+        activated_zL = self.start_activated_zL.unsqueeze(0).expand(b, -1)
+        zL_trace = self.start_trace_zL.unsqueeze(0).expand(b, -1, -1)
+        zH = self.start_zH.unsqueeze(0).expand(b, -1)
+        
+        # Optional voice blending
+        if voice1_id is not None and voice2_id is not None and blend_degree is not None:
+             if hasattr(self, 'voice_blender'):
+                blended_voice = self.voice_blender(voice1_id, voice2_id, blend_degree)
+                zH = zH + blended_voice
+        
+        # 3. Initialize sync recurrent values
+        decay_alpha_action, decay_beta_action = None, None
+        decay_alpha_out, decay_beta_out = None, None
+        r_action = torch.exp(-self.decay_params_action).unsqueeze(0).expand(b, -1)
+        r_out = torch.exp(-self.decay_params_out).unsqueeze(0).expand(b, -1)
+        
+        if not self.config.use_h_net_core:
+            r_h = torch.exp(-self.decay_params_h).unsqueeze(0).expand(b, -1)
+        else:
+            r_h = None
+            
+        zH_history = []
+        programs = []
+        total_entropy_loss = torch.tensor(0.0, device=device)
+
+        # 4. Hierarchical recurrent loop
+        for n in range(self.config.hrm_high_level_cycles):
+            decay_alpha_action, decay_beta_action = None, None
+            prev_zL = activated_zL.clone()
+            for t in range(self.config.hrm_low_level_timesteps):
+                sync_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
+                    activated_zL, decay_alpha_action, decay_beta_action, r_action, 'action'
+                )
+                if self.basal_ganglia:
+                    action_candidates = [sync_action, sync_action * 0.5, sync_action * 1.5]
+                    sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, x_context.mean(dim=1))
+                activated_zL, zL_trace = self.l_module(
+                    activated_zL, zL_trace, zH, x_context, sync_action, confidence_level=confidence_level
+                )
+                if self.config.enable_neuromodulators and hasattr(self, 'neuromodulators') and hasattr(self, 'mod_fusion'):
+                    mod_outputs = [mod(activated_zL) for mod in self.neuromodulators.values()]
+                    concatenated_mods = torch.cat(mod_outputs, dim=-1)
+                    fused_mod = self.mod_fusion(concatenated_mods)
+                    activated_zL = activated_zL * fused_mod
+                activated_zL = self.working_memory.update(activated_zL)
+                delta = torch.norm(activated_zL - prev_zL)
+                if delta < 1e-3: break
+                prev_zL = activated_zL.clone()
+            
+            surprise = compute_normalized_entropy(activated_zL.unsqueeze(1)).mean()
+            if surprise > self.config.ltm_surprise_threshold:
+                self.ltm.add_to_memory(zH.squeeze(0), surprise)
+            retrieved_memory = self.ltm.retrieve_from_memory(zH.squeeze(0))
+            fused_input = torch.cat([activated_zL.unsqueeze(1), retrieved_memory], dim=1)
+            fused_input = self.fusion_proj(fused_input.mean(dim=1))
+            
+            zH, encoded_patches, patch_indices, entropy_aux_loss, confidence = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance, confidence_level=confidence_level)
+
+            if self.config.enable_neuromodulators and hasattr(self, 'neuromodulators') and hasattr(self, 'mod_fusion'):
+                mod_outputs = [mod(zH) for mod in self.neuromodulators.values()]
+                concatenated_mods = torch.cat(mod_outputs, dim=-1)
+                fused_mod = self.mod_fusion(concatenated_mods)
+                zH = zH * fused_mod
+            
+            modulation = self.consciousness_controller.get_attention_modulation()
+            zH = zH * modulation
+
+            if quantize and self.config.ctm_adaptive_quantization and self.bitwidth_adapter:
+                with torch.no_grad():
+                    task_embedding = zH.mean(dim=1)  # Per-sample mean
+                    bits = self.bitwidth_adapter(task_embedding)
+                
+                if self.config.ctm_quant_policy_search and self.quant_policy_net:
+                    with torch.no_grad():
+                        policy_params = self.quant_policy_net(task_embedding)
+                        # For simplicity, we'll use the average params for the whole tensor
+                        scale = policy_params[:, :, 1].mean()
+                        zero_point = policy_params[:, :, 2].mean().round().int()
+                    q_zH, _, _ = quantize_adaptive(zH, bits)
+                    zH = dequantize_adaptive(q_zH, scale, zero_point)
+                else:
+                    q_zH, scale, zero_point = quantize_adaptive(zH, bits)
+                    zH = dequantize_adaptive(q_zH, scale, zero_point)
+                if self.config.ctm_use_qat:
+                    zH = self.dequant(zH)
+            
+            # Apply Synaptic Empathy
+            synaptic_modulation, empathy_reward = self.synaptic_empathy(activated_zL.unsqueeze(-1), zH.unsqueeze(-1), zH)
+            zH = zH + synaptic_modulation * 0.1
+            
+            # Apply Mirror Neuron Layer
+            valence, arousal = self.mirror_neuron.get_valence_arousal(zH.unsqueeze(1))
+            observed_valence, observed_arousal = self.mirror_neuron.get_valence_arousal(zH.unsqueeze(1))  # Placeholder for observed
+            emotion = torch.cat([valence, arousal], dim=-1)
+            observed_emotion = torch.cat([observed_valence, observed_arousal], dim=-1)
+            modulated_zH, _, current_observed_goal, mirror_reward = self.mirror_neuron(
+                zH.unsqueeze(1), zH.unsqueeze(1),
+                emotion,
+                observed_emotion,
+                torch.zeros(b, 1, self.config.goal_dim, device=device)
+            )
+            zH = modulated_zH.squeeze(1)
+            
+
+            zH = self.glial_support(zH)
+            zH = self.working_memory.update(zH)
+            zH = self.temporal_spatial_tracker(zH.unsqueeze(1)).squeeze(1)
+            zH_history.append(zH)
+            if encoded_patches is not None: programs.append(encoded_patches)
+            total_entropy_loss += entropy_aux_loss if entropy_aux_loss is not None else 0
+
+               # Replay from LTM
+            replayed_memory = self.ltm.replay_memory(batch_size=self.replay_batch_size)
+            if replayed_memory is not None:
+                # Process replayed memory through H-module to make it a compatible state
+                # Here we might need a simplified pass or assumption
+                # For now, let's assume replayed memory can be treated as a zH-like state
+                zH_history.append(replayed_memory.mean(dim=0, keepdim=True).expand(b, -1))
     
-       # Store history of high-level states for final representation
-       zH_history = []
-       programs = []
-       total_entropy_loss = torch.tensor(0.0, device=device)
+        # 5. Compute final output synchronisation from the history of H-states
+        # This treats the H-module's evolution as the final 'trace' for output
     
-       # 4. Hierarchical recurrent loop
-       for n in range(self.config.hrm_high_level_cycles):
-           # The L-module's own synchronisation state is reset/recalculated each high-level cycle
-           decay_alpha_action, decay_beta_action = None, None
+        final_zH_trace = torch.stack(zH_history, dim=-1)  # (B, D, N)
+        decay_alpha_out, decay_beta_out = None, None
+        for i in range(self.config.hrm_high_level_cycles):
+            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
+                final_zH_trace[:,:,i], decay_alpha_out, decay_beta_out, r_out, 'out'
+            )
     
-           prev_zL = activated_zL.clone()
-           for t in range(self.config.hrm_low_level_timesteps):
-               # Compute L-module's action synchronisation for its attention query
-               sync_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
-                   activated_zL, decay_alpha_action, decay_beta_action, r_action, 'action'
-               )
-               
-               if self.basal_ganglia:
-                   action_candidates = [sync_action, sync_action * 0.5, sync_action * 1.5]
-                   sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, x_context.mean(dim=1))
-               
-               # Run one step of the L-module
-               activated_zL, zL_trace = self.l_module(
-                   activated_zL, zL_trace, zH, x_context, sync_action, confidence_level=confidence_level
-               )
-               
-               # Apply Neuromodulators to activated_zL
-               if self.config.enable_neuromodulators:
-                   mod_outputs = [mod(activated_zL) for mod in self.neuromodulators.values()]
-                   concatenated_mods = torch.cat(mod_outputs, dim=-1)
-                   fused_mod = self.mod_fusion(concatenated_mods)
-                   activated_zL = activated_zL * fused_mod
-               
-               activated_zL = self.working_memory.update(activated_zL)
-   
-               # Early stopping if change is small
-               
-               delta = torch.norm(activated_zL - prev_zL)
-               if delta < 1e-3:
-                   break
-               prev_zL = activated_zL.clone()
-           
-           # Calculate surprise
-           surprise = compute_normalized_entropy(activated_zL.unsqueeze(1)).mean()
-           
-           # Store zH in LTM if surprising
-           if surprise > self.config.ltm_surprise_threshold:
-               self.ltm.add_to_memory(zH.squeeze(0), surprise)
+        predictions = self.output_projector(synchronisation_out)
+        certainties = self.compute_certainty(predictions)
+        # Confidence Thresholding
+        abstain_mask = torch.zeros(b, dtype=torch.bool, device=device)
+        if self.config.confidence_threshold > 0:
+            confidence_scores = certainties[:, 1]  # Shape: (B,)
+            abstain_mask = confidence_scores < self.config.confidence_threshold
+        self.consciousness_controller.sleep_down(0)
+
+        if quantize and self.config.ctm_use_qat:
+            predictions = self.dequant(predictions)
+        
+        # --- Inverse Reasoning ---
+        inverse_reasoning_loss = torch.tensor(0.0, device=device)
+        low_confidence_warning = torch.tensor(False, device=device)
+
+        if self.inverse_reasoning_module is not None:
+            reconstructed_input = self.inverse_reasoning_module(synchronisation_out)
+            
+            # Pad or truncate original input to match reconstructed shape
+            original_input_padded = F.pad(x, (0, 0, 0, self.config.max_sequence_length - x.shape[1]))
+            
+            # Cosine similarity loss
+            similarity = F.cosine_similarity(original_input_padded.view(b, -1), reconstructed_input.view(b, -1)).mean()
+            
+            if self.training:
+                inverse_reasoning_loss = (1 - similarity) * self.config.inverse_reasoning_loss_weight
+            elif similarity < self.config.inverse_reasoning_threshold:
+                low_confidence_warning = torch.tensor(True, device=device)
+            
+        return {
+            'predictions': predictions.unsqueeze(-1),
+            'certainties': certainties.unsqueeze(-1),
+            'abstained': abstain_mask.unsqueeze(-1),
+            'final_sync_out': synchronisation_out,
+            'activated_states': zH_history,
+            'programs': programs,
+            'entropy_aux_loss': total_entropy_loss,
+            'inverse_reasoning_loss': inverse_reasoning_loss,
+            'low_confidence_warning': low_confidence_warning
+        }
     
-           # Retrieve from LTM
-           retrieved_memory = self.ltm.retrieve_from_memory(zH.squeeze(0))
-    
-           # End of low-level cycle, update high-level state using the final L-state
-           # Fuse retrieved_memory with zL before passing to h_module
-           # Fuse retrieved_memory with zL before passing to h_module with bidirectional attention
-           fused_input = torch.cat([activated_zL.unsqueeze(1), retrieved_memory], dim=1)
-           attn_out, _ = nn.MultiheadAttention(self.d_model, num_heads=8, batch_first=True)(fused_input, fused_input, fused_input)
-           fused_input = self.fusion_proj(attn_out.mean(dim=1))
-           
-           zH, encoded_patches, patch_indices, entropy_aux_loss = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance, confidence_level=confidence_level)
-           
-           # Apply Neuromodulators to zH
-           if self.config.enable_neuromodulators:
-               mod_outputs = [mod(zH) for mod in self.neuromodulators.values()]
-               concatenated_mods = torch.cat(mod_outputs, dim=-1)
-               fused_mod = self.mod_fusion(concatenated_mods)
-               zH = zH * fused_mod
-           
-           modulation = self.consciousness_controller.get_attention_modulation()
-           zH = zH * modulation
-   
-           if quantize and self.config.ctm_adaptive_quantization and self.bitwidth_adapter:
-               with torch.no_grad():
-                   task_embedding = zH.mean(dim=1)  # Per-sample mean
-                   bits = self.bitwidth_adapter(task_embedding)
-               
-               if self.config.ctm_quant_policy_search and self.quant_policy_net:
-                   with torch.no_grad():
-                       policy_params = self.quant_policy_net(task_embedding)
-                       # For simplicity, we'll use the average params for the whole tensor
-                       scale = policy_params[:, :, 1].mean()
-                       zero_point = policy_params[:, :, 2].mean().round().int()
-                   q_zH, _, _ = quantize_adaptive(zH, bits)
-                   zH = dequantize_adaptive(q_zH, scale, zero_point)
-               else:
-                   q_zH, scale, zero_point = quantize_adaptive(zH, bits)
-                   zH = dequantize_adaptive(q_zH, scale, zero_point)
-               if self.config.ctm_use_qat:
-                   zH = self.dequant(zH)
-           
-           # Apply Synaptic Empathy
-           synaptic_modulation, empathy_reward = self.synaptic_empathy(activated_zL.unsqueeze(-1), zH.unsqueeze(-1), zH)
-           zH = zH + synaptic_modulation * 0.1
-           
-           # Apply Mirror Neuron Layer
-           valence, arousal = self.mirror_neuron.get_valence_arousal(zH.unsqueeze(1))
-           observed_valence, observed_arousal = self.mirror_neuron.get_valence_arousal(zH.unsqueeze(1))  # Placeholder for observed
-           emotion = torch.cat([valence, arousal], dim=-1)
-           observed_emotion = torch.cat([observed_valence, observed_arousal], dim=-1)
-           modulated_zH, _, current_observed_goal, mirror_reward = self.mirror_neuron(
-               zH.unsqueeze(1), zH.unsqueeze(1),
-               emotion,
-               observed_emotion,
-               torch.zeros(b, 1, self.config.goal_dim, device=device)
-           )
-           zH = modulated_zH.squeeze(1)
-           
-           # Apply Glial Support for state stabilization
-           zH = self.glial_support(zH)
-           
-           # Apply Working Memory
-           zH = self.working_memory.update(zH)
-           
-           # Apply Temporal-Spatial Tracker
-           zH = self.temporal_spatial_tracker(zH.unsqueeze(1)).squeeze(1)
-           zH_history.append(zH)
-           # The 'programs' list now stores the patch embeddings (if not None)
-           if encoded_patches is not None:
-               programs.append(encoded_patches)
-           total_entropy_loss += entropy_aux_loss
-    
-           # Replay from LTM
-           replayed_memory = self.ltm.replay_memory(batch_size=self.replay_batch_size)
-           if replayed_memory is not None:
-               # Process replayed memory through H-module to make it a compatible state
-               # Here we might need a simplified pass or assumption
-               # For now, let's assume replayed memory can be treated as a zH-like state
-               zH_history.append(replayed_memory.mean(dim=0, keepdim=True).expand(b, -1))
-    
-       # 5. Compute final output synchronisation from the history of H-states
-       # This treats the H-module's evolution as the final 'trace' for output
-       final_zH_trace = torch.stack(zH_history, dim=-1) # (B, D, N)
-       decay_alpha_out, decay_beta_out = None, None
-       for i in range(self.config.hrm_high_level_cycles):
-           synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
-               final_zH_trace[:,:,i], decay_alpha_out, decay_beta_out, r_out, 'out'
-           )
-    
-       # 6. Project output from the final H-synchronisation
-       predictions = self.output_projector(synchronisation_out)
-       certainties = self.compute_certainty(predictions)
-       
-       # Confidence Thresholding
-       abstain_mask = torch.zeros(b, dtype=torch.bool, device=device)
-       if self.config.confidence_threshold > 0:
-           confidence_scores = certainties[:, 1]  # Shape: (B,)
-           abstain_mask = confidence_scores < self.config.confidence_threshold
-    
-       self.consciousness_controller.sleep_down(0)
-       return {
-           'predictions': predictions.unsqueeze(-1),
-           'certainties': certainties.unsqueeze(-1),
-           'abstained': abstain_mask.unsqueeze(-1),
-           'final_sync_out': synchronisation_out,
-           'activated_states': zH_history,
-           'programs': programs,
-           'entropy_aux_loss': total_entropy_loss
-       }
-    
+ 
 
 class GlialSupport(nn.Module):
-            def __init__(self, d_model):
-                super().__init__()
-                self.adaptive_norm = nn.LayerNorm(d_model)
-                self.support_mlp = nn.Sequential(
-                    nn.Linear(d_model, d_model // 2),
-                    nn.ReLU(),
-                    nn.Linear(d_model // 2, d_model)
-                )
-        
-            def forward(self, x):
-                norm_x = self.adaptive_norm(x)
-                support = self.support_mlp(norm_x)
-                return x + support * 0.1
+    def __init__(self, d_model):
+        super().__init__()
+        self.adaptive_norm = nn.LayerNorm(d_model)
+        self.support_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, d_model)
+        )
+            
+    def forward(self, x):
+        norm_x = self.adaptive_norm(x)
+        support = self.support_mlp(norm_x)
+        return x + support * 0.1
 
 
 class ForesightSimulator(nn.Module):
@@ -4592,3 +4728,268 @@ class ProgramSynthesizer(nn.Module):
         return encoded_patches, patch_indices, entropy_aux_loss
 
     
+
+  
+class DynamicChunker(nn.Module):
+    """
+    Implements dynamic chunking based on content, using a routing model
+    to predict chunk boundaries and a smoothing mechanism for differentiability.
+    """
+    def __init__(self, config: EnhancedCTMConfig):
+        super().__init__()
+        self.config = config
+        self.chunk_size = config.chunk_size
+
+        # Routing model
+        if config.dc_routing_model_type == 'mlp':
+            self.routing_model = nn.Sequential(
+                nn.Linear(config.d_model, config.d_model // 2),
+                nn.ReLU(),
+                nn.Linear(config.d_model // 2, 1)
+            )
+        elif config.dc_routing_model_type == 'attention':
+            self.routing_model = nn.MultiheadAttention(config.d_model, num_heads=4, batch_first=True)
+        else:
+            raise ValueError(f"Unknown dc_routing_model_type: {config.dc_routing_model_type}")
+
+        self.smoothing_sigma = nn.Parameter(torch.tensor(config.dc_smoothing_sigma), requires_grad=False)
+
+    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        batch_size, seq_len, _ = x.shape
+
+        if self.config.dc_routing_model_type == 'mlp':
+            boundary_logits = self.routing_model(x).squeeze(-1)
+        else:
+            attn_out, _ = self.routing_model(x, x, x)
+            boundary_logits = attn_out.mean(dim=-1)
+
+        if self.smoothing_sigma > 0:
+            kernel_size = int(3 * self.smoothing_sigma.item()) * 2 + 1
+            kernel = torch.exp(-torch.arange(-(kernel_size // 2), kernel_size // 2 + 1, device=x.device)**2 / (2 * self.smoothing_sigma**2))
+            kernel = kernel / kernel.sum()
+            kernel = kernel.view(1, 1, -1)
+            padded_logits = F.pad(boundary_logits.unsqueeze(1), (kernel_size//2, kernel_size//2), mode='reflect')
+            smoothed_logits = F.conv1d(padded_logits, kernel).squeeze(1)
+        else:
+            smoothed_logits = boundary_logits
+
+        boundary_probs = torch.sigmoid(smoothed_logits)
+
+        chunks = []
+        boundaries_for_loss = []
+        for i in range(batch_size):
+            sample_boundaries = (boundary_probs[i] > 0.5).nonzero(as_tuple=True)[0]
+            start = 0
+            sample_chunks = []
+            for end in sample_boundaries:
+                if end > start:
+                    sample_chunks.append(x[i, start:end+1])
+                start = end + 1
+            if start < seq_len:
+                sample_chunks.append(x[i, start:])
+            chunks.append(sample_chunks)
+            boundaries_for_loss.append(boundary_probs[i])
+
+        return chunks, torch.stack(boundaries_for_loss)
+
+class HighEndChunkProcessor(nn.Module):
+    """
+    Processes chunks to identify and summarize "high-end" (information-rich) ones.
+    This simulates "file generation" for high-end chunks to create a focused summary vector.
+    """
+    def __init__(self, config: EnhancedCTMConfig):
+        super().__init__()
+        self.config = config
+        # Scorer to evaluate the importance of a chunk
+        self.chunk_scorer = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model // 2),
+            nn.ReLU(),
+            nn.Linear(config.d_model // 2, 1),
+            nn.Sigmoid()
+        )
+        # Processor for high-end chunks
+        self.high_end_processor = Mamba2Block(d_model=config.d_model)
+        self.threshold = 0.7  # Configurable threshold to identify high-end chunks
+
+    def forward(self, chunks: List[List[torch.Tensor]]) -> torch.Tensor:
+        all_scores = []
+        all_chunks_flat = []
+
+        if not chunks or not chunks[0]:
+            return torch.zeros(1, self.config.d_model, device=self.chunk_scorer[0].weight.device)
+
+        device = chunks[0][0].device
+
+        for sample_chunks in chunks:
+            if not sample_chunks:
+                continue
+            for chunk in sample_chunks:
+                score = self.chunk_scorer(chunk.mean(dim=0, keepdim=True)).item()
+                all_scores.append(score)
+                all_chunks_flat.append(chunk)
+
+        if not all_chunks_flat:
+            return torch.zeros(1, self.config.d_model, device=device)
+
+        scores_tensor = torch.tensor(all_scores, device=device)
+        high_end_indices = (scores_tensor > self.threshold).nonzero(as_tuple=True)[0]
+
+        if len(high_end_indices) == 0:
+            return torch.zeros(1, self.config.d_model, device=device)
+
+        high_end_chunks = [all_chunks_flat[i] for i in high_end_indices]
+        
+        processed_high_end = []
+        for chunk in high_end_chunks:
+            # Pad chunk to be processed
+            padded_chunk = F.pad(chunk, (0, 0, 0, self.config.chunk_size - chunk.shape[0]))
+            processed = self.high_end_processor(padded_chunk.unsqueeze(0)).squeeze(0)
+            processed_high_end.append(processed.mean(dim=0))
+        
+        if not processed_high_end:
+            return torch.zeros(1, self.config.d_model, device=device)
+
+        summary_vector = torch.stack(processed_high_end).mean(dim=0)
+        return summary_vector.unsqueeze(0)
+
+class HNetCore(nn.Module):
+    """
+    Hierarchical network (H-Net) core, replacing the OriginalCTMCore.
+    """
+    def __init__(self, config: EnhancedCTMConfig):
+        super().__init__()
+        self.config = config
+        self.high_end_chunk_processor = HighEndChunkProcessor(config)
+
+        # Encoder stages
+        self.encoders = nn.ModuleList([
+            nn.ModuleDict({
+                'chunker': DynamicChunker(config),
+                'ssm': Mamba2Block(d_model=config.d_model) if config.hnet_ssm_type == 'mamba2' else None, # Add S4 support later
+                'norm': nn.LayerNorm(config.d_model)
+            }) for _ in range(config.hnet_encoder_stages)
+        ])
+
+        # Main network stages
+        self.main_net = nn.ModuleList([
+            nn.ModuleDict({
+                'attention': WINAAttention(d_model=config.d_model, n_heads=config.n_heads, config=config, dropout=config.dropout) if config.hnet_transformer_type == 'wina' else nn.TransformerEncoderLayer(d_model=config.d_model, nhead=config.n_heads, batch_first=True, dropout=config.dropout),
+                'ssm': Mamba2Block(d_model=config.d_model, config=config) if config.hnet_ssm_type == 'mamba2' else None,
+            })
+            for _ in range(config.hnet_main_stages)
+        ])
+
+        # Decoder stages
+        self.decoders = nn.ModuleList([
+             nn.ModuleDict({
+                'ssm': Mamba2Block(d_model=config.d_model, config=config) if config.hnet_ssm_type == 'mamba2' else None, # Add S4 support later
+                'dechunker': nn.Linear(config.d_model, config.d_model * config.chunk_size), # Simple dechunking
+                'norm': nn.LayerNorm(config.d_model)
+            }) for _ in range(config.hnet_decoder_stages)
+        ])
+
+        if config.hnet_use_signal_propagation:
+            self.signal_probes = nn.ModuleList([nn.Linear(config.d_model, 1) for _ in range(config.hnet_encoder_stages + config.hnet_main_stages + config.hnet_decoder_stages)])
+
+    def forward_with_full_tracking(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        batch_size, seq_len, d_model = x.shape
+        total_ratio_loss = 0.0
+        summaries = []
+        
+        # Encoder pass
+        for i, encoder_stage in enumerate(self.encoders):
+            chunks, boundary_probs = encoder_stage['chunker'](x)
+            
+            # Generate and store summary from high-end chunks
+            if chunks and any(c for c in chunks):
+                 with torch.no_grad():
+                    summaries.append(self.high_end_chunk_processor(chunks))
+
+            # Calculate ratio loss for this stage
+            num_chunks = torch.sum(boundary_probs, dim=-1) + 1
+            avg_chunk_len = seq_len / num_chunks
+            compression_ratio = self.config.chunk_size / avg_chunk_len
+            total_ratio_loss += F.mse_loss(compression_ratio, torch.tensor(self.config.dc_target_compression_ratio, device=x.device))
+
+            processed_chunks = []
+            for sample_chunks in chunks:
+                sample_processed = []
+                for chunk in sample_chunks:
+                    chunk_padded = F.pad(chunk, (0, 0, 0, self.config.chunk_size - chunk.shape[0]))
+                    if encoder_stage['ssm']:
+                         processed = encoder_stage['ssm'](chunk_padded.unsqueeze(0)).squeeze(0)
+                    else: # Placeholder for S4
+                         processed = chunk_padded
+                    sample_processed.append(processed.mean(dim=0)) # Pool chunk to a single vector
+                if sample_processed:
+                    processed_chunks.append(torch.stack(sample_processed))
+            
+            if not processed_chunks:
+                x = torch.zeros(batch_size, 0, d_model, device=x.device)
+            else:
+                x = torch.nn.utils.rnn.pad_sequence(processed_chunks, batch_first=True)
+
+            x = encoder_stage['norm'](x)
+            if self.config.hnet_use_signal_propagation:
+                 x = x * torch.sigmoid(self.signal_probes[i](x.mean(dim=1, keepdim=True)))
+
+        # Integrate high-end chunk summary before main network
+        if summaries:
+            high_end_summary = torch.stack(summaries).mean(dim=0)
+            if x.shape[1] > 0: # Avoid adding to empty tensor
+                 x = x + high_end_summary
+
+        # Main network pass
+        for i, main_stage in enumerate(self.main_net):
+            attention_layer = main_stage['attention']
+            ssm_layer = main_stage['ssm']
+            
+            if isinstance(attention_layer, WINAAttention) and ssm_layer is not None:
+                # Dynamic routing with WINA
+                control_input = attention_layer.control_proj(x.mean(dim=1))
+                _, scores = attention_layer.wina_sparsifier.apply_wina_gating(
+                    x, attention_layer.q_proj.weight, "query", f"q_proj_{id(attention_layer.q_proj.weight)}", control_input, return_scores=True
+                )
+                route_to_attention = (scores > 0.5).float()
+
+                attn_out = attention_layer(x, x, x)
+                ssm_out = ssm_layer(x)
+                
+                # Ensure route_to_attention is broadcastable
+                if route_to_attention.dim() < attn_out.dim():
+                    route_to_attention = route_to_attention.unsqueeze(-1)
+
+                x = ssm_out * (1 - route_to_attention) + attn_out * route_to_attention
+
+            elif isinstance(attention_layer, WINAAttention):
+                x = attention_layer(x,x,x)
+            else: # Standard Transformer
+                x = attention_layer(x)
+
+            if self.config.hnet_use_signal_propagation:
+                x = x * torch.sigmoid(self.signal_probes[len(self.encoders) + i](x.mean(dim=1, keepdim=True)))
+
+        # Decoder pass
+        for i, decoder_stage in enumerate(self.decoders):
+            if decoder_stage['ssm']:
+                x = decoder_stage['ssm'](x)
+            if x.shape[1] > 0:
+                x_dechunked = decoder_stage['dechunker'](x).view(x.shape[0], -1, d_model)
+                x = x_dechunked[:, :seq_len, :]
+            else:
+                x = torch.zeros(batch_size, seq_len, d_model, device=x.device)
+
+            x = decoder_stage['norm'](x)
+            if self.config.hnet_use_signal_propagation:
+                 x = x * torch.sigmoid(self.signal_probes[len(self.encoders) + len(self.main_net) + i](x.mean(dim=1, keepdim=True)))
+
+        output = {
+            'predictions': x.unsqueeze(-1), 
+            'certainties': torch.ones(x.shape[0], 2, 1, device=x.device),
+            'abstained': torch.zeros(x.shape[0], 1, dtype=torch.bool, device=x.device),
+            'final_sync_out': x.mean(dim=1) if x.shape[1] > 0 else torch.zeros(x.shape[0], d_model, device=x.device),
+            'activated_states': [x],
+            'programs': [],
+            'entropy_aux_loss': self.config.dc_ratio_loss_weight * (total_ratio_loss / len(self.encoders) if self.encoders else 0.0)
+        }
+        return output
