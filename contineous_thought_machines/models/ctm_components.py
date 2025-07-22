@@ -36,6 +36,7 @@ from .biological_neuron_selection import BiologicalNeuronSelector, BiologicalSel
 from .constants import VALID_NEURON_SELECT_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
 import torch.quantization as quant
 from .mamba_block import quantize_adaptive, dequantize_adaptive, BitwidthAdapter, QuantizationPolicyNetwork, SelectiveQuantizer, load_quantized_state, dequantize_for_adaptation, quantize_after_adaptation
+from .tracking import CTMTracker
 
 from .neuromodulators import (
     BaseNeuromodulator,
@@ -2095,6 +2096,9 @@ class OriginalCTMCore(nn.Module):
         self.quant = quant.QuantStub()
         self.dequant = quant.DeQuantStub()
 
+        # --- Tracking ---
+        self.tracker = CTMTracker()
+
 
     # --- Core CTM Methods ---
 
@@ -2366,17 +2370,12 @@ class OriginalCTMCore(nn.Module):
         if quantize and self.config.ctm_use_qat:
             x = self.quant(x)
 
-        # --- Tracking Initialization ---
-        pre_activations_tracking = []
-        post_activations_tracking = []
-        synch_out_tracking = []
-        synch_action_tracking = []
-        attention_tracking = []
-        dopamine_error_tracking = []
+        if track:
+            self.tracker = CTMTracker()
 
         # --- Input Features (x is assumed to be pre-processed) ---
         # x has shape (B, S, d_input) where S is sequence length of features
-        kv = x 
+        kv = x
 
         # --- Initialise Recurrent State ---
         state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, d_model, memory_length)
@@ -2399,6 +2398,10 @@ class OriginalCTMCore(nn.Module):
 
             # --- Calculate Synchronisation for Input Data Interaction ---
             synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
+            plastic_adjustment = None
+            dopamine_error = None
+            pc_loss = None
+            attn_weights = None
 
             # --- Basal Ganglia Gating ---
             if self.basal_ganglia is not None:
@@ -2408,8 +2411,7 @@ class OriginalCTMCore(nn.Module):
                     reward_signal=None
                 )
                 synchronisation_action = synchronisation_action * action_gate
-                if track:
-                    dopamine_error_tracking.append(dopamine_error.detach().cpu().numpy())
+                
 
             # --- Interact with Data via Attention ---
             if self.attention is not None and self.q_proj is not None:
@@ -2418,8 +2420,7 @@ class OriginalCTMCore(nn.Module):
                 attn_out = attn_out.squeeze(1) # attn_out shape: (B, d_input)
                 pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1) # (B, d_input + d_model)
             else: # No attention mechanism
-                attn_weights = None # For tracking
-                # If no attention, synapse input might just be activated_state or require different handling
+                 # If no attention, synapse input might just be activated_state or require different handling
                 # For now, let's assume if attention is None, we might pass activated_state directly or a zero tensor for attn_out part
                 # This part needs clarification if heads=0 is a valid use case for this modified CTM.
                 # Assuming for now that if attention is None, this path might not be fully defined by original logic.
@@ -2432,7 +2433,6 @@ class OriginalCTMCore(nn.Module):
                 # Or, if concatenation is always expected:
                 zero_attn_out_replacement = torch.zeros(B, self.d_input, device=device, dtype=activated_state.dtype)
                 pre_synapse_input = torch.concatenate((zero_attn_out_replacement, activated_state), dim=-1)
-
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input) # state shape: (B, d_model)
@@ -2478,25 +2478,14 @@ class OriginalCTMCore(nn.Module):
 
             # --- Tracking ---
             if track:
-                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
-                post_activations_tracking.append(activated_state.detach().cpu().numpy())
-                if attn_weights is not None:
-                    attention_tracking.append(attn_weights.detach().cpu().numpy())
-                else: # Handle case where attn_weights might not be generated
-                    attention_tracking.append(None) 
-                synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
-                synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
+                self.tracker.track_step(state_trace, activated_state, synchronisation_action, synchronisation_out, attn_weights, dopamine_error, plastic_adjustment, pc_loss)
+
 
         # --- Return Values ---
         if quantize and self.config.ctm_use_qat:
             predictions = self.dequant(predictions)
         if track:
-            tracking_results = (np.array(synch_out_tracking), np.array(synch_action_tracking)), \
-                               np.array(pre_activations_tracking), np.array(post_activations_tracking), \
-                               np.array(attention_tracking)
-            if dopamine_error_tracking:
-                return predictions, certainties, tracking_results, np.array(dopamine_error_tracking)
-            return predictions, certainties, tracking_results
+            return predictions, certainties, self.tracker.get_tracking_data()
         return predictions, certainties, synchronisation_out
     def compute_predictive_coding_loss(self, activated_state: torch.Tensor) -> torch.Tensor:
         """
@@ -2536,7 +2525,7 @@ class OriginalCTMCore(nn.Module):
         return total_pc_loss
 
 
-    def forward_with_full_tracking(self, kv_features: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward_with_full_tracking(self, kv_features: torch.Tensor, track=False) -> Dict[str, torch.Tensor]:
         """
         Enhanced forward pass that returns ALL CTM internal states for diffusion control.
         
@@ -2555,11 +2544,9 @@ class OriginalCTMCore(nn.Module):
         quantize = (self.config.quant_enabled_training and self.training) or \
                    (self.config.quant_enabled_inference and not self.training)
         
-        # Initialize tracking dictionaries and lists
-        tracking_data = {
-            'sync_out_history': [], 'sync_action_history': [], 'activated_states': [], 'state_traces': [],
-            'attention_weights': [], 'pc_losses': [], 'dopamine_errors': [], 'plastic_adjustments': []
-        }
+        if track:
+            self.tracker = CTMTracker()
+        
         full_state_history = []
 
         # Initialize recurrent state
@@ -2592,13 +2579,10 @@ class OriginalCTMCore(nn.Module):
                 if self.basal_ganglia:
                     action_gate, dopamine_error = self.basal_ganglia(activated_state, activated_state, None)
                     synchronisation_action = synchronisation_action * action_gate
-                    tracking_data['dopamine_errors'].append(dopamine_error)
-                tracking_data['sync_action_history'].append(synchronisation_action.clone())
                 if self.attention:
                     q = self.q_proj(synchronisation_action).unsqueeze(1)
                     attn_out, attn_weights = self.attention(q, kv_features, kv_features, average_attn_weights=False, need_weights=True)
                     pre_synapse_input = torch.cat((attn_out.squeeze(1), activated_state), dim=-1)
-                    tracking_data['attention_weights'].append(attn_weights.clone())
                 else:
                     pre_synapse_input = torch.cat((kv_features.mean(dim=1), activated_state), dim=-1)
             else:
@@ -2608,7 +2592,6 @@ class OriginalCTMCore(nn.Module):
             if self.use_activity_plasticity:
                 plastic_adjustment = self.plastic_synapses(activated_state)
                 state = state + plastic_adjustment
-                tracking_data['plastic_adjustments'].append(plastic_adjustment.clone())
 
             state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
             activated_state = self.trace_processor(state_trace)
@@ -2617,9 +2600,13 @@ class OriginalCTMCore(nn.Module):
                 activated_state = activated_state + feedback.squeeze(1)
             
             if self.use_predictive_coding:
-                tracking_data['pc_losses'].append(self.compute_predictive_coding_loss(activated_state))
+                pc_loss = self.compute_predictive_coding_loss(activated_state)
             
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, 'out')
+            
+            if track:
+                self.tracker.track_step(state_trace, activated_state, synchronisation_action, synchronisation_out, attn_weights, dopamine_error, plastic_adjustment, pc_loss)
+            
             current_prediction = self.output_projector(synchronisation_out)
             current_certainty = self.compute_certainty(current_prediction)
             mean_conf = current_certainty[:,1].mean()
@@ -2672,15 +2659,16 @@ class OriginalCTMCore(nn.Module):
         if quantize and self.config.ctm_use_qat:
             predictions = self.dequant(predictions)
 
-        return {
+        return_data = {
             'predictions': predictions,
             'certainties': certainties,
             'abstained': abstain_mask.unsqueeze(-1),
             'final_sync_out': synchronisation_out,
-            'predictive_coding_loss': torch.stack(tracking_data['pc_losses']).mean() if tracking_data['pc_losses'] else torch.tensor(0.0, device=device),
-            'dopamine_loss': torch.stack(tracking_data['dopamine_errors']).mean() if tracking_data['dopamine_errors'] else torch.tensor(0.0, device=device),
-            **tracking_data
         }
+        if track:
+            return_data.update(self.tracker.get_tracking_data())
+
+        return return_data
 
 class BidirectionalReasoningController(nn.Module):
     """
