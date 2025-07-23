@@ -4,6 +4,7 @@ Shared components for CTM models.
 This file contains shared components for the Continuous Thought Machine (CTM)
 models, moved from ctm_HRM.py to break circular dependencies.
 """
+#Need to pip install imageio
 
 import torch
 import torch.nn as nn
@@ -727,6 +728,8 @@ class HRM_L_Module(nn.Module):
         state = self.synapses(pre_synapse_input)
         top_down_mod = self.top_down_projector(zH)  # (B, D)
         state = state + top_down_mod * 0.3  # Modulate with strength 0.3
+        if self.config.enable_tracking:
+            self.tracker.track_step(hierarchical_projection=top_down_mod)
         
         # Add parietal-inspired spatial reasoning
         if self.config.use_spatial and self.spatial_reasoning is not None:
@@ -2449,6 +2452,7 @@ class OriginalCTMCore(nn.Module):
             activated_state = self.trace_processor(state_trace) # (B, d_model)
 
             # Apply Neuromodulators
+            fused_mod = None
             if self.config.enable_neuromodulators and hasattr(self, 'neuromodulators'):
                 mod_outputs = [mod(activated_state) for mod in self.neuromodulators.values()]
                 if mod_outputs:
@@ -2478,7 +2482,7 @@ class OriginalCTMCore(nn.Module):
 
             # --- Tracking ---
             if track:
-                self.tracker.track_step(state_trace, activated_state, synchronisation_action, synchronisation_out, attn_weights, dopamine_error, plastic_adjustment, pc_loss)
+                self.tracker.track_step(state_trace, activated_state, synchronisation_action, synchronisation_out, attn_weights, dopamine_error, plastic_adjustment, pc_loss, neuromodulators=fused_mod)
 
 
         # --- Return Values ---
@@ -2605,7 +2609,8 @@ class OriginalCTMCore(nn.Module):
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, 'out')
             
             if track:
-                self.tracker.track_step(state_trace, activated_state, synchronisation_action, synchronisation_out, attn_weights, dopamine_error, plastic_adjustment, pc_loss)
+                neuromodulators = activated_state  # Assuming activated_state is modulated
+                self.tracker.track_step(state_trace, activated_state, synchronisation_action, synchronisation_out, attn_weights, dopamine_error, plastic_adjustment, pc_loss, neuromodulators=neuromodulators)
             
             current_prediction = self.output_projector(synchronisation_out)
             current_certainty = self.compute_certainty(current_prediction)

@@ -21,7 +21,14 @@ class BaseNeuromodulator(nn.Module):
         Returns:
             Modulation tensor of same shape as state
         """
-        return torch.sigmoid(self.modulator(state))  # Modulation factor between 0 and 1
+        mod_val = torch.sigmoid(self.modulator(state))
+        self.track_neuromodulators(mod_val)
+        return mod_val
+
+    def track_neuromodulators(self, mod_val):
+        if not hasattr(self, 'mod_vals'):
+            self.mod_vals = []
+        self.mod_vals.append(mod_val.detach().cpu().numpy())
 
 class DopamineModulator(BaseNeuromodulator):
     """
