@@ -361,3 +361,5 @@ Instead of tokens, the implementation uses:
 
 Binary dynamic entropy patching batched_bytes_to_numeric_tensor() and batched_numeric_tensor_to_bytes()
 Learned byte patching encoder LearnedBytePatcherEncoder (reference in JEPA section
+
+#This is the easiest method to git commit all changes to the main remote origin branch of the repository: git add -A && git commit -m "Automated commit of all changes" && git push origin main
