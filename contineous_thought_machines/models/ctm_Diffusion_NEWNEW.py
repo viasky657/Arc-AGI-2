@@ -1112,8 +1112,8 @@ class CTMControlledDiffusionProcessor(nn.Module):
         self.kv_projector_for_ctm_attention = nn.Linear(config.d_model, self.target_noise_dim)
 
         # Base noise prediction network
-        # The input dimension is actual_noisy_input_dim (from kv_features_for_ctm) + config.d_model (from time_emb)
-        self.noise_predictor_base = nn.Sequential(
+        # Velocity predictor for rectified flow (input: x_t + t_emb, output: v to x_0)
+        self.velocity_predictor = nn.Sequential(
             nn.Linear(actual_noisy_input_dim + config.d_model, config.d_model * 2),
             nn.GELU(),
             nn.Linear(config.d_model * 2, self.target_noise_dim), # Changed output to target_noise_dim
@@ -1209,67 +1209,44 @@ class CTMControlledDiffusionProcessor(nn.Module):
         'low': 0.5
         }
 
-    def forward(self, noisy_input: torch.Tensor, timestep: torch.Tensor,
+    def forward(self, x_t: torch.Tensor, timestep: torch.Tensor,
                 ctm_data: Optional[Dict[str, torch.Tensor]] = None,
-                hipa_control_signal: Optional[torch.Tensor] = None, confidence_level: str = 'medium') -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]: # Added hipa_control_signal, updated return type
-        self.forward = torch.compile(self.forward)
+                hipa_control_signal: Optional[torch.Tensor] = None, confidence_level: str = 'medium') -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
         """
-        Predict noise with DEEP CTM control and influence.
-        
-        Args:
-            noisy_input: Noisy data to denoise
-            timestep: Current diffusion timestep
-            ctm_data: Dictionary containing all CTM states and outputs
-            hipa_control_signal: Signal to control HIPA activation in submodules.
-        Returns:
-            Predicted noise (or x0 depending on UNet) and potentially guidance info.
-            For now, let's assume it returns just the prediction.
-            The original return was torch.Tensor. If guidance_info is returned, it should be Tuple.
-            Let's stick to torch.Tensor for now and adjust if guidance_info is added here.
+        Predict velocity v_θ(x_t, t) for rectified flow in unified byte space.
         """
-        # This method's responsibility is to predict noise using its internal UNet/etc.,
-        # conditioned by ctm_data and potentially using hipa_control_signal if its submodules are HIPA-aware.
-        # The current CTMControlledDiffusionProcessor structure doesn't show internal HIPA modules directly.
-        # If self.noise_predictor_refined or other components were HIPA-aware, they'd use hipa_control_signal.
-        # For now, we ensure it's accepted.
-        
         # Time embedding
         if timestep.dim() == 0:
             timestep = timestep.unsqueeze(0)
         time_emb = self.time_embedding(timestep.float().unsqueeze(-1))
         
-        # Base noise prediction
-        combined = torch.cat([noisy_input, time_emb], dim=-1) # Reverted: No task_embedding
-        base_noise_pred = self.noise_predictor_base(combined)
+        # Base velocity prediction
+        combined = torch.cat([x_t, time_emb], dim=-1)
+        base_velocity = self.velocity_predictor(combined)
         
-        # If no CTM context, return base prediction
+        # If no CTM context, return base velocity
         if ctm_data is None:
-            confidence = torch.tensor(1.0, device=base_noise_pred.device)
-            return base_noise_pred, confidence
+            confidence = torch.tensor(1.0, device=base_velocity.device)
+            return base_velocity, confidence
         
-        # Extract CTM influences
+        # Extract and combine CTM influences (same as before)
         ctm_influences = []
         influence_weights = []
-        
         # 1. Synchronization influence (STRONGEST)
         if 'final_sync_out' in ctm_data:
             sync_influence = self.ctm_sync_processor(ctm_data['final_sync_out'])
             ctm_influences.append(sync_influence)
             influence_weights.append(self.sync_influence_weight)
-        
         # 2. Certainty-based adaptive influence
         if 'certainties' in ctm_data:
             # Use final iteration certainty
-            final_certainty = ctm_data['certainties'][:, :, -1]  # (B, 2)
+            final_certainty = ctm_data['certainties'][:, :, -1] # (B, 2)
             certainty_influence = self.ctm_certainty_processor(final_certainty)
-            
             # Scale influence by certainty level
             certainty_strength = final_certainty[:, 0].unsqueeze(-1)  # High certainty = strong influence
             scaled_certainty_influence = certainty_influence * certainty_strength
-            
             ctm_influences.append(scaled_certainty_influence)
             influence_weights.append(self.certainty_influence_weight)
-        
         # 3. Internal state influence
         if 'activated_states' in ctm_data and len(ctm_data['activated_states']) > 0:
             # Use final activated state
@@ -1277,163 +1254,110 @@ class CTMControlledDiffusionProcessor(nn.Module):
             state_influence = self.ctm_state_processor(final_state)
             ctm_influences.append(state_influence)
             influence_weights.append(self.state_influence_weight)
-        
         # 4. Prediction history influence
         if 'predictions' in ctm_data:
-            # Flatten prediction history
-            pred_history = ctm_data['predictions'].flatten(start_dim=1)  # (B, out_dims * iterations)
+             # Flatten prediction history
+            pred_history = ctm_data['predictions'].flatten(start_dim=1)
             pred_influence = self.ctm_prediction_processor(pred_history)
             ctm_influences.append(pred_influence)
             influence_weights.append(self.prediction_influence_weight)
+             # Combine and weight CTM influences
         
-        # Combine and weight CTM influences
         if ctm_influences:
-            # Stack influences and weights
-            stacked_influences = torch.stack(ctm_influences, dim=1)  # (B, num_influences, d_model)
-            stacked_weights = torch.stack(influence_weights, dim=0)  # (num_influences,)
-            
-            # Apply learned weights
-            weighted_influences = stacked_influences * stacked_weights.view(1, -1, 1) # (B, num_influences, config.d_model)
-            
+            stacked_influences = torch.stack(ctm_influences, dim=1)
+            stacked_weights = torch.stack(influence_weights, dim=0)
+            weighted_influences = stacked_influences * stacked_weights.view(1, -1, 1)
             # Project weighted_influences (keys and values) to target_noise_dim
             # Original shape: (B, num_influences, config.d_model)
             # Target shape for K,V: (B, num_influences, self.target_noise_dim)
             batch_size_attn, num_influences_attn, _ = weighted_influences.shape
-            projected_kv_for_attention = self.kv_projector_for_ctm_attention(
+            projected_kv = self.kv_projector_for_ctm_attention(
                 weighted_influences.reshape(batch_size_attn * num_influences_attn, self.config.d_model)
             ).reshape(batch_size_attn, num_influences_attn, self.target_noise_dim)
-
             # Use CTM-guided attention to combine influences
             # Query is base_noise_pred (B, self.target_noise_dim)
-            query = base_noise_pred.unsqueeze(1)  # (B, 1, self.target_noise_dim)
-            attended_influence, attention_weights = self.ctm_guided_attention(
-                query, projected_kv_for_attention, projected_kv_for_attention # K and V are projected
-            )
-            attended_influence = attended_influence.squeeze(1)  # (B, self.target_noise_dim)
+            query = base_velocity.unsqueeze(1)
+            attended_influence, _ = self.ctm_guided_attention(query, projected_kv, projected_kv)
+            attended_influence = attended_influence.squeeze(1)
             
-            # Progressive refinement with CTM control
-            current_noise = base_noise_pred
-            
-            # Get primary CTM influences for refinement
-            # These influences are config.d_model (512) dimensional.
-            batch_size_for_fallback = base_noise_pred.shape[0]
-            device_for_fallback = base_noise_pred.device
-            dtype_for_fallback = base_noise_pred.dtype
-
-            sync_inf = ctm_influences[0] if len(ctm_influences) > 0 else torch.zeros(batch_size_for_fallback, self.config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
-            state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros(batch_size_for_fallback, self.config.d_model, device=device_for_fallback, dtype=dtype_for_fallback)
-            
+            current_velocity = base_velocity
             # Multi-stage refinement
             deltas = []
-            prev_noise = current_noise.clone()
+            prev_velocity = current_velocity.clone()
             for i, refinement_layer in enumerate(self.ctm_noise_refinement):
-                # CTM Feedback
                 if hasattr(self, 'ctm_feedback_module') and self.ctm_feedback_module is not None and ctm_data and 'final_sync_out' in ctm_data:
-                    if current_noise.dim() == 2:
-                        current_noise_for_feedback = current_noise.unsqueeze(1)
-                    else:
-                        current_noise_for_feedback = current_noise
-                    
-                    if current_noise_for_feedback.size(-1) == self.ctm_feedback_module.diffusion_model_dim:
-                        feedback_signal = self.ctm_feedback_module(current_noise_for_feedback, ctm_data['final_sync_out'])
-                        current_noise = current_noise + feedback_signal.squeeze(1)
-
+                    feedback_input = current_velocity.unsqueeze(1) if current_velocity.dim() == 2 else current_velocity
+                    if feedback_input.size(-1) == self.ctm_feedback_module.diffusion_model_dim:
+                        feedback = self.ctm_feedback_module(feedback_input, ctm_data['final_sync_out'])
+                        current_velocity = current_velocity + feedback.squeeze(1)
                 # Combine current noise with CTM influences
-                refinement_input = torch.cat([current_noise, sync_inf, state_inf], dim=-1)
+                sync_inf = ctm_influences[0] if len(ctm_influences) > 0 else torch.zeros_like(current_velocity[:, :self.config.d_model])
+                state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros_like(sync_inf)
+                refinement_input = torch.cat([current_velocity, sync_inf, state_inf], dim=-1)
                 refinement = refinement_layer(refinement_input)
-                
-                # Progressive residual connection with increasing CTM influence
+                 # Progressive residual connection with increasing CTM influence
                 ctm_strength = self.coupling_strength * (i + 1) / len(self.ctm_noise_refinement)
-                current_noise = current_noise + refinement * ctm_strength
-                delta = torch.norm(current_noise - prev_noise, dim=-1).mean()
+                current_velocity = current_velocity + refinement * ctm_strength
+                delta = torch.norm(current_velocity - prev_velocity, dim=-1).mean()
                 deltas.append(delta)
-                prev_noise = current_noise.clone()
-
+                prev_velocity = current_velocity.clone()
                 # Apply Neuromodulators
+                
                 if self.config.enable_neuromodulators:
-                    modulation = torch.ones_like(current_noise)
-                    for name, mod in self.neuromodulators.items():
-                        mod_input = current_noise  # Using current noise as input
-                        modulation = modulation * mod(mod_input)
-                    current_noise = current_noise * modulation
+                    modulation = torch.ones_like(current_velocity)
+                    for mod in self.neuromodulators.values():
+                        modulation *= mod(current_velocity)
+                    current_velocity *= modulation
             
-            # Final certainty-based scaling
+             # Final certainty-based scaling
+            
             if deltas:
                 variance = torch.var(torch.stack(deltas))
                 confidence = torch.exp(-variance)
                 threshold = self.confidence_thresholds.get(confidence_level, 0.8)
                 if not self.training and confidence < threshold:
-                    current_noise = current_noise * 0
+                    current_velocity *= 0
             else:
-                confidence = torch.tensor(1.0, device=current_noise.device)
+                confidence = torch.tensor(1.0, device=current_velocity.device)
             if 'certainties' in ctm_data:
                 final_certainty = ctm_data['certainties'][:, :, -1]
-                noise_scale = self.certainty_noise_scaler(final_certainty)
-                current_noise = current_noise * noise_scale
-            
+                scale = self.certainty_noise_scaler(final_certainty)
+                current_velocity *= scale
             # Apply Task-Aware HiPA for intelligent frequency enhancement
+            
             if self.enable_task_aware_hipa:
-                # Determine task_id from CTM data or use default
-                task_id = getattr(ctm_data, 'task_id', 0) if hasattr(ctm_data, 'task_id') else 0
-                
-                # Apply intelligent frequency enhancement
+                task_id = getattr(ctm_data, 'task_id', 0) if ctm_data else 0
+                 # Apply intelligent frequency enhancement
                 # Reshape current_noise (B, D) to (B, 1, D) for FrequencyDomainAwareAttention
-                current_noise_unsqueezed = current_noise.unsqueeze(1)
-                enhanced_noise_squeezed, modality_config = self.task_aware_hipa(
-                    current_noise_unsqueezed,
-                    hipa_control_signal=hipa_control_signal,
-                    context_hints={'ctm_data': ctm_data} if ctm_data is not None else None
-                )
+                current_velocity_unsqueezed = current_velocity.unsqueeze(1)
                 # Reshape enhanced_noise (B, 1, D) back to (B, D)
-                enhanced_noise = enhanced_noise_squeezed.squeeze(1)
-                
-                # Log modality detection for debugging
-                if hasattr(self, '_debug_mode') and self._debug_mode:
-                    print(f"CTM Diffusion - HiPA Applied: {modality_config['use_hipa']} for {modality_config['modality']}")
-                
-                current_noise = enhanced_noise
+                enhanced_velocity_squeezed, _ = self.task_aware_hipa(
+                    current_velocity_unsqueezed, hipa_control_signal=hipa_control_signal,
+                    context_hints={'ctm_data': ctm_data} if ctm_data else None
+                )
+                current_velocity = enhanced_velocity_squeezed.squeeze(1)
+                # Apply Integration Flow refinement if enabled
             
-            # Apply Integration Flow refinement if enabled
             if self.enable_integration_flow and 'final_sync_out' in ctm_data:
-                # Use Integration Flow principles for final refinement
-                # Integration Flow: x_0 = x_t - G(x_0, x_t, t)
-                
-                # Get CTM synchronization as guidance
                 sync_guidance = ctm_data['final_sync_out']
-                
                 # Apply Integration Flow correction
-                if sync_guidance.shape[-1] == current_noise.shape[-1]:
-                    # Direct application if dimensions match
-                    integration_correction = sync_guidance * self.integration_flow_strength
-                    current_noise = current_noise - integration_correction
-                else:
-                    # Project sync guidance to noise space if needed
-                    if hasattr(self, 'sync_to_noise_proj'):
-                        projected_sync = self.sync_to_noise_proj(sync_guidance)
-                        integration_correction = projected_sync * self.integration_flow_strength
-                        current_noise = current_noise - integration_correction
-
-            # Handle abstention based on confidence threshold
-            if 'abstained' in ctm_data and ctm_data['abstained'].any():
-                abstained_mask = ctm_data['abstained'].squeeze(-1) # Shape (B,)
-                
-                # Reshape mask for broadcasting to noise tensor shape
-                while abstained_mask.dim() < current_noise.dim():
-                    abstained_mask = abstained_mask.unsqueeze(-1)
-                
-                # Where abstained, use the base (unconditioned) noise prediction.
-                # Otherwise, use the CTM-guided prediction.
-                final_noise = torch.where(abstained_mask, base_noise_pred, current_noise)
-                return final_noise, confidence
+                if sync_guidance.shape[-1] != current_velocity.shape[-1]:
+                    sync_guidance = nn.Linear(sync_guidance.shape[-1], current_velocity.shape[-1])(sync_guidance).to(current_velocity.device)
+                correction = sync_guidance * self.integration_flow_strength
+                current_velocity -= correction
             
-            return current_noise, confidence
+            if 'abstained' in ctm_data and ctm_data['abstained'].any():
+                mask = ctm_data['abstained'].squeeze(-1)
+                while mask.dim() < current_velocity.dim(): mask = mask.unsqueeze(-1)
+                return torch.where(mask, base_velocity, current_velocity), confidence
+            
+            return current_velocity, confidence
         
-        # If no CTM data, still apply Task-Aware HiPA if enabled
         if self.enable_task_aware_hipa:
-            enhanced_noise, _ = self.task_aware_hipa(base_noise_pred, task_id=0)
-            return enhanced_noise
+            enhanced_velocity, _ = self.task_aware_hipa(base_velocity.unsqueeze(1), task_id=0).squeeze(1)
+            return enhanced_velocity
         
-        return base_noise_pred
+        return base_velocity
     
     def compute_enhanced_ctm_guidance(self, ctm_data: Dict[str, torch.Tensor],
                                     target_shape: Tuple[int, ...]) -> torch.Tensor:
@@ -1670,19 +1594,21 @@ class CTMControlledDiffusionProcessor(nn.Module):
         return generated, False
 
     def add_noise(self, x_start: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        """Add noise to clean data according to diffusion schedule"""
-        # Get alpha_bar for the given timesteps
-        timesteps = torch.clamp(timesteps, 0, len(self.alpha_bars) - 1).to(self.alpha_bars.device)
-        alpha_bar = self.alpha_bars[timesteps]
+        """
+        Create a noisy sample x_t for rectified flow at a given timestep.
+        x_t = t * x_1 + (1 - t) * x_0, where x_1 is noise and x_0 is the clean data.
+        """
+        # Timestep `t` is expected to be in [0, 1] for rectified flow.
+        # We need to map the integer timesteps (0 to T-1) to this range.
+        t = timesteps.float() / (self.config.diffusion_timesteps - 1)
         
-        # Reshape alpha_bar to match x_start dimensions
-        while len(alpha_bar.shape) < len(x_start.shape):
-            alpha_bar = alpha_bar.unsqueeze(-1)
-        
-        # Apply noise: x_t = sqrt(alpha_bar) * x_0 + sqrt(1 - alpha_bar) * noise
-        noisy_x = torch.sqrt(alpha_bar) * x_start + torch.sqrt(1 - alpha_bar) * noise
-        
-        return noisy_x
+        # Reshape t to match x_start dimensions for broadcasting
+        while len(t.shape) < len(x_start.shape):
+            t = t.unsqueeze(-1)
+            
+        # Linear interpolation between data (x_0) and noise (x_1)
+        x_t = t * noise + (1 - t) * x_start
+        return x_t
 
     def integration_flow_one_step_generation(self, shape: Tuple[int, ...],
                                            ctm_data: Dict[str, torch.Tensor], #  HIPA controlled by signal
@@ -1847,77 +1773,24 @@ class CTMControlledDiffusionProcessor(nn.Module):
     def denoise_one_step(self, x_t: torch.Tensor, timestep: torch.Tensor,
                          ctm_data: Optional[Dict[str, torch.Tensor]] = None,
                          hipa_control_signal: Optional[torch.Tensor] = None,
-                         eta: float = 0.0, # For DDIM
-                         generator: Optional[torch.Generator] = None, # For stochasticity if needed by scheduler
                          confidence_level: str = 'medium') -> torch.Tensor:
         """
-        Performs one step of denoising using the diffusion model, conditioned by CTM.
-        This encapsulates calling the model's forward pass and then using the scheduler.
-
-        Args:
-            x_t (torch.Tensor): The current noisy input (e.g., x_t).
-            timestep (torch.Tensor): The current timestep. Ensure it's a tensor, possibly (batch_size,).
-            ctm_data (Optional[Dict[str, torch.Tensor]]): Conditioning data from CTM.
-            inferred_task_latent (Optional[torch.Tensor]): Inferred task latent for conditioning.
-            hipa_control_signal (Optional[torch.Tensor]): HIPA control signal.
-            eta (float): Eta parameter for DDIM scheduler.
-            generator (Optional[torch.Generator]): Random generator for schedulers that require it.
-
-        Returns:
-            torch.Tensor: The denoised sample from the previous step (e.g., x_{t-1}).
+        Performs one step of denoising for rectified flow using simple Euler integration.
+        x_{t-dt} = x_t - v_t * dt
         """
-        # Ensure timestep is correctly shaped for the model forward pass if it expects a scalar or batched tensor
-        # The CTMControlledDiffusionProcessor.forward expects timestep as (B,) or a scalar that can be broadcasted.
-        # If timestep is a scalar tensor, it might need unsqueezing or repeating.
-        # For safety, let's assume timestep is already correctly batched if x_t is batched.
+        # 1. Predict velocity using the main forward method
+        # The forward method now returns velocity `v_theta`
+        v_theta, _ = self.forward(x_t, timestep, ctm_data, hipa_control_signal, confidence_level)
+
+        # 2. Compute the step size `dt`
+        # For a T-step diffusion process, dt is 1/T.
+        dt = 1.0 / self.config.diffusion_timesteps
         
-        # 1. Predict noise (or x0) using the main forward method of this processor
-        model_output_tuple = self.forward( # Calls CTMControlledDiffusionProcessor.forward
-            noisy_input=x_t,
-            timestep=timestep, # Pass the potentially batched timestep tensor
-            ctm_data=ctm_data,
-            hipa_control_signal=hipa_control_signal,
-            confidence_level=confidence_level
-        )
-        
-        # The forward method returns a tuple: (prediction, ctm_guidance_info)
-        # We only need the prediction for the scheduler.
-        predicted_value = model_output_tuple[0]
-
-
-        # 2. Use the sampling_noise_scheduler to compute the previous sample
-        # Ensure the arguments match the specific scheduler being used.
-        if hasattr(self, 'sampling_noise_scheduler') and hasattr(self.sampling_noise_scheduler, 'step'):
-            # For DDPMScheduler, DDIMScheduler from diffusers
-            scheduler_step_kwargs = {
-                "model_output": predicted_value,
-                "timestep": timestep,
-                "sample": x_t,
-                "generator": generator
-            }
-            # Check if scheduler's step method accepts 'eta'
-            import inspect
-            sig = inspect.signature(self.sampling_noise_scheduler.step)
-            if "eta" in sig.parameters:
-                 scheduler_step_kwargs["eta"] = eta
+        # 3. Apply the Euler integration step
+        # We are moving from t to t-dt, so we subtract the velocity term.
+        x_prev = x_t - v_theta * dt
             
-            scheduler_output = self.sampling_noise_scheduler.step(**scheduler_step_kwargs)
-            
-            if isinstance(scheduler_output, dict):
-                 prev_sample = scheduler_output.get('prev_sample')
-                 if prev_sample is None:
-                     prev_sample = scheduler_output.get('pred_original_sample')
-            elif hasattr(scheduler_output, 'prev_sample'):
-                prev_sample = scheduler_output.prev_sample
-            else:
-                prev_sample = scheduler_output
-
-            if prev_sample is None:
-                raise ValueError("sampling_noise_scheduler output did not contain 'prev_sample' or 'pred_original_sample'.")
-        else:
-            raise NotImplementedError(f"CTMControlledDiffusionProcessor.sampling_noise_scheduler is not defined or has no 'step' method.")
-            
-        return prev_sample
+        return x_prev
 
 class JEPAModule(nn.Module):
     def __init__(self, config, dynamic_entropy_patcher):
@@ -2843,44 +2716,46 @@ class EnhancedCTMDiffusion(nn.Module):
         batch_size, num_patches, patch_dim = online_patch_embeddings.shape
         parallel_patches = online_patch_embeddings.view(batch_size, -1)
         
-        # --- Diffusion Model Logic ---
-        numeric_target_diffusion_output = None
-        if target_diffusion_output is not None:
-            # PARALLEL PATCH GENERATION MODIFICATION
-            # Flatten target for parallel processing
-            target_flat = target_diffusion_output.view(batch_size, -1)
-            
-            # Normalize flattened target
-            if target_flat.dtype == torch.uint8:
-                float_target = target_flat.float() 
-                # 2. Normalize the values. ARC symbols are 0-9, padding is 10.
-                # Normalizing to the standard [-1, 1] range.
-                # Max value is 10. (val / 5.0) - 1.0 maps [0, 10] to [-1, 1].
-                normalized_target = (float_target / 255.0) * 2.0 - 1.0  # Normalize to [-1, 1]
-                numeric_target_diffusion_output = normalized_target
-            else: # Already numeric (e.g., during sampling)
-                numeric_target_diffusion_output = target_flat
+        # --- Diffusion Model Logic (Rectified Flow) ---
+        if target_diffusion_output is not None and mode in ['ctm_controlled_diffusion', 'diffusion_only']:
+            # This is the forward pass for training, where we compute the loss.
+            # 1. Prepare the clean target `x_0`
+            if target_diffusion_output.dtype == torch.uint8:
+                target_flat = target_diffusion_output.view(batch_size, -1).float()
+                x_0 = (target_flat / 255.0) * 2.0 - 1.0 # Normalize to [-1, 1]
+            else:
+                x_0 = target_diffusion_output.view(batch_size, -1)
 
-            # Use flattened CTM data and parallel patches
-            ctm_data_flat = {
-                k: v.view(batch_size, -1) if isinstance(v, torch.Tensor) else v
-                for k, v in ctm_data.items()
-            }
+            # Ensure x_0 has the correct dimension for the diffusion processor
+            current_len = x_0.shape[-1]
+            target_unet_len = self.config.unet_input_feature_dim
+            if current_len < target_unet_len:
+                padding = torch.zeros(batch_size, target_unet_len - current_len, device=device, dtype=x_0.dtype)
+                x_0 = torch.cat([x_0, padding], dim=-1)
+            elif current_len > target_unet_len:
+                x_0 = x_0[:, :target_unet_len]
             
-            # Generate noise based on flattened target
-            noise = torch.randn_like(numeric_target_diffusion_output)
-            noisy_input = self.diffusion.add_noise(numeric_target_diffusion_output, noise, timestep)
+            # 2. Sample noise `x_1` (the other end of the flow)
+            x_1 = torch.randn_like(x_0)
             
-            # Predict with diffusion using parallel inputs
-            pred = self.diffusion(
-                noisy_input=noisy_input,
+            # 3. Create the noisy input `x_t` using the rectified flow `add_noise`
+            # This performs the interpolation: x_t = t * x_1 + (1 - t) * x_0
+            noisy_input = self.diffusion.add_noise(x_start=x_0, noise=x_1, timesteps=timestep)
+
+            # 4. Predict the velocity `v_theta(x_t, t)`
+            # The CTM core has already been run on the input `byte_sequence`
+            # We can reuse the `ctm_data` and `hipa_control_signal` from that.
+            predicted_velocity, _ = self.diffusion(
+                x_t=noisy_input,
                 timestep=timestep,
-                ctm_data=ctm_data_flat,
+                ctm_data=ctm_data, # Use the original CTM data
                 hipa_control_signal=hipa_control_signal
             )
-            
-            # Compute loss on flattened outputs
-            diffusion_loss = F.mse_loss(pred, noise)
+
+            # 5. Compute the velocity matching loss for rectified flow
+            # The target velocity is simply `x_1 - x_0`
+            target_velocity = x_1 - x_0
+            diffusion_loss = F.mse_loss(predicted_velocity, target_velocity)
             losses['diffusion_loss'] = diffusion_loss
 
         # PARALLEL PATCH GENERATION MODIFICATION
