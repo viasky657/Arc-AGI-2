@@ -153,7 +153,14 @@ class UnifiedCTMDenoisingModel(HierarchicalCTM):
         final_sync_out = ctm_output_data['final_sync_out']
         predicted_velocity = self.final_velocity_projection(final_sync_out)
 
-        return predicted_velocity
+        output = {'predicted_velocity': predicted_velocity}
+        if self.training:
+            output['empathy_loss'] = ctm_output_data.get('empathy_loss', torch.tensor(0.0, device=predicted_velocity.device))
+            output['mirror_loss'] = ctm_output_data.get('mirror_loss', torch.tensor(0.0, device=predicted_velocity.device))
+            output['basal_ganglia_loss'] = ctm_output_data.get('basal_ganglia_loss', torch.tensor(0.0, device=predicted_velocity.device))
+            output['amygdala_loss'] = ctm_output_data.get('amygdala_loss', torch.tensor(0.0, device=predicted_velocity.device))
+        
+        return output
 
     def hrm_forward_with_full_tracking(self,
        x: torch.Tensor,
@@ -179,6 +186,10 @@ class UnifiedCTMDenoisingModel(HierarchicalCTM):
        r_out = torch.exp(-self.decay_params_out).unsqueeze(0).expand(b, -1)
             
        zH_history = []
+       empathy_loss = torch.tensor(0.0, device=device)
+       mirror_loss = torch.tensor(0.0, device=device)
+       basal_ganglia_loss = torch.tensor(0.0, device=device)
+       amygdala_loss = torch.tensor(0.0, device=device)
 
        for n in range(self.config.hrm_high_level_cycles):
             decay_alpha_action, decay_beta_action = None, None
@@ -187,9 +198,11 @@ class UnifiedCTMDenoisingModel(HierarchicalCTM):
                 sync_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(
                     activated_zL, decay_alpha_action, decay_beta_action, r_action, 'action'
                 )
+                dopamine_error = torch.tensor(0.0, device=device)
                 if self.basal_ganglia:
-                    action_candidates = [sync_action, sync_action * 0.5, sync_action * 1.5]
-                    sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, x_context.mean(dim=1))
+                    action_gate, dopamine_error = self.basal_ganglia(activated_zL, x_context.mean(dim=1), None)
+                    sync_action = sync_action * action_gate
+                basal_ganglia_loss += dopamine_error.mean()
                 
                 modified_zH = zH + time_embedding
                 
@@ -217,6 +230,32 @@ class UnifiedCTMDenoisingModel(HierarchicalCTM):
             
             zH, _, _, _, _ = self.h_module(modified_zH_h, fused_input, retrieved_memory, thought_guidance=thought_guidance, confidence_level=confidence_level)
 
+            if self.config.enable_synaptic_empathy and hasattr(self, 'synaptic_empathy'):
+                synaptic_modulation, empathy_reward = self.synaptic_empathy(
+                    self_state_trace=zL_trace,
+                    observed_state_trace=zL_trace, # Using self-trace as observed for now
+                    self_activated_state=activated_zL
+                )
+                zH = zH + synaptic_modulation * 0.1
+                empathy_loss += -empathy_reward.mean() * self.config.synaptic_empathy_reward_weight
+            
+            if self.config.enable_mirror_neurons and hasattr(self, 'mirror_neuron'):
+                batch_size = zH.shape[0]
+                prev_self_emotion = torch.zeros(batch_size, 1, self.config.num_emotion_dim, device=device)
+                prev_observed_emotion = torch.zeros(batch_size, 1, self.config.num_emotion_dim, device=device)
+                prev_observed_goal = torch.zeros(batch_size, 1, self.config.goal_dim, device=device)
+                
+                modulated_zH, _, _, mirror_reward, current_amygdala_loss = self.mirror_neuron(
+                    self_state=zH.unsqueeze(1),
+                    observed_state=zH.unsqueeze(1), # using self-state as observed
+                    prev_self_emotion=prev_self_emotion,
+                    prev_observed_emotion=prev_observed_emotion,
+                    prev_observed_goal=prev_observed_goal
+                )
+                zH = modulated_zH.squeeze(1)
+                mirror_loss += -mirror_reward.mean() * self.config.mirror_reward_weight
+                amygdala_loss += current_amygdala_loss
+
             zH_history.append(zH)
        # Final output from the last H-state
        final_zH_trace = torch.stack(zH_history, dim=-1)
@@ -224,7 +263,13 @@ class UnifiedCTMDenoisingModel(HierarchicalCTM):
            final_zH_trace[:,:, -1], None, None, r_out, 'out'
        )
 
-       return { 'final_sync_out': final_sync_out }
+       return {
+           'final_sync_out': final_sync_out,
+           'empathy_loss': empathy_loss,
+           'mirror_loss': mirror_loss,
+           'basal_ganglia_loss': basal_ganglia_loss,
+           'amygdala_loss': amygdala_loss
+        }
 
 
     # Add sampling and training helper methods

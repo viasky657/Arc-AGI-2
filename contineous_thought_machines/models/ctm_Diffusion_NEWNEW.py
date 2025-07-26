@@ -1679,6 +1679,11 @@ class EnhancedCTMDiffusion(nn.Module):
             predicted_velocity = self.denoising_model(noisy_input, timestep, conditioning_features=conditioning_features)
             target_velocity = self.denoising_model.get_velocity(x_0, x_1)
             losses['diffusion_loss'] = F.mse_loss(predicted_velocity, target_velocity)
+            if isinstance(predicted_velocity, dict):
+                empathy_loss = predicted_velocity.get('empathy_loss', torch.tensor(0.0, device=predicted_velocity['predicted_velocity'].device))
+                mirror_loss = predicted_velocity.get('mirror_loss', torch.tensor(0.0, device=predicted_velocity['predicted_velocity'].device))
+                losses['empathy_loss'] = empathy_loss
+                losses['mirror_loss'] = mirror_loss
 
         # 3. JEPA self-supervised loss
         if self.config.use_jepa_training and self.training:
@@ -1703,12 +1708,25 @@ class EnhancedCTMDiffusion(nn.Module):
             
             self._update_jepa_target_encoder()
 
-
         # Combine all losses
+        if 'diffusion_loss' in losses and isinstance(losses['diffusion_loss'], dict):
+            diffusion_outputs = losses['diffusion_loss']
+            losses['diffusion_loss'] = diffusion_outputs['predicted_velocity']
+            losses['amygdala_loss'] = diffusion_outputs.get('amygdala_loss', torch.tensor(0.0, device=device))
+            losses['basal_ganglia_loss'] = diffusion_outputs.get('basal_ganglia_loss', torch.tensor(0.0, device=device))
+
         total_loss = sum(losses.values()) if losses else torch.tensor(0.0, device=device)
 
+        #Make sure to handle dict and tensor returns for predicted_velocity
+        final_output = None
+        if 'diffusion_loss' in losses:
+            if isinstance(predicted_velocity, dict):
+                final_output = predicted_velocity['predicted_velocity']
+            else:
+                final_output = predicted_velocity
+
         return {
-            'final_output': predicted_velocity if 'diffusion_loss' in losses else None,
+            'final_output': final_output,
             'total_loss': total_loss,
             **losses
         }
