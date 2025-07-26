@@ -151,9 +151,10 @@ class EnhancedCTMConfig: # Renamed from ContinualLearningConfig for consistency 
     diffusion_beta_start: float = 0.0001
     diffusion_beta_end: float = 0.02
     diffusion_timesteps: int = 1000 # Number of timesteps for the diffusion process
-    ctm_diffusion_coupling_strength: float = 0.8 # How CTM influences diffusion
-    adaptive_scheduling: bool = True  # CTM-adaptive diffusion timestep scheduling
-    iterative_refinement: bool = True # Iterative CTM-diffusion refinement for sampling
+    
+    # CTM Time Conditioning
+    ctm_time_embedding_dim: int = 128
+    ctm_time_injection_point: str = 'adaptive' # 'initial', 'recurrent', 'adaptive'
     
     #Inferred_Latent_Dimensions Set to Avoid runtime errors but it does not functionally do anything in the model or program processing. 
     inferred_task_latent_dim=512
@@ -4054,31 +4055,28 @@ class HRM_L_Module(nn.Module):
                 activated_zL: torch.Tensor,
                 zL_trace: torch.Tensor,
                 zH: torch.Tensor,
-                x_context: torch.Tensor,
+                kv: torch.Tensor,
                 sync_action: torch.Tensor,
                 confidence_level: str = 'medium') -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs one step of the low-level CTM computation.
-    
+
         Args:
             activated_zL: Current post-activation state of the L-module. (B, D)
             zL_trace: History of pre-activations for the L-module. (B, D, M)
             zH: Current high-level state, provides top-down context. (B, D)
-            x_context: External input, provides bottom-up context. (B, S, d_input)
+            kv: Precomputed key/value context from H-module. (B, S, d_input)
             sync_action: Synchronization representation for generating attention query. (B, sync_dim)
-    
+
         Returns:
             A tuple of (next_activated_zL, next_zL_trace).
         """
-        x_context = self.mamba_encoder(x_context, confidence_level=confidence_level).contiguous()
     
         # 1. Interact with context via attention
         # Query is from L-module's own action synchronisation
         q = self.q_proj(sync_action).unsqueeze(1)
         
-        # Key/Value is a combination of external input and high-level context
-        # Add zH as part of the key/value context
-        kv = x_context + zH.unsqueeze(1)
+        # Key/Value is precomputed and passed in
         attn_out, _ = self.attention(q, kv, kv)
         attn_out = attn_out.squeeze(1)
     
@@ -4304,12 +4302,13 @@ class HierarchicalCTM(OriginalCTMCore):
             return self.hrm_forward_with_full_tracking(x, thought_guidance, confidence_level, voice1_id, voice2_id, blend_degree)
 
     def hrm_forward_with_full_tracking(self,
-                                        x: torch.Tensor,
-                                        thought_guidance: bool = True,
-                                        confidence_level: str = 'medium',
-                                        voice1_id: Optional[torch.Tensor] = None,
-                                        voice2_id: Optional[torch.Tensor] = None,
-                                        blend_degree: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                                     x: torch.Tensor,
+                                     thought_guidance: bool = True,
+                                     confidence_level: str = 'medium',
+                                     voice1_id: Optional[torch.Tensor] = None,
+                                     voice2_id: Optional[torch.Tensor] = None,
+                                     blend_degree: Optional[torch.Tensor] = None,
+                                     time_embedding: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
         The original hierarchical reasoning process.
         """
@@ -4330,6 +4329,9 @@ class HierarchicalCTM(OriginalCTMCore):
         activated_zL = self.start_activated_zL.unsqueeze(0).expand(b, -1)
         zL_trace = self.start_trace_zL.unsqueeze(0).expand(b, -1, -1)
         zH = self.start_zH.unsqueeze(0).expand(b, -1)
+        
+        if time_embedding is not None:
+            zH = zH + time_embedding
         
         # Optional voice blending
         if voice1_id is not None and voice2_id is not None and blend_degree is not None:
@@ -4354,6 +4356,10 @@ class HierarchicalCTM(OriginalCTMCore):
 
         # 4. Hierarchical recurrent loop
         for n in range(self.config.hrm_high_level_cycles):
+            # Precompute L-module context for this high-level cycle
+            encoded_context = self.l_module.mamba_encoder(x_context, confidence_level=confidence_level)
+            kv = encoded_context + zH.unsqueeze(1)
+            
             decay_alpha_action, decay_beta_action = None, None
             prev_zL = activated_zL.clone()
             for t in range(self.config.hrm_low_level_timesteps):
@@ -4363,8 +4369,13 @@ class HierarchicalCTM(OriginalCTMCore):
                 if self.basal_ganglia:
                     action_candidates = [sync_action, sync_action * 0.5, sync_action * 1.5]
                     sync_action = self.basal_ganglia.select_action(action_candidates, activated_zL, x_context.mean(dim=1))
+                
+                modified_zH = zH
+                if time_embedding is not None:
+                    modified_zH = modified_zH + time_embedding
+
                 activated_zL, zL_trace = self.l_module(
-                    activated_zL, zL_trace, zH, x_context, sync_action, confidence_level=confidence_level
+                    activated_zL, zL_trace, modified_zH, kv, sync_action, confidence_level=confidence_level
                 )
                 if self.config.enable_neuromodulators and hasattr(self, 'neuromodulators') and hasattr(self, 'mod_fusion'):
                     mod_outputs = [mod(activated_zL) for mod in self.neuromodulators.values()]
@@ -4379,11 +4390,16 @@ class HierarchicalCTM(OriginalCTMCore):
             surprise = compute_normalized_entropy(activated_zL.unsqueeze(1)).mean()
             if surprise > self.config.ltm_surprise_threshold:
                 self.ltm.add_to_memory(zH.squeeze(0), surprise)
+
             retrieved_memory = self.ltm.retrieve_from_memory(zH.squeeze(0))
             fused_input = torch.cat([activated_zL.unsqueeze(1), retrieved_memory], dim=1)
             fused_input = self.fusion_proj(fused_input.mean(dim=1))
             
-            zH, encoded_patches, patch_indices, entropy_aux_loss, confidence = self.h_module(zH, fused_input, retrieved_memory, thought_guidance=thought_guidance, confidence_level=confidence_level)
+            modified_zH_h = zH
+            if time_embedding is not None:
+                modified_zH_h = modified_zH_h + time_embedding
+
+            zH, encoded_patches, patch_indices, entropy_aux_loss, confidence = self.h_module(modified_zH_h, fused_input, retrieved_memory, thought_guidance=thought_guidance, confidence_level=confidence_level)
 
             if self.config.enable_neuromodulators and hasattr(self, 'neuromodulators') and hasattr(self, 'mod_fusion'):
                 mod_outputs = [mod(zH) for mod in self.neuromodulators.values()]

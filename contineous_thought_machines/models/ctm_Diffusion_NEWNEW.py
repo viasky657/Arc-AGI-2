@@ -103,9 +103,10 @@ def batched_numeric_tensor_to_bytes(numeric_batch_tensor: torch.Tensor, source_d
 
 
 from .enhanced_neuron_selection import EnhancedNeuronSelector #Enhances Nueron Selections with Biologically-Inspired Systems instead of Random
-from .ctm_components import HierarchicalCTM
+from .ctm_unified_diffusion import UnifiedCTMDenoisingModel
 from .ctm_components import (
     EnhancedCTMConfig,
+    HierarchicalCTM,
     OriginalCTMCore,
     CTMFeedbackModule,
     BasalGangliaMechanism,
@@ -933,864 +934,6 @@ class MixedPrecisionTrainer:
 
 
 
-class CTMControlledDiffusionProcessor(nn.Module):
-    """
-    Enhanced Diffusion processor with DEEP CTM integration and GPU optimizations.
-    
-    The CTM now has multiple levels of influence:
-    1. Direct noise prediction conditioning from synchronization states
-    2. Adaptive timestep scheduling based on CTM certainty
-    3. CTM-guided attention mechanisms for noise refinement
-    4. Iterative CTM-diffusion coupling during generation
-    5. CTM state-dependent diffusion guidance
-    6. Enhanced CTM guidance processors with adaptive strength
-    7. Quality preservation networks
-    8. Multi-resolution guidance for different data types
-    """
-
-    def __init__(self, config: EnhancedCTMConfig, actual_noisy_input_dim: int, task_analyzer: 'TaskAnalyzer'): # Added task_analyzer
-        super().__init__()
-        self.target_noise_dim = actual_noisy_input_dim # This is config.unet_input_feature_dim
-        
-        self.latent_dim = config.d_model
-        self.coupling_strength = config.ctm_diffusion_coupling_strength
-        self.adaptive_scheduling = config.adaptive_scheduling
-        self.iterative_refinement = config.iterative_refinement
-        self.config = config # Storing the config for other parts of the class
-        
-                
-        # Add recurrent connections
-        self.recurrent_cells = nn.ModuleDict()
-        for layer in range(config.n_layers):
-            self.recurrent_cells[f"layer_{layer}"] = nn.GRUCell(
-                input_size=config.d_model,
-                hidden_size=config.d_model
-            )
-            
-        # Add predictive coding modules
-        self.predictive_coders = nn.ModuleDict()
-        for layer in range(1, config.n_layers):
-            self.predictive_coders[f"layer_{layer}"] = nn.Sequential(
-                nn.Linear(config.d_model, config.d_model),
-                nn.ReLU()
-            )
-            
-        
-        # Replace WINA sparsifier with meta version
-        self.wina_sparsifier = MetaWINASparsifier(
-            sparsity_ratio=config.sparse_attention_ratio,
-            control_dim=getattr(config, 'control_dim', 64)
-        )
-
-        # Enhanced CTM guidance processors (from ctm_guided_integration_flow.py)
-        self.sync_to_flow_mapper = nn.Sequential(
-            nn.Linear(config.ctm_n_synch_out, config.d_model),
-            nn.GELU(),
-            nn.Linear(config.d_model, config.d_model * 2),
-            nn.GELU(),
-            nn.Linear(config.d_model * 2, config.d_model),
-            nn.Tanh()  # Bounded output for stable guidance
-        )
-        
-        # Multi-scale guidance fusion
-        self.guidance_fusion = nn.MultiheadAttention(
-            config.d_model, num_heads=8, batch_first=True
-        )
-        
-        # Certainty-adaptive guidance strength predictor
-        self.adaptive_strength_predictor = nn.Sequential(
-            nn.Linear(2 + config.d_model, 128),  # certainty + sync state
-            nn.GELU(),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()  # 0-1 strength
-        )
-        
-        # Quality preservation network
-        self.quality_enhancer = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.GELU(),
-            nn.Linear(config.d_model, config.d_model),
-            nn.Identity()  # Preserve original signal (residual connection)
-        )
-        
-        # Learned noise-to-data mapping (Integration Flow core)
-        self.flow_predictor = nn.Sequential(
-            nn.Linear(self.target_noise_dim * 3, config.d_model * 2),  # noise + sync + certainty
-            nn.GELU(),
-            nn.Linear(config.d_model * 2, config.d_model), # Intermediate
-            nn.GELU(),
-            nn.Linear(config.d_model, self.target_noise_dim) # Output target_noise_dim
-        )
-        
-        # Multi-resolution guidance for different data types
-        self.multi_res_processors = nn.ModuleList([
-            nn.Conv1d(config.d_model, config.d_model, kernel_size=k, padding=k//2)
-            for k in [3, 5, 7]  # Different receptive fields
-        ])
-        
-        # Learnable guidance weights
-        self.sync_weight = nn.Parameter(torch.tensor(1.0))
-        self.certainty_weight = nn.Parameter(torch.tensor(0.8))
-        self.prediction_weight = nn.Parameter(torch.tensor(0.6))
-        
-        # GPU optimization: Enable flow refinement
-        self.flow_refinement_enabled = True
-        
-        # Task-Aware HiPA system for intelligent frequency enhancement
-        self.task_aware_hipa = FrequencyDomainAwareAttention(
-            embed_dim=self.target_noise_dim, # Changed to target_noise_dim
-            num_heads=8,
-            task_analyzer=task_analyzer, # Pass the task_analyzer instance
-            config=config # Pass the main config
-        )
-
-        # Initialize Integration Flow + HiPA Sampler for ultra-fast generation
-        self.integration_flow_sampler = IntegrationFlowHiPASampler(
-            task_aware_hipa_module=self.task_aware_hipa, # Pass the HiPA module instance
-            num_steps=config.diffusion_steps,
-            beta_start=config.diffusion_beta_start,
-            beta_end=config.diffusion_beta_end,
-            sigma_min=0.01,
-            sigma_max=50.0,
-            hipa_freq_threshold=0.1,
-            integration_flow_strength=1.0,
-            model_type='VE'  # Default to VE for CTM integration
-        )
-        
-        # Integration Flow control parameters
-        self.enable_integration_flow = True
-        self.enable_task_aware_hipa = True
-        self.integration_flow_strength = nn.Parameter(torch.tensor(0.8))  # Learnable strength
-        
-        # Enhanced time embedding with CTM influence
-        self.time_embedding = nn.Sequential(
-            nn.Linear(1, config.d_model // 2),
-            nn.GELU(),
-            nn.Linear(config.d_model // 2, config.d_model)
-        )
-        
-        # CTM synchronization processor (strongest influence)
-        self.ctm_sync_processor = nn.Sequential(
-            nn.Linear(config.ctm_n_synch_out, config.d_model),
-            nn.GELU(),
-            nn.Linear(config.d_model, config.d_model * 2),
-            nn.GELU(),
-            nn.Linear(config.d_model * 2, config.d_model)
-        )
-        
-        # CTM certainty-based adaptive control
-        self.ctm_certainty_processor = nn.Sequential(
-            nn.Linear(2, config.d_model // 4),
-            nn.GELU(),
-            nn.Linear(config.d_model // 4, config.d_model)
-        )
-        
-        # CTM internal state processor
-        self.ctm_state_processor = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model),
-            nn.GELU(),
-            nn.Linear(config.d_model, config.d_model)
-        )
-        
-        # CTM prediction history processor
-        self.ctm_prediction_processor = nn.Sequential(
-            nn.Linear(config.ctm_out_dims * config.ctm_iterations, config.d_model),
-            nn.GELU(),
-            nn.Linear(config.d_model, config.d_model)
-        )
-        
-        # Multi-head attention for CTM-guided noise prediction
-        # Now using target_noise_dim (2048) as the embedding dimension
-        self.ctm_guided_attention = nn.MultiheadAttention(
-            self.target_noise_dim, num_heads=8, batch_first=True
-        )
-        
-        # Projection for the key and value of ctm_guided_attention
-        # Projects from config.d_model (512) to target_noise_dim (2048)
-        self.kv_projector_for_ctm_attention = nn.Linear(config.d_model, self.target_noise_dim)
-
-        # Base noise prediction network
-        # Velocity predictor for rectified flow (input: x_t + t_emb, output: v to x_0)
-        self.velocity_predictor = nn.Sequential(
-            nn.Linear(actual_noisy_input_dim + config.d_model, config.d_model * 2),
-            nn.GELU(),
-            nn.Linear(config.d_model * 2, self.target_noise_dim), # Changed output to target_noise_dim
-        )
-        
-        # CTM-controlled noise refinement (multiple stages)
-        self.ctm_noise_refinement = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.target_noise_dim + config.d_model * 2, config.d_model * 2),  # Changed input dim
-                nn.GELU(),
-                nn.Linear(config.d_model * 2, config.d_model), # Intermediate
-                nn.GELU(),
-                nn.Linear(config.d_model, self.target_noise_dim) # Changed output to target_noise_dim
-            ) for _ in range(4)  # 4 refinement stages
-        ])
-        
-        # CTM-adaptive diffusion schedule predictor
-        self.adaptive_schedule_predictor = nn.Sequential(
-            nn.Linear(config.d_model + 2, 128),  # CTM state + certainty
-            nn.GELU(),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-        
-        # Certainty-based noise scaling
-        self.certainty_noise_scaler = nn.Sequential(
-            nn.Linear(2, 32),
-            nn.GELU(),
-            nn.Linear(32, 1),
-            nn.Sigmoid()
-        )
-        
-        # Standard diffusion schedule
-        # Initialize a scheduler for sampling methods like denoise_one_step
-        self.sampling_noise_scheduler =  DPMSolverMultistepScheduler (
-            num_train_timesteps=config.diffusion_timesteps, # Use diffusion_timesteps from main config
-            beta_start=config.diffusion_beta_start,
-            beta_end=config.diffusion_beta_end,
-            beta_schedule="linear" # Changed from config.noise_schedule to fix NotImplementedError for 'cosine'
-        )
-        self.register_buffer('alpha_bars', self.sampling_noise_scheduler.alphas_cumprod.clone())
-        
-        # Learnable CTM influence weights
-        self.sync_influence_weight = nn.Parameter(torch.tensor(1.0))  # Strong sync influence
-        self.certainty_influence_weight = nn.Parameter(torch.tensor(0.8))
-        self.state_influence_weight = nn.Parameter(torch.tensor(0.6))
-        self.prediction_influence_weight = nn.Parameter(torch.tensor(0.4))
-        
-        # State history for thought loop detection
-        self.register_buffer('state_history', torch.zeros(10, config.d_model))  # Store last 10 states
-        self.history_pointer = 0
-        
-        # Missing components for early stopping
-        self.efficiency_predictor = nn.Sequential(
-            nn.Linear(config.d_model + 1, 64),  # state + step_ratio
-            nn.GELU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()
-        )
-
-        # CTM Feedback Module
-        if config.ctm_n_synch_out > 0:
-            self.ctm_feedback_module = CTMFeedbackModule(
-                ctm_sync_dim=config.ctm_n_synch_out,
-                diffusion_model_dim=self.target_noise_dim,
-                n_heads=config.n_heads
-            )
-        else:
-            self.ctm_feedback_module = None
-
-        # Neuromodulator Initialization
-        modulator_classes = {
-            'dopamine': DopamineModulator,
-            'serotonin': SerotoninModulator,
-            'oxytocin': OxytocinModulator,
-            'norepinephrine': NorepinephrineModulator,
-            'acetylcholine': AcetylcholineModulator,
-            'endorphins': EndorphinsModulator,
-            'cortisol': CortisolModulator,
-            'gaba': GABAModulator,
-            'glutamate': GlutamateModulator
-        }
-        self.neuromodulators = nn.ModuleDict()
-        if config.enable_neuromodulators:
-            for mod_name in config.active_neuromodulators:
-                if mod_name in modulator_classes:
-                    self.neuromodulators[mod_name] = modulator_classes[mod_name](config.neuromodulator_dim)
-        self.confidence_thresholds = {
-        'critical': 0.99,
-        'medium': 0.8,
-        'low': 0.5
-        }
-
-    def forward(self, x_t: torch.Tensor, timestep: torch.Tensor,
-                ctm_data: Optional[Dict[str, torch.Tensor]] = None,
-                hipa_control_signal: Optional[torch.Tensor] = None, confidence_level: str = 'medium') -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Any]]]:
-        """
-        Predict velocity v_θ(x_t, t) for rectified flow in unified byte space.
-        """
-        # Time embedding
-        if timestep.dim() == 0:
-            timestep = timestep.unsqueeze(0)
-        time_emb = self.time_embedding(timestep.float().unsqueeze(-1))
-        
-        # Base velocity prediction
-        combined = torch.cat([x_t, time_emb], dim=-1)
-        base_velocity = self.velocity_predictor(combined)
-        
-        # If no CTM context, return base velocity
-        if ctm_data is None:
-            confidence = torch.tensor(1.0, device=base_velocity.device)
-            return base_velocity, confidence
-        
-        # Extract and combine CTM influences (same as before)
-        ctm_influences = []
-        influence_weights = []
-        # 1. Synchronization influence (STRONGEST)
-        if 'final_sync_out' in ctm_data:
-            sync_influence = self.ctm_sync_processor(ctm_data['final_sync_out'])
-            ctm_influences.append(sync_influence)
-            influence_weights.append(self.sync_influence_weight)
-        # 2. Certainty-based adaptive influence
-        if 'certainties' in ctm_data:
-            # Use final iteration certainty
-            final_certainty = ctm_data['certainties'][:, :, -1] # (B, 2)
-            certainty_influence = self.ctm_certainty_processor(final_certainty)
-            # Scale influence by certainty level
-            certainty_strength = final_certainty[:, 0].unsqueeze(-1)  # High certainty = strong influence
-            scaled_certainty_influence = certainty_influence * certainty_strength
-            ctm_influences.append(scaled_certainty_influence)
-            influence_weights.append(self.certainty_influence_weight)
-        # 3. Internal state influence
-        if 'activated_states' in ctm_data and len(ctm_data['activated_states']) > 0:
-            # Use final activated state
-            final_state = ctm_data['activated_states'][-1]
-            state_influence = self.ctm_state_processor(final_state)
-            ctm_influences.append(state_influence)
-            influence_weights.append(self.state_influence_weight)
-        # 4. Prediction history influence
-        if 'predictions' in ctm_data:
-             # Flatten prediction history
-            pred_history = ctm_data['predictions'].flatten(start_dim=1)
-            pred_influence = self.ctm_prediction_processor(pred_history)
-            ctm_influences.append(pred_influence)
-            influence_weights.append(self.prediction_influence_weight)
-             # Combine and weight CTM influences
-        
-        if ctm_influences:
-            stacked_influences = torch.stack(ctm_influences, dim=1)
-            stacked_weights = torch.stack(influence_weights, dim=0)
-            weighted_influences = stacked_influences * stacked_weights.view(1, -1, 1)
-            # Project weighted_influences (keys and values) to target_noise_dim
-            # Original shape: (B, num_influences, config.d_model)
-            # Target shape for K,V: (B, num_influences, self.target_noise_dim)
-            batch_size_attn, num_influences_attn, _ = weighted_influences.shape
-            projected_kv = self.kv_projector_for_ctm_attention(
-                weighted_influences.reshape(batch_size_attn * num_influences_attn, self.config.d_model)
-            ).reshape(batch_size_attn, num_influences_attn, self.target_noise_dim)
-            # Use CTM-guided attention to combine influences
-            # Query is base_noise_pred (B, self.target_noise_dim)
-            query = base_velocity.unsqueeze(1)
-            attended_influence, _ = self.ctm_guided_attention(query, projected_kv, projected_kv)
-            attended_influence = attended_influence.squeeze(1)
-            
-            current_velocity = base_velocity
-            # Multi-stage refinement
-            deltas = []
-            prev_velocity = current_velocity.clone()
-            for i, refinement_layer in enumerate(self.ctm_noise_refinement):
-                if hasattr(self, 'ctm_feedback_module') and self.ctm_feedback_module is not None and ctm_data and 'final_sync_out' in ctm_data:
-                    feedback_input = current_velocity.unsqueeze(1) if current_velocity.dim() == 2 else current_velocity
-                    if feedback_input.size(-1) == self.ctm_feedback_module.diffusion_model_dim:
-                        feedback = self.ctm_feedback_module(feedback_input, ctm_data['final_sync_out'])
-                        current_velocity = current_velocity + feedback.squeeze(1)
-                # Combine current noise with CTM influences
-                sync_inf = ctm_influences[0] if len(ctm_influences) > 0 else torch.zeros_like(current_velocity[:, :self.config.d_model])
-                state_inf = ctm_influences[2] if len(ctm_influences) > 2 else torch.zeros_like(sync_inf)
-                refinement_input = torch.cat([current_velocity, sync_inf, state_inf], dim=-1)
-                refinement = refinement_layer(refinement_input)
-                 # Progressive residual connection with increasing CTM influence
-                ctm_strength = self.coupling_strength * (i + 1) / len(self.ctm_noise_refinement)
-                current_velocity = current_velocity + refinement * ctm_strength
-                delta = torch.norm(current_velocity - prev_velocity, dim=-1).mean()
-                deltas.append(delta)
-                prev_velocity = current_velocity.clone()
-                # Apply Neuromodulators
-                
-                if self.config.enable_neuromodulators:
-                    modulation = torch.ones_like(current_velocity)
-                    for mod in self.neuromodulators.values():
-                        modulation *= mod(current_velocity)
-                    current_velocity *= modulation
-            
-             # Final certainty-based scaling
-            
-            if deltas:
-                variance = torch.var(torch.stack(deltas))
-                confidence = torch.exp(-variance)
-                threshold = self.confidence_thresholds.get(confidence_level, 0.8)
-                if not self.training and confidence < threshold:
-                    current_velocity *= 0
-            else:
-                confidence = torch.tensor(1.0, device=current_velocity.device)
-            if 'certainties' in ctm_data:
-                final_certainty = ctm_data['certainties'][:, :, -1]
-                scale = self.certainty_noise_scaler(final_certainty)
-                current_velocity *= scale
-            # Apply Task-Aware HiPA for intelligent frequency enhancement
-            
-            if self.enable_task_aware_hipa:
-                task_id = getattr(ctm_data, 'task_id', 0) if ctm_data else 0
-                 # Apply intelligent frequency enhancement
-                # Reshape current_noise (B, D) to (B, 1, D) for FrequencyDomainAwareAttention
-                current_velocity_unsqueezed = current_velocity.unsqueeze(1)
-                # Reshape enhanced_noise (B, 1, D) back to (B, D)
-                enhanced_velocity_squeezed, _ = self.task_aware_hipa(
-                    current_velocity_unsqueezed, hipa_control_signal=hipa_control_signal,
-                    context_hints={'ctm_data': ctm_data} if ctm_data else None
-                )
-                current_velocity = enhanced_velocity_squeezed.squeeze(1)
-                # Apply Integration Flow refinement if enabled
-            
-            if self.enable_integration_flow and 'final_sync_out' in ctm_data:
-                sync_guidance = ctm_data['final_sync_out']
-                # Apply Integration Flow correction
-                if sync_guidance.shape[-1] != current_velocity.shape[-1]:
-                    sync_guidance = nn.Linear(sync_guidance.shape[-1], current_velocity.shape[-1])(sync_guidance).to(current_velocity.device)
-                correction = sync_guidance * self.integration_flow_strength
-                current_velocity -= correction
-            
-            if 'abstained' in ctm_data and ctm_data['abstained'].any():
-                mask = ctm_data['abstained'].squeeze(-1)
-                while mask.dim() < current_velocity.dim(): mask = mask.unsqueeze(-1)
-                return torch.where(mask, base_velocity, current_velocity), confidence
-            
-            return current_velocity, confidence
-        
-        if self.enable_task_aware_hipa:
-            enhanced_velocity, _ = self.task_aware_hipa(base_velocity.unsqueeze(1), task_id=0).squeeze(1)
-            return enhanced_velocity
-        
-        return base_velocity
-    
-    def compute_enhanced_ctm_guidance(self, ctm_data: Dict[str, torch.Tensor],
-                                    target_shape: Tuple[int, ...]) -> torch.Tensor:
-        """
-        Compute enhanced CTM guidance that adapts to the target generation task.
-        
-        Returns:
-            guidance: Tensor of shape target_shape containing the guidance signal
-        """
-        device = next(self.parameters()).device
-        batch_size = target_shape[0]
-        
-        # Extract CTM components
-        sync_out = ctm_data.get('final_sync_out')  # (B, n_synch_out)
-        certainties = ctm_data.get('certainties')  # (B, 2, iterations)
-        predictions = ctm_data.get('predictions')  # (B, out_dims, iterations)
-        
-        if sync_out is None:
-            return torch.zeros(target_shape, device=device)
-        
-        # 1. Process synchronization guidance (primary signal)
-        sync_guidance = self.sync_to_flow_mapper(sync_out)  # (B, d_model)
-        
-        # 2. Compute adaptive guidance strength based on CTM certainty
-        if certainties is not None:
-            final_certainty = certainties[:, :, -1]  # (B, 2)
-            strength_input = torch.cat([final_certainty, sync_guidance], dim=-1)
-            adaptive_strength = self.adaptive_strength_predictor(strength_input)  # (B, 1)
-        else:
-            adaptive_strength = torch.ones(batch_size, 1, device=device)
-        
-        # 3. Apply adaptive strength to guidance
-        weighted_sync_guidance = sync_guidance * adaptive_strength * self.sync_weight
-        
-        # 4. Add certainty-based refinement
-        guidance_components = [weighted_sync_guidance]
-        
-        if certainties is not None:
-            # High certainty -> stronger guidance, Low certainty -> gentler guidance
-            certainty_factor = final_certainty[:, 0].unsqueeze(-1)  # (B, 1)
-            certainty_guidance = sync_guidance * certainty_factor * self.certainty_weight
-            guidance_components.append(certainty_guidance)
-        
-        # 5. Add prediction history guidance
-        if predictions is not None:
-            # Use final prediction as additional guidance
-            final_pred = predictions[:, :, -1]  # (B, out_dims)
-            if final_pred.shape[-1] == self.latent_dim:
-                pred_guidance = final_pred * self.prediction_weight
-                guidance_components.append(pred_guidance)
-        
-        # 6. Fuse multiple guidance components
-        if len(guidance_components) > 1:
-            stacked_guidance = torch.stack(guidance_components, dim=1)  # (B, num_components, d_model)
-            query = weighted_sync_guidance.unsqueeze(1)  # (B, 1, d_model)
-            
-            fused_guidance, _ = self.guidance_fusion(
-                query, stacked_guidance, stacked_guidance
-            )
-            final_guidance = fused_guidance.squeeze(1)  # (B, d_model)
-        else:
-            final_guidance = weighted_sync_guidance
-        
-        # NEW: Multi-resolution fusion
-        # Process guidance at multiple resolutions
-        multi_res_outputs = []
-        guidance_transposed = final_guidance.unsqueeze(1)  # (B, 1, d_model) -> treat as channels=1
-        for processor in self.multi_res_processors:
-            res_output = processor(guidance_transposed).squeeze(1)  # (B, d_model)
-            multi_res_outputs.append(res_output)
-        
-        # Fuse multi-resolution outputs
-        stacked_multi_res = torch.stack(multi_res_outputs, dim=1)  # (B, num_res, d_model)
-        query_multi = final_guidance.unsqueeze(1)
-        fused_multi_res, _ = self.guidance_fusion(query_multi, stacked_multi_res, stacked_multi_res)
-        final_guidance = fused_multi_res.squeeze(1)
-        
-        # 7. Project to target shape
-        final_guidance = self._project_to_target_shape(final_guidance, target_shape)
-            
-        # 8. Apply quality enhancement
-        if len(final_guidance.shape) >= 2:
-            original_shape = final_guidance.shape
-            flat_guidance = final_guidance.view(batch_size, -1)
-            
-            if flat_guidance.shape[-1] == self.latent_dim:
-                enhanced_guidance = self.quality_enhancer(flat_guidance)
-                final_guidance = enhanced_guidance.view(original_shape)
-            
-        return final_guidance
-    
-    def _project_to_target_shape(self, guidance: torch.Tensor,
-                               target_shape: Tuple[int, ...]) -> torch.Tensor:
-        """Project CTM guidance to target generation shape"""
-        batch_size = target_shape[0]
-        
-        if guidance.shape == target_shape:
-            return guidance
-        
-        # Handle different target shapes
-        if len(target_shape) == 2:  # (B, D)
-            if guidance.shape[-1] == target_shape[-1]:
-                return guidance
-            else:
-                # Linear projection
-                proj = nn.Linear(guidance.shape[-1], target_shape[-1]).to(guidance.device)
-                return proj(guidance)
-                
-        elif len(target_shape) == 3:  # (B, seq_len, D) - sequences
-            seq_len, d_out = target_shape[1], target_shape[2]
-            
-            if guidance.shape[-1] == d_out:
-                # Expand to sequence length
-                return guidance.unsqueeze(1).expand(-1, seq_len, -1)
-            else:
-                # Project and expand
-                proj = nn.Linear(guidance.shape[-1], d_out).to(guidance.device)
-                projected = proj(guidance)
-                return projected.unsqueeze(1).expand(-1, seq_len, -1)
-                
-        elif len(target_shape) == 4:  # (B, C, H, W) - images
-            c, h, w = target_shape[1], target_shape[2], target_shape[3]
-            target_elements = c * h * w
-            
-            # Flatten guidance and project to image size
-            if guidance.shape[-1] >= target_elements:
-                reshaped = guidance[:, :target_elements].view(batch_size, c, h, w)
-            else:
-                # Repeat and project
-                repeat_factor = (target_elements // guidance.shape[-1]) + 1
-                repeated = guidance.repeat(1, repeat_factor)[:, :target_elements]
-                reshaped = repeated.view(batch_size, c, h, w)
-            
-            return reshaped
-        
-        else:
-            # Fallback: flatten and project
-            target_elements = torch.prod(torch.tensor(target_shape[1:]))
-            proj = nn.Linear(guidance.shape[-1], target_elements).to(guidance.device)
-            projected = proj(guidance)
-            return projected.view(target_shape)
-
-    def one_step_generation(self, noise: torch.Tensor,
-                          ctm_data: Dict[str, torch.Tensor],
-                          task_id: int = 0) -> torch.Tensor:
-        """
-        Perform one-step Integration Flow generation with enhanced CTM guidance.
-        
-        This is the core method that implements:
-        x_0 = x_t - G_CTM(x_t, CTM_state)
-        
-        Where G_CTM is the CTM-learned guidance function.
-        """
-        # Compute enhanced CTM guidance
-        ctm_guidance = self.compute_enhanced_ctm_guidance(ctm_data, noise.shape)
-        
-        # Integration Flow: x_0 = x_t - G(x_t, CTM_state)
-        generated = noise - ctm_guidance
-        
-        # Optional: Apply learned flow refinement
-        if hasattr(self, 'flow_refinement_enabled') and self.flow_refinement_enabled:
-            # Combine noise, guidance, and CTM state for learned refinement
-            if 'final_sync_out' in ctm_data:
-                sync_state = ctm_data['final_sync_out']
-                
-                # Project sync state to match noise dimensions
-                if sync_state.shape[-1] != noise.shape[-1]:
-                    sync_proj = nn.Linear(sync_state.shape[-1], noise.shape[-1]).to(noise.device)
-                    sync_state = sync_proj(sync_state)
-                
-                # Expand sync state to match noise shape
-                if len(noise.shape) > 2:
-                    for _ in range(len(noise.shape) - 2):
-                        sync_state = sync_state.unsqueeze(-2)
-                    sync_state = sync_state.expand_as(noise)
-                
-                # Learned refinement
-                refinement_input = torch.cat([
-                    noise.flatten(1),
-                    ctm_guidance.flatten(1),
-                    sync_state.flatten(1)
-                ], dim=-1)
-                
-                if refinement_input.shape[-1] == self.latent_dim * 3:
-                    refinement = self.flow_predictor(refinement_input)
-                    refinement = refinement.view(noise.shape)
-                    generated = generated + 0.1 * refinement  # Small refinement
-        
-        return generated
-
-    def multi_step_refinement(self, initial_generation: torch.Tensor,
-                            ctm_data: Dict[str, torch.Tensor],
-                            num_refinement_steps: int = 3) -> torch.Tensor:
-        """
-        Optional multi-step refinement for even higher quality.
-        Each step uses updated CTM guidance.
-        """
-        current = initial_generation
-        
-        for step in range(num_refinement_steps):
-            # Recompute CTM guidance for current state
-            refined_guidance = self.compute_enhanced_ctm_guidance(ctm_data, current.shape)
-            
-            # Apply refinement with decreasing strength
-            refinement_strength = 0.1 * (1.0 - step / num_refinement_steps)
-            current = current - refined_guidance * refinement_strength
-        
-        return current
-    
-    def adaptive_quality_control(self, generated: torch.Tensor,
-                               ctm_data: Dict[str, torch.Tensor],
-                               quality_threshold: float = 0.8) -> Tuple[torch.Tensor, bool]:
-        """
-        Adaptive quality control that decides whether to apply refinement
-        based on CTM certainty and generation quality metrics.
-        """
-        needs_refinement = False
-        
-        # Check CTM certainty
-        if 'certainties' in ctm_data:
-            final_certainty = ctm_data['certainties'][:, 0, -1].mean().item()
-            if final_certainty < quality_threshold:
-                needs_refinement = True
-        
-        # Check generation quality (simple metrics)
-        if torch.isnan(generated).any() or torch.isinf(generated).any():
-            needs_refinement = True
-        
-        # Apply refinement if needed
-        if needs_refinement:
-            refined = self.multi_step_refinement(generated, ctm_data, num_refinement_steps=2)
-            return refined, True
-        
-        return generated, False
-
-    def add_noise(self, x_start: torch.Tensor, noise: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        """
-        Create a noisy sample x_t for rectified flow at a given timestep.
-        x_t = t * x_1 + (1 - t) * x_0, where x_1 is noise and x_0 is the clean data.
-        """
-        # Timestep `t` is expected to be in [0, 1] for rectified flow.
-        # We need to map the integer timesteps (0 to T-1) to this range.
-        t = timesteps.float() / (self.config.diffusion_timesteps - 1)
-        
-        # Reshape t to match x_start dimensions for broadcasting
-        while len(t.shape) < len(x_start.shape):
-            t = t.unsqueeze(-1)
-            
-        # Linear interpolation between data (x_0) and noise (x_1)
-        x_t = t * noise + (1 - t) * x_start
-        return x_t
-
-    def integration_flow_one_step_generation(self, shape: Tuple[int, ...],
-                                           ctm_data: Dict[str, torch.Tensor], #  HIPA controlled by signal
-                                           hipa_control_signal: Optional[torch.Tensor] = None,
-                                           device: torch.device = None) -> torch.Tensor:
-        """
-        Ultra-fast one-step generation using enhanced Integration Flow with CTM guidance
-        and dynamically controlled HIPA.
-        """
-        if device is None:
-            device = next(self.parameters()).device
-        
-        x_noise = torch.randn(shape, device=device)
-        
-        # one_step_generation should ideally also accept hipa_control_signal if it uses HIPA internally
-        # For now, assuming task_aware_hipa is the main HIPA point here.
-        # The task_id from one_step_generation needs to be removed or adapted.
-        # Let's assume one_step_generation is a more general denoising step.
-        # The original one_step_generation took task_id. We need to see its definition.
-        # For now, passing None or a default if it's still required but not used for HIPA.
-        x_generated = self.one_step_generation(x_noise, ctm_data, task_id=0) # task_id=0 as placeholder if still needed by one_step_generation internally for non-HIPA reasons
-
-        x_final, _was_refined = self.adaptive_quality_control(x_generated, ctm_data)
-        
-        # Apply Task-Aware HiPA enhancement, now controlled by hipa_control_signal
-        if self.enable_task_aware_hipa and self.task_aware_hipa is not None:
-            # The self.task_aware_hipa is FrequencyDomainAwareAttention.
-            # Its forward method now takes hipa_control_signal.
-            x_final, _modality_config = self.task_aware_hipa(x_final, hipa_control_signal=hipa_control_signal)
-        
-        return x_final
-    
-    def get_adaptive_timesteps(self, ctm_data: Dict[str, torch.Tensor],
-                              base_timesteps: torch.Tensor) -> torch.Tensor:
-        """
-        Generate CTM-adaptive timesteps based on CTM certainty and state.
-        
-        High certainty -> fewer steps needed
-        Low certainty -> more steps for careful generation
-        """
-        if not self.adaptive_scheduling or 'certainties' not in ctm_data or 'activated_states' not in ctm_data:
-            return base_timesteps
-        
-        final_certainty = ctm_data['certainties'][:, :, -1]  # (B, 2)
-        final_state = ctm_data['activated_states'][-1]  # (B, d_model)
-        
-        schedule_input = torch.cat([final_state, final_certainty], dim=-1)
-        adaptive_factor = self.adaptive_schedule_predictor(schedule_input)  # (B, 1)
-        
-        # Modify timesteps based on CTM state
-        # High certainty (adaptive_factor close to 1) -> reduce timesteps
-        # Low certainty (adaptive_factor close to 0) -> keep more timesteps
-        modified_timesteps = base_timesteps * (1.0 - adaptive_factor.squeeze(-1) * 0.5)
-        
-        return modified_timesteps.long()
-    
-    def detect_convergence(self, ctm_data: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Detect if CTM has converged to a stable solution.
-        
-        Returns convergence probability (0-1) for each batch item.
-        """
-        if 'activated_states' not in ctm_data or len(ctm_data['activated_states']) < 2:
-            return torch.zeros(ctm_data['final_sync_out'].size(0), device=ctm_data['final_sync_out'].device)
-        
-        # Get final state and certainty
-        final_state = ctm_data['activated_states'][-1]
-        final_certainty = ctm_data['certainties'][:, :, -1] if 'certainties' in ctm_data else torch.zeros(final_state.size(0), 2, device=final_state.device)
-        
-        # Simple convergence detection based on certainty
-        # High certainty indicates convergence
-        convergence_prob = final_certainty[:, 0]  # Use first component of certainty
-        
-        return convergence_prob
-    
-    def detect_thought_loop(self, current_state: torch.Tensor,
-                           window_size: int = 5, similarity_threshold: float = 0.95) -> torch.Tensor:
-        """
-        Detect if the model is stuck in a thought loop by comparing current state
-        with recent history.
-        
-        Returns loop detection probability (0-1) for each batch item.
-        """
-        batch_size = current_state.size(0)
-        device = current_state.device
-        
-        # Update state history
-        self.state_history[self.history_pointer] = current_state.mean(dim=0)  # Average across batch
-        self.history_pointer = (self.history_pointer + 1) % self.state_history.size(0)
-        
-        # Check similarity with recent states
-        loop_probs = torch.zeros(batch_size, device=device)
-        
-        for i in range(min(window_size, self.state_history.size(0))):
-            if i == 0:
-                continue  # Skip current state
-            
-            # Compute cosine similarity
-            hist_state = self.state_history[(self.history_pointer - i - 1) % self.state_history.size(0)]
-            similarities = torch.cosine_similarity(current_state, hist_state.unsqueeze(0).expand(current_state.shape), dim=-1)
-            
-            # Check if similarity exceeds threshold
-            loop_detected = (similarities > similarity_threshold).float()
-            loop_probs = torch.max(loop_probs, loop_detected)
-        
-        return loop_probs
-    
-    def should_early_stop(self, ctm_data: Dict[str, torch.Tensor],
-                         current_step: int, max_steps: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Determine if we should stop diffusion early based on:
-        1. CTM convergence
-        2. High certainty
-        3. Thought loop detection
-        4. Efficiency considerations
-        
-        Returns:
-            should_stop: (B,) boolean tensor
-            stop_reasons: Dict with reasons for stopping
-        """
-        batch_size = ctm_data['final_sync_out'].size(0)
-        device = ctm_data['final_sync_out'].device
-        
-        stop_reasons = {}
-        should_stop = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        
-        # 1. Convergence detection
-        convergence_prob = self.detect_convergence(ctm_data)
-        convergence_stop = convergence_prob > 0.8
-        should_stop = should_stop | convergence_stop
-        stop_reasons['convergence'] = convergence_stop
-        
-        # 2. High certainty early stopping
-        if 'certainties' in ctm_data:
-            final_certainty = ctm_data['certainties'][:, 0, -1]  # First component of certainty
-            certainty_stop = final_certainty > 0.85
-            should_stop = should_stop | certainty_stop
-            stop_reasons['high_certainty'] = certainty_stop
-        
-        # 3. Thought loop detection
-        if 'activated_states' in ctm_data and len(ctm_data['activated_states']) > 0:
-            current_state = ctm_data['activated_states'][-1]
-            loop_prob = self.detect_thought_loop(current_state)
-            loop_stop = loop_prob > 0.9
-            should_stop = should_stop | loop_stop
-            stop_reasons['thought_loop'] = loop_stop
-        
-        # 4. Efficiency consideration (encourage early stopping)
-        step_ratio = current_step / max_steps
-        if step_ratio > 0.7:  # After 70% of max steps, encourage stopping
-            efficiency_input = torch.cat([
-                ctm_data['final_sync_out'],
-                torch.full((batch_size, 1), step_ratio, device=device)
-            ], dim=-1)
-            efficiency_stop_prob = self.efficiency_predictor(efficiency_input).squeeze(-1)
-            efficiency_stop = efficiency_stop_prob > 0.6
-            should_stop = should_stop | efficiency_stop
-            stop_reasons['efficiency'] = efficiency_stop
-        
-        return should_stop, stop_reasons
-
-    def denoise_one_step(self, x_t: torch.Tensor, timestep: torch.Tensor,
-                         ctm_data: Optional[Dict[str, torch.Tensor]] = None,
-                         hipa_control_signal: Optional[torch.Tensor] = None,
-                         confidence_level: str = 'medium') -> torch.Tensor:
-        """
-        Performs one step of denoising for rectified flow using simple Euler integration.
-        x_{t-dt} = x_t - v_t * dt
-        """
-        # 1. Predict velocity using the main forward method
-        # The forward method now returns velocity `v_theta`
-        v_theta, _ = self.forward(x_t, timestep, ctm_data, hipa_control_signal, confidence_level)
-
-        # 2. Compute the step size `dt`
-        # For a T-step diffusion process, dt is 1/T.
-        dt = 1.0 / self.config.diffusion_timesteps
-        
-        # 3. Apply the Euler integration step
-        # We are moving from t to t-dt, so we subtract the velocity term.
-        x_prev = x_t - v_theta * dt
-            
-        return x_prev
 
 class JEPAModule(nn.Module):
     def __init__(self, config, dynamic_entropy_patcher):
@@ -2023,19 +1166,9 @@ class EnhancedCTMDiffusion(nn.Module):
         # Mixed precision trainer
         self.mixed_precision_trainer = MixedPrecisionTrainer(self, config)
 
-        # Core CTM: Conditionally instantiate either Original or Hierarchical core
-        if config.use_hrm_core:
-            from .ctm_components import HierarchicalCTM
-            self.ctm_core = HierarchicalCTM(config)
-            # Using HierarchicalCTM (HRM) core if configured
-        
-        # Enhanced diffusion processor
-        # actual_noisy_input_dim is now config.unet_input_feature_dim
-        self.diffusion = CTMControlledDiffusionProcessor(
-            config,
-            actual_noisy_input_dim=config.unet_input_feature_dim,
-            task_analyzer=self.task_analyzer_instance # Pass the TaskAnalyzer instance
-        )
+        # Core CTM and Diffusion are now unified in a single model.
+        # This denoising model IS the CTM, refactored to predict velocity.
+        self.denoising_model = UnifiedCTMDenoisingModel(config)
         self.target_noise_dim = config.unet_input_feature_dim
         self.ctm_contrastive_proj = nn.Linear(self.config.d_model, 128)
         self.diff_contrastive_proj = nn.Linear(self.target_noise_dim, 128)
@@ -2185,29 +1318,22 @@ class EnhancedCTMDiffusion(nn.Module):
             'sample_priorities': []
         }
 
-        # --- JEPA Components Initialization (Integrated with LearnedBytePatcherEncoder) ---
+        # --- JEPA Components Initialization ---
         if self.config.use_jepa_training:
             if not self.config.use_dynamic_entropy_patcher:
-                raise ValueError("JEPA training requires 'use_dynamic_entropy_patcher' to be True, as it uses LearnedBytePatcherEncoder.")
-            if self.dynamic_entropy_patcher is None: # This is the online encoder
-                 raise ValueError("self.dynamic_entropy_patcher (LearnedBytePatcherEncoder) must be initialized before JEPA components if use_jepa_training is True.")
-
-            # Target encoder is a momentum copy of the online patcher (dynamic_entropy_patcher)
+                raise ValueError("JEPA training requires 'use_dynamic_entropy_patcher'.")
+            
             self.jepa_target_patch_encoder = copy.deepcopy(self.dynamic_entropy_patcher)
             for param_target in self.jepa_target_patch_encoder.parameters():
                 param_target.requires_grad = False
             
-            # Predictor operates on patch embeddings
-            # The input/output dim for predictor is patch_embedding_dim from the patcher
             jepa_io_dim = self.config.patch_embedding_dim
-            # Output dimension of the predictor should be num_target_blocks * patch_embedding_dim
             predictor_output_dim = jepa_io_dim * self.config.jepa_num_target_blocks
             self.jepa_predictor = JEPAPredictor(
                 input_dim=jepa_io_dim,
                 hidden_dim=self.config.jepa_predictor_hidden_dim,
-                output_dim=predictor_output_dim # Predict embeddings for all target blocks
+                output_dim=predictor_output_dim
             )
-            # JEPA components initialized
     
     def get_optimized_batch_size(self) -> int:
         """Get the current optimized batch size from adaptive batch sampler."""
@@ -2515,927 +1641,145 @@ class EnhancedCTMDiffusion(nn.Module):
                 self.consciousness_controller.sleep_down(i)
             print(f"Model is asleep.")
     
-    def forward(self, byte_sequence: torch.Tensor, target_diffusion_output: Optional[torch.Tensor] = None,
-                mode: str = 'ctm_controlled_diffusion', timestep: Optional[torch.Tensor] = None,
-                current_epoch: int = 0,
-                current_batch: int = 0, task_name: Optional[str] = None,
-                observed_byte_sequence: Optional[torch.Tensor] = None,
-                confidence_level: str = 'medium') -> Dict[str, torch.Tensor]:
-        
+    def forward(self,
+                byte_sequence: torch.Tensor,
+                target_diffusion_output: Optional[torch.Tensor] = None,
+                timestep: Optional[torch.Tensor] = None,
+                **kwargs) -> Dict[str, torch.Tensor]:
         """
-        Forward pass of the CTMDiffusionModel using byte sequences.
-
-        Args:
-            byte_sequence (torch.Tensor): Raw byte sequence input.
-                                          Shape: (batch_size, sequence_length)
-            target_diffusion_output (Optional[torch.Tensor]): The target clean data (x_0) for diffusion loss.
-                                                              Required if training with diffusion.
-                                                              Shape: (batch_size, sequence_length, output_feature_dim)
-            mode (str): Operation mode. Options: 'ctm_controlled_diffusion', 'ctm_only', 'diffusion_only'
-                       'ctm_only' runs CTM core.
-                       'diffusion_only' runs diffusion processor (needs appropriate 'inputs' as noisy data).
-                       'ctm_controlled_diffusion' runs CTM, then diffusion.
-            timestep (Optional[torch.Tensor]): Current diffusion timestep (if applicable for diffusion modes)
-            current_epoch (int): Current training epoch.
-            current_batch (int): Current training batch in the epoch.
-            observed_byte_sequence (Optional[torch.Tensor]): Observed agent's byte sequence for mirror neuron processing.
-                                                             Shape: (batch_size, sequence_length)
-
-        Returns:
-            Dict[str, torch.Tensor]: A dictionary containing various outputs. Key fields include:
-            - 'final_output': The primary output tensor (e.g., CTM prediction, MCMC expectation, or diffusion prediction).
-            - 'total_loss': Aggregated loss (diffusion loss + MCMC loss + CTM internal losses).
-            - 'ctm_core_data': Raw output from the CTM core.
-            - 'mcmc_results': Results from the MCMC step, if active.
-            - 'diffusion_output': Output from the diffusion processor, if active.
-            - Other losses and intermediate data.
-
+        Forward pass of the refactored EnhancedCTMDiffusion model.
+        This method now uses the UnifiedCTMDenoisingModel to predict velocity
+        and calculates the corresponding rectified flow loss. The old controller-
+        actuator logic has been removed.
         """
-        losses = {}
-        batch_size = byte_sequence.size(0)
         device = byte_sequence.device
-        
-        # Initialize hidden states for recurrent connections
-        hidden_states = {}
-        for layer in range(self.config.n_layers):
-            hidden_states[f"layer_{layer}"] = torch.zeros(
-                batch_size, self.config.d_model, device=device
-            )
-            
-        # Initialize predictive coding errors
-        predictive_errors = {}
-        
-        # Initialize layer output for first layer
-        layer_output = None
-        
-        # Prepare input features for CTM core (with entropy aux loss)
-        kv_features_for_ctm, inferred_task_latent, hipa_control_signal, entropy_aux_loss = \
-            self._prepare_input_features(byte_sequence)
-        losses['entropy_model_aux_loss'] = entropy_aux_loss * self.config.entropy_model_loss_weight
-        
-        # Process through CTM core with full tracking
-        ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
+        batch_size = byte_sequence.size(0)
+        losses = {}
 
-        losses['jepa_loss'] = torch.tensor(0.0, device=device)
-        # The aux loss from dynamic_entropy_patcher (online JEPA encoder) is handled by _prepare_input_features
-        # No separate jepa_context_aux_loss or jepa_target_aux_loss needed here for now.
+        # 1. Get conditioning features and entropy loss from the main input processor
+        conditioning_features, _, _, entropy_aux_loss = self._prepare_input_features(byte_sequence)
+        if self.training:
+            losses['entropy_aux_loss'] = entropy_aux_loss * self.config.entropy_model_loss_weight
 
-        # Use the already prepared input features for JEPA
-        online_patch_embeddings = kv_features_for_ctm # Shape: (B, S_patches, D_embed)
-
-        
-        # PARALLEL BINARY PATCH GENERATION
-        # Flatten patches for parallel processing with entropy-based guidance
-        batch_size, num_patches, patch_dim = online_patch_embeddings.shape
-        parallel_patches = online_patch_embeddings.view(batch_size, -1)
-
-        # --- JEPA Loss Calculation ---
-        if self.config.use_jepa_training and self.training and \
-           self.jepa_target_patch_encoder is not None and self.jepa_predictor is not None and \
-           self.dynamic_entropy_patcher is not None: # Ensure online encoder (dynamic_entropy_patcher) is also available
-            try:
-                with torch.no_grad():
-                    # Target encoder processes the original byte sequence
-                    # LearnedBytePatcherEncoder returns (embeddings, indices, aux_loss)
-                    target_patch_embeddings, _target_patch_indices, _target_aux_loss = \
-                        self.jepa_target_patch_encoder(byte_sequence)
-                    # target_patch_embeddings shape: (B, S_patches, D_embed)
-
-                # Create masked views from patch embeddings
-                # online_patch_embeddings are from self.dynamic_entropy_patcher (via _prepare_input_features)
-                context_representation, actual_target_representation = self._jepa_create_masked_patch_views(
-                    online_patch_embeddings, # These are the kv_features_for_ctm
-                    target_patch_embeddings
-                )
-
-                if context_representation is not None and actual_target_representation is not None:
-                    # context_representation is (B, D_embed)
-                    # actual_target_representation is (B, num_target_blocks, D_embed)
-                    predicted_target_representation_flat = self.jepa_predictor(context_representation) # (B, num_target_blocks * D_embed)
-                    
-                    # Reshape predicted_target_representation to match actual_target_representation
-                    predicted_target_representation = predicted_target_representation_flat.view(
-                        batch_size, # batch_size is defined at the start of the forward method
-                        self.config.jepa_num_target_blocks,
-                        self.config.patch_embedding_dim
-                    )
-                    
-                    current_jepa_loss = F.mse_loss(predicted_target_representation, actual_target_representation.detach())
-                    losses['jepa_loss'] = current_jepa_loss * self.config.jepa_loss_weight
-                else:
-                    # Masking might not have produced valid context/target (e.g., too few patches)
-                    losses['jepa_loss'] = torch.tensor(0.0, device=device)
-
-            except Exception as e_jepa:
-                # Handle JEPA error gracefully
-                losses['jepa_loss'] = torch.tensor(0.0, device=device)
-        
-        # Initialize states
-        batch_size, seq_len, _ = kv_features_for_ctm.shape
-        device = kv_features_for_ctm.device
-        if not hasattr(self, 'self_emotion_state'):
-            self.self_emotion_state = torch.zeros(batch_size, seq_len, self.config.num_emotion_dim, device=device)
-        if not hasattr(self, 'observed_emotion_state'):
-            self.observed_emotion_state = torch.zeros(batch_size, seq_len, self.config.num_emotion_dim, device=device)
-        if not hasattr(self, 'observed_goal_state'):
-            self.observed_goal_state = torch.zeros(batch_size, seq_len, self.config.goal_dim, device=device)
-        
-        # First, run the CTM for the agent itself to get its internal state
-        ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
-
-        # --- Synaptic Empathy Module ---
-        # If synaptic empathy is enabled and we have an observed sequence
-        if self.config.enable_synaptic_empathy and self.synaptic_empathy_module is not None and observed_byte_sequence is not None:
-            # In a real scenario, an "observer" model would predict the state trace from observables.
-            # Here, we generate the "true" trace by passing the observed sequence through the CTM core.
-            with torch.no_grad():
-                observed_kv_features, _, _, _ = self._prepare_input_features(observed_byte_sequence)
-                observed_ctm_output = self.ctm_core.forward_with_full_tracking(observed_kv_features)
-            
-            # The SynapticEmpathy module operates on the historical traces of neuron activations.
-            observed_state_trace = observed_ctm_output["state_trace"]
-            self_state_trace = ctm_data["state_trace"]
-            self_activated_state = ctm_data["activated_states"][-1]
-
-            # The module returns a modulation vector and a reward.
-            synaptic_modulation, empathy_reward = self.synaptic_empathy_module(
-                self_state_trace=self_state_trace,
-                observed_state_trace=observed_state_trace,
-                self_activated_state=self_activated_state
-            )
-
-            # Apply the synaptic modulation directly to the CTM's final activated state.
-            # This directly influences neural dynamics for subsequent processing steps.
-            ctm_data["activated_states"][-1] = ctm_data["activated_states"][-1] + synaptic_modulation
-            
-            # The empathy_reward is a reward, so it should be subtracted from the loss.
-            if empathy_reward is not None:
-                losses['empathy_reward'] = -empathy_reward.mean() * self.config.synaptic_empathy_reward_weight
-        
-        # --- High-Level Empathy (Mirror Neuron) Processing ---
-        elif self.config.enable_mirror_neurons and self.mirror_layer is not None and observed_byte_sequence is not None:
-            # Process observed agent's state to get their thought vector
-            with torch.no_grad():
-                observed_kv_features, _, _, _ = self._prepare_input_features(observed_byte_sequence)
-                observed_ctm_data = self.ctm_core.forward_with_full_tracking(observed_kv_features)
-            
-            # The thought vector is the final synchronization output from the CTM
-            observed_thought = observed_ctm_data['final_sync_out']
-            self_thought = ctm_data['final_sync_out']
-
-            # Ensure emotion/goal state trackers match the batch and sequence length
-            batch_size, seq_len, _ = self_thought.shape
-            prev_self_emotion = self.self_emotion_state.expand(batch_size, seq_len, -1)
-            prev_observed_emotion = self.observed_emotion_state.expand(batch_size, seq_len, -1)
-            prev_observed_goal = self.observed_goal_state.expand(batch_size, seq_len, -1)
-
-            # Apply mirror neuron layer
-            modulated_state, new_self_emotion, new_observed_goal, selfless_reward = self.mirror_layer(
-                self_state=self_thought,
-                observed_state=observed_thought,
-                prev_self_emotion=prev_self_emotion,
-                prev_observed_emotion=prev_observed_emotion,
-                prev_observed_goal=prev_observed_goal
-            )
-
-            # Update persistent emotion and goal states for the next forward pass
-            self.self_emotion_state = new_self_emotion[:, -1, :].unsqueeze(1).detach()
-            self.observed_emotion_state = self.mirror_layer.observed_emotion_tracker(observed_thought, prev_observed_emotion)[:, -1, :].unsqueeze(1).detach()
-            self.observed_goal_state = new_observed_goal[:, -1, :].unsqueeze(1).detach()
-            
-            # Add the selfless reward to the loss dictionary
-            if selfless_reward is not None:
-                losses['mirror_reward'] = -selfless_reward.mean() * self.config.mirror_reward_weight
-            
-            # Update the main CTM data with the modulated state
-            ctm_data['final_sync_out'] = modulated_state
-        
-        # --- CTM Core Logic (Continued) ---
-        # The `ctm_data` dictionary, now potentially modified by an empathy module,
-        # will be used for subsequent MCMC and Diffusion processing.
-        batch_size, num_patches, patch_dim = online_patch_embeddings.shape
-        parallel_patches = online_patch_embeddings.view(batch_size, -1)
-        
-        # --- Diffusion Model Logic (Rectified Flow) ---
-        if target_diffusion_output is not None and mode in ['ctm_controlled_diffusion', 'diffusion_only']:
-            # This is the forward pass for training, where we compute the loss.
-            # 1. Prepare the clean target `x_0`
+        # 2. Main diffusion loss calculation (rectified flow)
+        if target_diffusion_output is not None and self.training:
             if target_diffusion_output.dtype == torch.uint8:
                 target_flat = target_diffusion_output.view(batch_size, -1).float()
-                x_0 = (target_flat / 255.0) * 2.0 - 1.0 # Normalize to [-1, 1]
+                x_0 = (target_flat / 255.0) * 2.0 - 1.0
             else:
                 x_0 = target_diffusion_output.view(batch_size, -1)
 
-            # Ensure x_0 has the correct dimension for the diffusion processor
-            current_len = x_0.shape[-1]
-            target_unet_len = self.config.unet_input_feature_dim
-            if current_len < target_unet_len:
-                padding = torch.zeros(batch_size, target_unet_len - current_len, device=device, dtype=x_0.dtype)
-                x_0 = torch.cat([x_0, padding], dim=-1)
-            elif current_len > target_unet_len:
-                x_0 = x_0[:, :target_unet_len]
+            current_len, target_len = x_0.shape[-1], self.config.unet_input_feature_dim
+            if current_len < target_len:
+                x_0 = F.pad(x_0, (0, target_len - current_len))
+            elif current_len > target_len:
+                x_0 = x_0[:, :target_len]
+
+            x_1, noisy_input = torch.randn_like(x_0), self.denoising_model.add_noise(x_0, torch.randn_like(x_0), timestep)
+            predicted_velocity = self.denoising_model(noisy_input, timestep, conditioning_features=conditioning_features)
+            target_velocity = self.denoising_model.get_velocity(x_0, x_1)
+            losses['diffusion_loss'] = F.mse_loss(predicted_velocity, target_velocity)
+
+        # 3. JEPA self-supervised loss
+        if self.config.use_jepa_training and self.training:
+            with torch.no_grad():
+                target_patch_embeddings, _, _ = self.jepa_target_patch_encoder(byte_sequence)
             
-            # 2. Sample noise `x_1` (the other end of the flow)
-            x_1 = torch.randn_like(x_0)
+            online_patch_embeddings, _, _ = self.dynamic_entropy_patcher(byte_sequence)
+
+            context_reps, target_reps = self._jepa_create_masked_patch_views(online_patch_embeddings, target_patch_embeddings)
             
-            # 3. Create the noisy input `x_t` using the rectified flow `add_noise`
-            # This performs the interpolation: x_t = t * x_1 + (1 - t) * x_0
-            noisy_input = self.diffusion.add_noise(x_start=x_0, noise=x_1, timesteps=timestep)
-
-            # 4. Predict the velocity `v_theta(x_t, t)`
-            # The CTM core has already been run on the input `byte_sequence`
-            # We can reuse the `ctm_data` and `hipa_control_signal` from that.
-            predicted_velocity, _ = self.diffusion(
-                x_t=noisy_input,
-                timestep=timestep,
-                ctm_data=ctm_data, # Use the original CTM data
-                hipa_control_signal=hipa_control_signal
-            )
-
-            # 5. Compute the velocity matching loss for rectified flow
-            # The target velocity is simply `x_1 - x_0`
-            target_velocity = x_1 - x_0
-            diffusion_loss = F.mse_loss(predicted_velocity, target_velocity)
-            losses['diffusion_loss'] = diffusion_loss
-
-        # PARALLEL PATCH GENERATION MODIFICATION
-        # For sampling modes, reshape output to original patch dimensions
-        if mode in ['ctm_only', 'mcmc_only']:
-            final_output = ctm_data.get('final_sync_out', torch.zeros_like(parallel_patches))
-            final_output = final_output.view(batch_size, num_patches, patch_dim)
+            if context_reps is not None and target_reps is not None:
+                predicted_target_reps = self.jepa_predictor(context_reps)
+                
+                # Reshape for loss calculation
+                
+                D_embed = online_patch_embeddings.shape[-1]
+                num_targets = self.config.jepa_num_target_blocks
+                predicted_target_reps = predicted_target_reps.view(-1, num_targets, D_embed)
+                
+                jepa_loss = F.mse_loss(predicted_target_reps, target_reps.detach())
+                losses['jepa_loss'] = jepa_loss * self.config.jepa_loss_weight
             
-        elif mode in ['ctm_controlled_diffusion', 'diffusion_only']:
-            # In diffusion modes, output is already flattened
-            final_output = pred if 'pred' in locals() else torch.zeros_like(parallel_patches)
-
-        # Convert final output back to bytes if needed
-        if mode in ['ctm_controlled_diffusion', 'diffusion_only']:
-            # Output is already in flattened form, convert directly
-            if final_output.dtype != torch.uint8:
-                final_output = (final_output * 0.5 + 0.5) * 255.0
-                final_output = final_output.clamp(0, 255).byte()
-
-                # --- FIX: Resize target to match UNet input dimension ---
-                current_len = numeric_target_diffusion_output.shape[-1]
-                target_unet_len = self.config.unet_input_feature_dim
-                
-                if current_len < target_unet_len:
-                    padding = torch.zeros(batch_size, target_unet_len - current_len, device=device, dtype=numeric_target_diffusion_output.dtype)
-                    clean_target_for_unet = torch.cat([numeric_target_diffusion_output, padding], dim=-1)
-                elif current_len > target_unet_len:
-                    clean_target_for_unet = numeric_target_diffusion_output[:, :target_unet_len]
-                else:
-                    clean_target_for_unet = numeric_target_diffusion_output
-                # clean_target_for_unet is now (B, config.unet_input_feature_dim)
-                
-                # Generate noise based on the correctly-sized target's shape and type
-                noise = torch.randn_like(clean_target_for_unet)
-                # Use a distinct variable name for the noisy input passed to the diffusion processor
-                noisy_input_for_diffusion_processor = self.training_noise_scheduler.add_noise(clean_target_for_unet, noise, timestep)
-                
-                # CTMControlledDiffusionProcessor.forward (self.diffusion) is the model that predicts noise (or x0)
-                # It needs the noisy input, timestep, and CTM conditioning data.
-                # kv_features_for_ctm was prepared earlier from byte_sequence.
-                ctm_data_for_diffusion_conditioning = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
-                
-                high_end_chunk_summary = ctm_data_for_diffusion_conditioning.get('high_end_chunk_summary')
-                if high_end_chunk_summary is not None:
-                     ctm_data_for_diffusion_conditioning['final_sync_out'] = ctm_data_for_diffusion_conditioning['final_sync_out'] + high_end_chunk_summary
+            self._update_jepa_target_encoder()
 
 
-                # Get the prediction from the diffusion processor
-                # The diffusion processor's forward method is CTMControlledDiffusionProcessor.forward
-                prediction_output_tuple = self.diffusion(
-                    noisy_input=noisy_input_for_diffusion_processor,
-                    timestep=timestep,
-                    ctm_data=ctm_data_for_diffusion_conditioning,
-                    hipa_control_signal=hipa_control_signal, # Pass HIPA signal
-                    confidence_level=confidence_level
-                )
+        # Combine all losses
+        total_loss = sum(losses.values()) if losses else torch.tensor(0.0, device=device)
 
-                if isinstance(prediction_output_tuple, tuple): # If it returns (prediction, guidance_info)
-                    predicted_noise_or_x0 = prediction_output_tuple[0]
-                else:
-                    predicted_noise_or_x0 = prediction_output_tuple
-
-                # Determine loss based on the training_noise_scheduler's prediction type
-                if not torch.isfinite(predicted_noise_or_x0).all():
-                    # Stability Guard: Handle NaN/Inf in diffusion output
-                    diffusion_loss = torch.tensor(0.0, device=byte_sequence.device, requires_grad=True)
-                elif hasattr(self.training_noise_scheduler, 'config') and hasattr(self.training_noise_scheduler.config, 'prediction_type'):
-                    if self.training_noise_scheduler.config.prediction_type == "epsilon":
-                        # Halve and zero-center the loss to make a positive learning signal more attainable.
-                        # Use tanh to create a bounded, zero-centered loss for the learning signal.
-                        # Use tanh with a scaled threshold to create a bounded, zero-centered "reward" signal.
-                        # This provides a smoother gradient than a hard threshold and prevents extreme values.
-                        # Low MSE -> negative loss -> positive learning signal.
-                        diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, noise) - 2.1) / 2.1)
-                    elif self.training_noise_scheduler.config.prediction_type == "sample":
-                        # Also apply to the sample prediction type.
-                        diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, clean_target_for_unet) - 2.1) / 2.1)
-                    else:
-                        # Unsupported prediction type
-                        diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
-                else: # Default to epsilon prediction if config not available
-                    diffusion_loss = torch.tanh((F.mse_loss(predicted_noise_or_x0, noise) - 2.1) / 2.1)
-            else:
-                # This case should ideally not be reached if training_noise_scheduler is always initialized
-                # Missing noise scheduler
-                diffusion_loss = torch.tensor(0.0, device=byte_sequence.device)
-            losses['diffusion_loss'] = diffusion_loss
-        else:
-            losses['diffusion_loss'] = torch.tensor(0.0, device=byte_sequence.device)
-
-        # --- Hebbian Plasticity Loss ---
-        hebbian_plasticity_loss = torch.tensor(0.0, device=device)
-        if self.config.use_activity_plasticity and self.training and 'plastic_adjustments' in ctm_data:
-            plastic_adjustments = ctm_data['plastic_adjustments']
-            activated_states = ctm_data['activated_states']
-            
-            if len(plastic_adjustments) > 1 and len(activated_states) > 1:
-                for i in range(len(plastic_adjustments) - 1):
-                    # Get the plastic adjustment at step t and activated state at step t+1
-                    current_plastic_adj = plastic_adjustments[i]
-                    next_activated_state = activated_states[i+1].detach() # Detach to treat as target
-
-                    # Identify neurons that fired at step t+1
-                    firing_mask = (next_activated_state > 0.1).float()
-
-                    # Calculate cosine similarity for all neurons
-                    # The goal is to make the plastic adjustment at 't' predict the activation at 't+1'
-                    similarity = F.cosine_similarity(current_plastic_adj, next_activated_state, dim=-1)
-
-                    # Only consider the similarity for neurons that actually fired
-                    masked_similarity = similarity * firing_mask.mean(dim=-1)
-                    
-                    # We want to maximize this similarity, so we minimize its negative
-                    hebbian_plasticity_loss -= masked_similarity.mean()
-
-                # Average the loss over the number of steps
-                hebbian_plasticity_loss /= (len(plastic_adjustments) -1)
-
-
-        losses['hebbian_plasticity_loss'] = hebbian_plasticity_loss * self.config.local_hebbian_loss_weight
-
-        if 'diffusion_loss' in losses and losses['diffusion_loss'] is not None:
-             learning_signal = -losses['diffusion_loss'].detach() # Make it positive for good performance
-             losses['hebbian_plasticity_loss'] = losses['hebbian_plasticity_loss'] * learning_signal
-
-
-        # Continue with the rest of the function logic
-        # For inference, the output would be generated by a sampling loop using the diffusion model,
-        # conditioned on ctm_output_features.
-        
-        # Use the existing variables from the first part of the function
-        device = byte_sequence.device
-
-        # Initialize output_dict
-        output_dict = {
-            'ctm_core_data': None,
-            'ctm_internal_loss': torch.tensor(0.0, device=device),
-            'mcmc_loss': torch.tensor(0.0, device=device),
-            'diffusion_output': None,
-            'diffusion_loss': torch.tensor(0.0, device=device), # Placeholder, actual loss computed in training script
-            'ctm_guidance_info': None,
-            'language_output': None,
-            'final_output': None,
-            'total_loss': torch.tensor(0.0, device=device)
+        return {
+            'final_output': predicted_velocity if 'diffusion_loss' in losses else None,
+            'total_loss': total_loss,
+            **losses
         }
-
-        # --- 1. CTM Core Processing (Common for most modes) ---
-        ctm_data = None
-        theta_candidate_from_ctm = None
-        if mode in ['ctm_only', 'ctm_controlled_diffusion']:
-            # Use the kv_features_for_ctm computed earlier in the function
-            ctm_data = self.ctm_core.forward_with_full_tracking(kv_features_for_ctm)
-            output_dict['ctm_core_data'] = ctm_data
-            theta_candidate_from_ctm = ctm_data['final_sync_out']
-            if self.config.use_hrm_core:
-                output_dict['programs'] = ctm_data.get('programs')
-        
-        final_ctm_representation = theta_candidate_from_ctm
-
-
-        # --- 3. Mode-Specific Outputs & Diffusion ---
-        if mode == 'ctm_only':
-            output_dict['final_output'] = final_ctm_representation # Could be original ctm_data['final_sync_out']
-            if hasattr(self, 'language_head') and final_ctm_representation is not None:
-                output_dict['language_output'] = self.language_head(final_ctm_representation)
-                output_dict['final_output'] = output_dict['language_output']
-
-        elif mode == 'mcmc_only':
-            output_dict['final_output'] = final_ctm_representation # This is MCMC expectation
-            if hasattr(self, 'language_head') and final_ctm_representation is not None:
-                output_dict['language_output'] = self.language_head(final_ctm_representation)
-                output_dict['final_output'] = output_dict['language_output']
-        
-        elif mode == 'ctm_controlled_diffusion':
-            if timestep is None:
-                raise ValueError("timestep required for 'ctm_controlled_diffusion' mode")
-            if ctm_data is None: # Original CTM data must have been computed
-                raise ValueError("Original ctm_data is required for 'ctm_controlled_diffusion' mode")
-            if final_ctm_representation is None: # This is the (potentially MCMC refined) output
-                 raise ValueError("final_ctm_representation is required for 'ctm_controlled_diffusion' mode but is None.")
-
-            # For this mode, we use the processed_input as the noisy data for the diffusion process.
-            
-            # Prepare guidance data for diffusion. Start with original CTM data.
-            guidance_data_for_diffusion = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in ctm_data.items()}
-            
-            # Update the primary guidance component in guidance_data_for_diffusion
-            # with the MCMC-refined output (final_ctm_representation).
-            # We assume 'final_sync_out' is a key that CTMControlledDiffusionProcessor
-            # uses from ctm_data for its main guidance. If it's another key, adjust this.
-            # Also, ensure the dimensions match what CTMControlledDiffusionProcessor expects for this key.
-            # The final_ctm_representation might be of mcmc_output_space.dimension.
-            # If diffusion guidance needs the original CTM output dimension, a projection might be needed here,
-            # or ensure ctm_to_mcmc_theta_proj was an identity/appropriate mapping if dimensions differ.
-            # For now, let's assume direct replacement is intended if MCMC ran.
-            # If final_ctm_representation is from MCMC, its shape is (B, mcmc_output_space.dimension)
-            # If original ctm_data['final_sync_out'] was (B, d_model), there might be a mismatch
-            # if mcmc_output_space.dimension != d_model and no reverse projection exists.
-
-            # Let's assume for now that if MCMC ran, final_ctm_representation is what we want to use,
-            # and it's compatible or CTMControlledDiffusionProcessor can handle it.
-            # A safer approach might be to add it as a new key, e.g., 'mcmc_refined_guidance',
-            # and modify CTMControlledDiffusionProcessor to use it if available.
-            # For direct replacement of 'final_sync_out':
-            if 'final_sync_out' in guidance_data_for_diffusion:
-                # Check if dimensions match before replacing.
-                # This is a placeholder for potential dimension mismatch handling.
-                # If final_ctm_representation.shape[-1] != guidance_data_for_diffusion['final_sync_out'].shape[-1]:
-                # Handle potential dimension mismatch for guidance
-                #     # if not hasattr(self, 'mcmc_to_ctm_guidance_proj'):
-                #     #     self.mcmc_to_ctm_guidance_proj = nn.Linear(final_ctm_representation.shape[-1], guidance_data_for_diffusion['final_sync_out'].shape[-1]).to(device)
-                #     # guidance_data_for_diffusion['final_sync_out'] = self.mcmc_to_ctm_guidance_proj(final_ctm_representation)
-                # else:
-                # The final_ctm_representation is treated as the 'x' thought vector.
-                # It's used here to directly provide the refined guidance signal for diffusion,
-                # replacing any original signal in 'final_sync_out' that might have been token-based or less refined.
-                guidance_data_for_diffusion['final_sync_out'] = final_ctm_representation
-            else:
-                guidance_data_for_diffusion['mcmc_refined_guidance_signal'] = final_ctm_representation
-            
-            # --- Activity Plasticity Update Step ---
-            # This is where you would call the plasticity update.
-            # The training loop needs to be modified to do this.
-            # JEPA target encoder update handled in trainer
-
-            effective_timestep = timestep
-            if hasattr(self.config, 'adaptive_scheduling') and self.config.adaptive_scheduling and hasattr(self.diffusion, 'get_adaptive_timesteps'):
-                effective_timestep = self.diffusion.get_adaptive_timesteps(guidance_data_for_diffusion, timestep)
-            
-            # Determine the input to diffusion processor based on training/sampling
-            # In training (target_diffusion_output is not None), diffusion input is noisy version of target.
-            # In sampling (target_diffusion_output is None), diffusion input is kv_features_for_ctm or some initial noise.
-            # The `processed_input` from earlier is derived from `byte_sequence`, not directly the noisy input for diffusion.
-            
-            diffusion_input_arg = None
-            if target_diffusion_output is not None: # Training with diffusion loss
-                 # numeric_target_diffusion_output is (B, L_bytes/item_size), e.g. (B, 2048)
-                 # Pad or truncate it to config.unet_input_feature_dim
-                 current_len = numeric_target_diffusion_output.shape[-1]
-                 target_unet_len = self.config.unet_input_feature_dim
-                 
-                 if current_len < target_unet_len:
-                     padding = torch.zeros(batch_size, target_unet_len - current_len, device=device, dtype=numeric_target_diffusion_output.dtype)
-                     clean_target_for_unet = torch.cat([numeric_target_diffusion_output, padding], dim=-1)
-                 elif current_len > target_unet_len:
-                     clean_target_for_unet = numeric_target_diffusion_output[:, :target_unet_len]
-                 else:
-                     clean_target_for_unet = numeric_target_diffusion_output
-                 # clean_target_for_unet is now (B, config.unet_input_feature_dim)
-
-                 current_noise_for_loss = torch.randn_like(clean_target_for_unet)
-                 diffusion_input_arg = self.diffusion.add_noise(clean_target_for_unet, current_noise_for_loss, effective_timestep)
-                 output_dict['true_noise_for_loss'] = current_noise_for_loss # For loss calculation against predicted noise
-            else: # Sampling or CTM-only modes where diffusion might be called for generation
-                 # kv_features_for_ctm is (B, S_patches, config.ctm_input_dim)
-                 # Average over S_patches to get (B, config.ctm_input_dim)
-                 if kv_features_for_ctm.dim() == 3 and kv_features_for_ctm.shape[1] > 0:
-                    avg_kv_features = kv_features_for_ctm.mean(dim=1)
-                 elif kv_features_for_ctm.dim() == 2: # Already (B, D)
-                    avg_kv_features = kv_features_for_ctm
-                 else:
-                    print(f"Warning: kv_features_for_ctm has unexpected shape {kv_features_for_ctm.shape} in sampling path. Using zeros for avg_kv_features.")
-                    avg_kv_features = torch.zeros(batch_size, self.config.ctm_input_dim, device=device, dtype=kv_features_for_ctm.dtype)
-                 
-                 # Project avg_kv_features (ctm_input_dim) to unet_input_feature_dim
-                 diffusion_input_arg = self.sampling_kv_to_unet_input_proj(avg_kv_features)
-
-            diffusion_call_output = self.diffusion( # This is CTMControlledDiffusionProcessor.forward
-                noisy_input=diffusion_input_arg, # Corrected argument name
-                timestep=effective_timestep,
-                ctm_data=guidance_data_for_diffusion,
-                hipa_control_signal=hipa_control_signal, # Pass the signal
-                confidence_level=confidence_level
-            )
-            if isinstance(diffusion_call_output, tuple): # Assuming (prediction, guidance_info)
-                noise_pred_or_x0 = diffusion_call_output[0]
-                guidance_info = diffusion_call_output[1] # Potential issue if forward doesn't return tuple
-            else: # Assuming just prediction
-                noise_pred_or_x0 = diffusion_call_output
-                guidance_info = {} # Default to empty dict
-
-            output_dict['diffusion_output'] = noise_pred_or_x0
-            output_dict['ctm_guidance_info'] = guidance_info
-            output_dict['final_output'] = noise_pred_or_x0
-            
-        elif mode == 'diffusion_only': # Pure diffusion, likely for sampling or specific testing
-            if timestep is None:
-                raise ValueError("timestep required for 'diffusion_only' mode")
-            simplified_ctm_data_for_diffusion_only = None
-            
-            diffusion_call_output = self.diffusion( # This is CTMControlledDiffusionProcessor.forward
-                noisy_input=kv_features_for_ctm, # This is the initial x_t (e.g. noise)
-                timestep=timestep,
-                ctm_data=simplified_ctm_data_for_diffusion_only,
-                hipa_control_signal=hipa_control_signal, # Pass the signal
-                confidence_level=confidence_level
-            )
-            if isinstance(diffusion_call_output, tuple):
-                noise_pred_or_x0 = diffusion_call_output[0]
-                guidance_info = diffusion_call_output[1]
-            else:
-                noise_pred_or_x0 = diffusion_call_output
-                guidance_info = {}
-            output_dict['diffusion_output'] = noise_pred_or_x0
-            output_dict['ctm_guidance_info'] = guidance_info
-            output_dict['final_output'] = noise_pred_or_x0
-            
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
-        # --- 4. Aggregate Loss ---
-        # The actual diffusion loss (e.g., MSE between predicted noise and true noise)
-        # is computed in the training script, as it needs the true noise or x0.
-        # output_dict['diffusion_loss'] will be updated by the training script.
-                
-        # Add the losses from the first part of the function to the output_dict
-        for loss_name, loss_val in losses.items():
-            if loss_name not in output_dict:
-                output_dict[loss_name] = loss_val
-                
-        # Re-aggregate total_loss in output_dict to include all components
-        # Start with diffusion_loss which should be in output_dict from earlier processing
-        current_total_loss = output_dict.get('diffusion_loss', torch.tensor(0.0, device=device))
-        current_total_loss += output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device))
-        current_total_loss += output_dict.get('mcmc_loss', torch.tensor(0.0, device=device))
-                
-        # Add predictive coding loss to total loss
-        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'predictive_coding_loss' in output_dict['ctm_core_data']:
-            pc_loss = output_dict['ctm_core_data'].get('predictive_coding_loss', torch.tensor(0.0, device=device))
-            output_dict['predictive_coding_loss'] = pc_loss
-            current_total_loss += pc_loss * getattr(self.config, 'ctm_pc_loss_weight', 0.1)
-            output_dict['ctm_internal_loss'] = output_dict.get('ctm_internal_loss', torch.tensor(0.0, device=device)) + pc_loss
-
-        # --- Dopamine Loss from Basal Ganglia ---
-        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'dopamine_loss' in output_dict['ctm_core_data']:
-            # The 'dopamine_loss' is -predicted_reward. We want to maximize reward, so we minimize -reward.
-            dopamine_loss = output_dict['ctm_core_data'].get('dopamine_loss', torch.tensor(0.0, device=device))
-            output_dict['dopamine_loss'] = dopamine_loss
-            current_total_loss += dopamine_loss * 0.1 # Add with some weight
-
-        # --- Inverse Reasoning Loss ---
-        if 'ctm_core_data' in output_dict and output_dict['ctm_core_data'] and 'inverse_reasoning_loss' in output_dict['ctm_core_data']:
-            inverse_loss = output_dict['ctm_core_data']['inverse_reasoning_loss']
-            if torch.is_tensor(inverse_loss) and not torch.isnan(inverse_loss) and not torch.isinf(inverse_loss):
-                output_dict['inverse_reasoning_loss'] = inverse_loss
-                current_total_loss += inverse_loss
-
-        if self.training and 'diffusion_output' in output_dict and output_dict['diffusion_output'] is not None and 'final_sync_out' in ctm_data:
-            ctm_proj = self.ctm_contrastive_proj(ctm_data['final_sync_out'])
-            diff_proj = self.diff_contrastive_proj(output_dict['diffusion_output'])
-
-            # Normalize
-            ctm_proj = F.normalize(ctm_proj, dim=-1)
-            diff_proj = F.normalize(diff_proj, dim=-1)
-
-            # SimCLR loss
-            similarity_matrix = torch.matmul(ctm_proj, diff_proj.T) / 0.07
-            labels = torch.arange(batch_size, device=device)
-            contrastive_loss = F.cross_entropy(similarity_matrix, labels)
-
-            losses['contrastive_loss'] = contrastive_loss * 0.1  # some weight
-            current_total_loss += losses['contrastive_loss']
-            output_dict['total_loss'] = current_total_loss
-
-        if 'hebbian_plasticity_loss' in output_dict and output_dict['hebbian_plasticity_loss'] is not None:
-            current_total_loss += output_dict['hebbian_plasticity_loss']
-        output_dict['total_loss'] = current_total_loss
-
-        # Convert final_output to bytes if it's audio from diffusion modes
-        if mode in ['ctm_controlled_diffusion', 'diffusion_only'] and output_dict.get('final_output') is not None:
-            final_numeric_output = output_dict['final_output']
-            if final_numeric_output.dtype != torch.uint8: # Ensure it's not already bytes
-                # Ensure it's float32 before converting
-                final_numeric_output = final_numeric_output.to(torch.float32)
-                try:
-                    output_dict['final_output'] = batched_numeric_tensor_to_bytes(final_numeric_output, source_dtype=np.float32)
-                except Exception as e:
-                    print(f"Warning: Could not convert final_output to bytes in forward method: {e}")
-                    # Failed to convert to bytes; keep numeric
-        
-        # Simplified prediction mechanism using meta-learning
-        # Instead of elevating ctm_core_data, use direct outputs from synapse network
-        if 'predictions' not in output_dict and 'final_sync_out' not in output_dict:
-            # Generate predictions directly from synapse network
-            if hasattr(self, 'synapse_network') and 'activated_states' in output_dict:
-                # Use the last activated state for prediction
-                last_state = output_dict['activated_states'][-1]
-                output_dict['predictions'] = self.synapse_network(last_state)
-                output_dict['final_sync_out'] = last_state.mean(dim=1)
-            else:
-                # Fallback to zeros if no synapse network available
-                output_dict['predictions'] = torch.zeros_like(input)
-                output_dict['final_sync_out'] = torch.zeros(input.size(0), self.config.d_model, device=input.device)
-
-        return output_dict
     
     def iterative_ctm_diffusion_sample(self, shape: Tuple[int, ...],
                                        initial_byte_sequence_for_inference: Optional[torch.Tensor] = None,
                                        num_steps: int = 50,
-                                       # ctm_refinement_steps: int = 3, # Not directly used with denoise_one_step
-                                       enable_early_stopping: bool = True,
-                                       # guidance_scale: float = 1.0, # Not directly used by this sampling structure
-                                       eta: float = 0.0, # For DDIM scheduler
-                                       generator: Optional[torch.Generator] = None
+                                       generator: Optional[torch.Generator] = None,
+                                       **kwargs
                                        ) -> Tuple[torch.Tensor, Dict]:
         """
-        Advanced sampling with iterative CTM-diffusion refinement and early stopping.
-        Uses an initial_byte_sequence_for_inference to determine task characteristics and HIPA control.
-        Adds flexible thought adjustment during generation.
+        Simplified sampling using the UnifiedCTMDenoisingModel.
+        The CTM guidance is now handled by passing conditioning features to the sampler.
         """
-        device = self.device_container.device # More robust way to get device
+        device = self.device_container.device
         batch_size = shape[0]
+        sampling_info = {}
 
-        overall_inferred_latent_for_guidance = None
-        overall_hipa_signal_for_guidance = None # Renamed from hipa_control_signal_sampling
-
-        # Infer task latent and HIPA control from initial_byte_sequence_for_inference for overall guidance
-        if initial_byte_sequence_for_inference is not None and self.config.use_ctm_guidance_from_condition:
-            if initial_byte_sequence_for_inference.size(0) != batch_size:
-                # Ensure batch size matches, e.g., by repeating the first sample
-                initial_byte_sequence_for_inference = initial_byte_sequence_for_inference[0].unsqueeze(0).expand(batch_size, *initial_byte_sequence_for_inference.shape[1:])
-            
-            # _prepare_input_features returns (features, latent, hipa_signal)
-            # We use the latent and HIPA signal from this initial condition for consistent diffusion processor conditioning.
-            # The CTM core itself will process the evolving `x` dynamically.
-            _, overall_inferred_latent_for_guidance, overall_hipa_signal_for_guidance = \
-                self._prepare_input_features(initial_byte_sequence_for_inference.to(device))
-        
-        elif initial_byte_sequence_for_inference is None and self.config.use_ctm_guidance_from_condition:
-            print("Warning: `use_ctm_guidance_from_condition` is True, but no `initial_byte_sequence_for_inference` provided. Overall guidance signals will be None.")
-        # If use_ctm_guidance_from_condition is False, overall_inferred_latent_for_guidance and overall_hipa_signal_for_guidance remain None.
-
-        # Initialize x_t as random noise.
-        x = torch.randn(shape, device=device, generator=generator)
-
-        sampling_info = {'steps_taken': [], 'early_stops': [], 'stop_reasons': {},
-                         'convergence_history': [], 'certainty_history': [],
-                         'thought_adjustments': []}  # Track thought adjustments
-
-        self.diffusion.noise_scheduler.set_timesteps(num_steps, device=device)
-        timesteps_to_iterate = self.diffusion.noise_scheduler.timesteps
-
-        if hasattr(self, 'progress_bar_sampler') and callable(self.progress_bar_sampler):
-            pb = self.progress_bar_sampler(timesteps_to_iterate)
-        else:
-            pb = timesteps_to_iterate
-
-        for i, t_tensor in enumerate(pb):
-            current_timestep_batched = t_tensor.expand(batch_size) if t_tensor.ndim == 0 else t_tensor
-            if current_timestep_batched.ndim == 0 :
-                 current_timestep_batched = current_timestep_batched.repeat(batch_size)
-
-            # CTM core processes the current diffusion state `x` (x_t).
-            # The `forward_with_full_tracking` method now contains the bidirectional reasoning loop.
-            ctm_input_features_for_core_step = x.detach()
-            ctm_data_guidance = self.ctm_core.forward_with_full_tracking(ctm_input_features_for_core_step)
-            
-            # Optional: store certainty for logging
-            if 'certainties' in ctm_data_guidance and ctm_data_guidance['certainties'] is not None:
-                current_certainty = ctm_data_guidance['certainties'][:, 0, -1].mean().item()
-                sampling_info['certainty_history'].append(current_certainty)
-
-            if enable_early_stopping and i > self.config.early_stop_min_steps and hasattr(self.diffusion, 'should_early_stop'):
-                should_stop_flags, stop_reason_details_dict = self.diffusion.should_early_stop(ctm_data_guidance, i, len(timesteps_to_iterate))
-                
-                # Log reasons for samples that are stopping
-                for sample_idx in range(batch_size):
-                    if should_stop_flags[sample_idx]:
-                        reasons_for_sample = [reason for reason, flag_tensor in stop_reason_details_dict.items() if flag_tensor[sample_idx]]
-                        if sample_idx not in sampling_info['stop_reasons']: sampling_info['stop_reasons'][sample_idx] = []
-                        sampling_info['stop_reasons'][sample_idx].append({'step': i, 'reasons': reasons_for_sample})
-
-                if should_stop_flags.any() and self.config.break_sampling_on_early_stop:
-                    print(f"Early stopping triggered for at least one sample at step {i}.")
-                    # Early stopping triggered
-                    break
-            
-            x = self.diffusion.denoise_one_step(
-                x_t=x,
-                timestep=current_timestep_batched,
-                ctm_data=ctm_data_guidance, # Dynamic CTM output based on current x
-                hipa_control_signal=overall_hipa_signal_for_guidance,     # Static from initial condition (if any)
-                eta=eta,
-                generator=generator,
-                confidence_level='medium'
-            )
-                
-            # External feedback: Feed diffusion output back to CTM
-            feedback_input = self.feedback_proj(x.detach()).unsqueeze(1)  # Project to ctm_input_dim and add seq dim=1
-            feedback_ctm_data = self.ctm_core.forward_with_full_tracking(feedback_input)
-                
-            # Update guidance with feedback (simple average for demonstration)
-            for key in ctm_data_guidance:
-                if isinstance(ctm_data_guidance[key], torch.Tensor):
-                    ctm_data_guidance[key] = (ctm_data_guidance[key] + feedback_ctm_data[key]) / 2
-                
-            sampling_info['steps_taken'].append(i)
-
-        # Ensure x is float32 before converting to bytes
-        x = x.to(torch.float32)
-        # Convert to byte tensor
-        x_bytes = batched_numeric_tensor_to_bytes(x, source_dtype=np.float32)
-        return x_bytes, sampling_info
-    
-    def get_loss_with_ctm_guidance(self, x_start: torch.Tensor, task_id: int = 0) -> Tuple[torch.Tensor, Dict]:
-        """
-        Compute diffusion loss with CTM guidance and return detailed metrics.
-        """
-        device = x_start.device
-        batch_size = x_start.size(0)
-        
-        # Sample random timesteps
-        timesteps = torch.randint(0, len(self.diffusion.betas), (batch_size,), device=device)
-        
-        # Sample noise
-        noise = torch.randn_like(x_start)
-        
-        # Add noise to clean data
-        noisy_x = self.diffusion.add_noise(x_start, noise, timesteps)
-        
-        # Predict noise with CTM control
-        predicted_noise, ctm_data = self.forward(noisy_x, timesteps, task_id, mode='ctm_controlled_diffusion', confidence_level='medium')
-        
-        # Main diffusion loss
-        diffusion_loss = nn.functional.mse_loss(predicted_noise, noise)
-        
-        # Additional CTM-based losses for better integration
-        additional_losses = {}
-        
-        # Certainty consistency loss (encourage consistent certainty)
-        if 'certainties' in ctm_data:
-            certainty_var = torch.var(ctm_data['certainties'], dim=-1).mean()
-            additional_losses['certainty_consistency'] = certainty_var * 0.1
-        
-        # Synchronization stability loss
-        if 'sync_out_history' in ctm_data and len(ctm_data['sync_out_history']) > 1:
-            sync_diffs = []
-            for i in range(1, len(ctm_data['sync_out_history'])):
-                diff = torch.mse_loss(ctm_data['sync_out_history'][i], ctm_data['sync_out_history'][i-1])
-                sync_diffs.append(diff)
-            sync_stability_loss = torch.stack(sync_diffs).mean()
-            additional_losses['sync_stability'] = sync_stability_loss * 0.05
-        
-        # Total loss
-        total_loss = diffusion_loss + sum(additional_losses.values())
-        
-        # FIX: Ensure CTM data contains final_sync_out for consistent ARC head input
-        if 'final_sync_out' not in ctm_data and 'predictions' in ctm_data:
-            # If final_sync_out is missing but predictions exist, use predictions
-            # but note: predictions may be 64D while ARC head expects 512D
-            # This is a fallback and may cause issues if predictions dimension doesn't match
-            ctm_data['final_sync_out'] = ctm_data['predictions']
-            print ("Predictions dimensions were used instead of final_sync_out: ERROR")
-            # Dimension fallback for ARC head
-        
-        return total_loss, {
-            'diffusion_loss': diffusion_loss,
-            'total_loss': total_loss,
-            **additional_losses,
-            'ctm_data': ctm_data
-        }
-    
-    def ultra_fast_integration_flow_generation(self, shape: Tuple[int, ...],
-                                             # task_id: int = 0, # Replaced
-                                             initial_byte_sequence_for_inference: Optional[torch.Tensor] = None,
-                                             text_condition: Optional[torch.Tensor] = None, # Keep if used by CTM/Diffusion
-                                             enable_hipa_flag: bool = True # Keep as an override/general toggle
-                                             ) -> Tuple[torch.Tensor, Dict]:
-        """
-        Ultra-fast one-step generation. HIPA control is now primarily via inferred latent.
-        `enable_hipa_flag` can be a global switch.
-        """
-        device = next(self.parameters()).device
-        batch_size = shape[0]
-        generation_info = {'method': 'integration_flow_one_step', 'hipa_applied': False, 'modality_detected': 'unknown', 'generation_time': 0.0}
-        
-        # Infer task latent and HIPA control signal
-        hipa_control_signal_sampling = None
-        ctm_input_for_guidance_generation = None
-
+        # 1. Prepare conditioning features for the generation process
+        conditioning_features = None
         if initial_byte_sequence_for_inference is not None:
+             # Ensure batch size matches if needed
             if initial_byte_sequence_for_inference.size(0) != batch_size:
-                 initial_byte_sequence_for_inference = initial_byte_sequence_for_inference[0].unsqueeze(0).expand(batch_size, -1)
+                 initial_byte_sequence_for_inference = initial_byte_sequence_for_inference[0].unsqueeze(0).expand(batch_size, *initial_byte_sequence_for_inference.shape[1:])
             
-            encoded_features, _inferred_latent, hipa_control_signal_sampling = \
-                self._prepare_input_features(initial_byte_sequence_for_inference.to(device))
-            ctm_input_for_guidance_generation = self.compute_features(encoded_features)
-        else: # Fallback for HIPA signal and CTM input
-            # Using dummy input for guidance
-            pass
-
-        if not enable_hipa_flag: # Global override to turn HIPA off
-            hipa_control_signal_sampling = torch.zeros_like(hipa_control_signal_sampling) if hipa_control_signal_sampling is not None else None
-            generation_info['hipa_applied'] = False
-        
-        start_time_gen = time.time()
-        
-        ctm_data = self.ctm_core.forward_with_full_tracking(ctm_input_for_guidance_generation)
-        
-        # Assuming integration_flow_one_step_generation in CTMControlledDiffusionProcessor
-        # now accepts hipa_control_signal
-        if hasattr(self.diffusion, 'integration_flow_one_step_generation'):
-            generated_samples = self.diffusion.integration_flow_one_step_generation(
-                shape=shape, ctm_data=ctm_data, device=device,
-                # task_id removed from integration_flow_one_step_generation
-                hipa_control_signal=hipa_control_signal_sampling
-            )
-        else:
-            # Fallback to iterative sampling
-            print("Warning: integration_flow_one_step_generation not found on diffusion processor. Using standard iterative sampling as fallback.")
-            generated_samples, _info = self.iterative_ctm_diffusion_sample(
-                shape=shape,
-                initial_byte_sequence_for_inference=initial_byte_sequence_for_inference,
-                num_steps=self.config.diffusion_num_inference_steps # Use default steps
+            conditioning_features, _, _, _ = self._prepare_input_features(
+                initial_byte_sequence_for_inference.to(device)
             )
 
-        generation_info['generation_time'] = time.time() - start_time_gen
-        
-        # The HIPA application is now expected to be handled *within* integration_flow_one_step_generation
-        # or the sampling loop if it uses HIPA-aware components, based on the passed hipa_control_signal.
-        # So, the explicit call to self.diffusion.task_aware_hipa here is removed.
-        # generation_info['hipa_applied'] should reflect if the signal was active.
-        if hipa_control_signal_sampling is not None and torch.any(hipa_control_signal_sampling > 0.5):
-            generation_info['hipa_applied'] = True
-        # Modality info would come from FrequencyDomainAwareAttention if it's used and returns it.
-        # For now, this is simplified.
+        # 2. Call the unified model's sampler
+        # The denoising model now internally handles the CTM-guided loop.
+        generated_numeric_tensor = self.denoising_model.sample(
+            shape=shape,
+            num_inference_steps=num_steps,
+            generator=generator,
+            conditioning_features=conditioning_features
+        )
 
-        # Ensure generated_samples is float32 before converting to bytes
-        generated_samples = generated_samples.to(torch.float32)
-        # Convert to byte tensor
-        generated_samples_bytes = batched_numeric_tensor_to_bytes(generated_samples, source_dtype=np.float32)
-        return generated_samples_bytes, generation_info
+        # 3. Convert the final numeric tensor to bytes
+        generated_bytes = batched_numeric_tensor_to_bytes(
+            generated_numeric_tensor, source_dtype=np.float32
+        )
+
+        return generated_bytes, sampling_info
     
 
-# Configuration helpers
-    def iterative_generation(self, condition: torch.Tensor, num_steps: int = 3) -> torch.Tensor:
+    @torch.no_grad()
+    def _update_jepa_target_encoder(self):
         """
-        Generate output with iterative refinement.
-        
-        Args:
-            condition: CTM guidance data (batch_size, d_model)
-            num_steps: Number of refinement steps
-            
-        Returns:
-            Refined output
+        Performs momentum update of the JEPA target patch encoder parameters
+        using the online patch encoder (self.dynamic_entropy_patcher).
+        This should be called by the training loop after optimizer.step().
         """
-        # Initial generation at final time step
-        time = torch.ones(condition.size(0), 1, device=condition.device) * self.config.diffusion_steps
-        output = self.integration_flow(condition, time)
+        if not self.config.use_jepa_training or \
+           self.dynamic_entropy_patcher is None or self.jepa_target_patch_encoder is None:
+            return
         
-        # Iterative refinement
-        for _ in range(num_steps):
-            # Prepare refinement input: current output + condition
-            refine_input = torch.cat([output, condition], dim=1)
-            refinement = self.integration_flow.refinement_net(refine_input)
-            output = output + refinement
-            
-        return output
+        m = self.config.jepa_momentum_beta
+        for param_online, param_target in zip(self.dynamic_entropy_patcher.parameters(), self.jepa_target_patch_encoder.parameters()):
+            param_target.data.mul_(m).add_((1 - m) * param_online.data)
 
     def _jepa_create_masked_patch_views(self,
                                         online_patch_embeddings: torch.Tensor,
                                         target_patch_embeddings: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Creates context and target representations from sequences of patch embeddings for JEPA.
-        Masking is applied at the patch sequence level. This version aims to select
-        one context block and one target block per sample.
-
-        Args:
-            online_patch_embeddings: (B, S_patches, D_embed) from the online encoder.
-            target_patch_embeddings: (B, S_patches, D_embed) from the target encoder.
-
-        Returns:
-            Tuple of (context_representation, actual_target_representation), or (None, None) if masking fails.
-            context_representation: (B, D_embed) - selected context patch from online encoder.
-            actual_target_representation: (B, num_target_blocks, D_embed) - selected target patches from target encoder.
         """
         B, S_patches, D_embed = online_patch_embeddings.shape
         device = online_patch_embeddings.device
 
-        if S_patches < 2: # Need at least one patch for context and one for target
+        if S_patches < 2:  # Need at least one patch for context and one for target
             return None, None
 
         batch_context_reps = []
@@ -3448,46 +1792,34 @@ class EnhancedCTMDiffusion(nn.Module):
             # Ensure there's enough space for at least num_target_blocks patches left after context
             num_context_patches = min(num_context_patches, S_patches - self.config.jepa_num_target_blocks)
 
-            if num_context_patches <= 0: # Not enough patches to form a context and have targets
-                continue
-
-            # 2. Select context block
-            # Ensure there's enough space for context block and target blocks
-            if S_patches < num_context_patches + self.config.jepa_num_target_blocks:
+            if num_context_patches <= 0:
                 continue
 
             all_indices = torch.arange(S_patches, device=device)
-            
             # Randomly select start for context block
             # Max start index for context ensures that context_block + target_blocks fit
-            max_context_start_idx = S_patches - num_context_patches - self.config.jepa_num_target_blocks
-            if max_context_start_idx < 0: # Should be caught by S_patches check above, but for safety
-                continue
             
-            context_start_idx = random.randint(0, max_context_start_idx)
+            context_start_idx = random.randint(0, S_patches - num_context_patches - self.config.jepa_num_target_blocks)
             context_indices = all_indices[context_start_idx : context_start_idx + num_context_patches]
-            context_block_embeddings = online_patch_embeddings[b_idx, context_indices, :] # (num_context_patches, D_embed)
-            context_rep = context_block_embeddings.mean(dim=0) # (D_embed) - Average context patches
-
+            context_block_embeddings = online_patch_embeddings[b_idx, context_indices, :]
+            context_rep = context_block_embeddings.mean(dim=0)
             # 3. Select target blocks (non-overlapping with context)
             # Create a mask for available target indices
             available_target_mask = torch.ones(S_patches, dtype=torch.bool, device=device)
-            available_target_mask[context_indices] = False # Mask out context indices
-            
+            available_target_mask[context_indices] = False
             potential_target_indices = all_indices[available_target_mask]
 
             if len(potential_target_indices) < self.config.jepa_num_target_blocks:
-                continue # Not enough non-overlapping patches left for the required number of target blocks
+                continue
             
-            # Shuffle potential target indices and select
             shuffled_potential_target_indices = potential_target_indices[torch.randperm(len(potential_target_indices), device=device)]
             actual_target_indices = shuffled_potential_target_indices[:self.config.jepa_num_target_blocks]
             
-            selected_target_patches = target_patch_embeddings[b_idx, actual_target_indices, :] # (num_target_blocks, D_embed)
-            target_rep = selected_target_patches # Keep as distinct blocks, shape (num_target_blocks, D_embed)
+            selected_target_patches = target_patch_embeddings[b_idx, actual_target_indices, :]  # (num_target_blocks, D_embed)
+            target_rep = selected_target_patches  #Keep as distinct blocks, shape (num_target_blocks, D_embed)
 
-            batch_context_reps.append(context_rep) # List of (D_embed)
-            batch_target_reps.append(target_rep)   # List of (num_target_blocks, D_embed)
+            batch_context_reps.append(context_rep)  # List of (D_embed)
+            batch_target_reps.append(target_rep)# List of (num_target_blocks, D_embed)
 
         if not batch_context_reps or not batch_target_reps:
             return None, None
@@ -3521,226 +1853,7 @@ def create_enhanced_config_for_tts_nonverbal(vocab_size: int) -> EnhancedCTMConf
     return config
         
 
-class IntegrationFlowHiPASampler: #Needed for the One Step Diffusion in the Diffusion Controller CTM Class function. 
-    """Advanced Integration Flow sampler with Task-Aware HiPA for CTM integration."""
-    
-    def __init__(self, task_aware_hipa_module: FrequencyDomainAwareAttention, num_steps=50, beta_start=0.0001, beta_end=0.02,
-                 sigma_min=0.01, sigma_max=50.0, hipa_freq_threshold=0.1,
-                 integration_flow_strength=1.0, model_type='VE'):
-        # self.model = model # model argument removed, context_fn will be passed to sample methods
-        self.task_aware_hipa = task_aware_hipa_module # Store the passed HiPA module
-        self.num_steps = num_steps
-        self.model_type = model_type
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.hipa_freq_threshold = hipa_freq_threshold
-        self.integration_flow_strength = integration_flow_strength
-        
-        # Noise schedules for different model types
-        if model_type == 'VE':
-            # Variance Exploding schedule: σ_min * (σ_max/σ_min)^(t/T)
-            t_values = torch.linspace(1, num_steps, num_steps)
-            self.sigma_schedule = sigma_min * (sigma_max / sigma_min) ** (t_values / num_steps)
-        elif model_type == 'RectifiedFlow':
-            # Linear interpolation, no noise schedule needed
-            self.sigma_schedule = torch.zeros(num_steps)
-        elif model_type == 'PFGM++':
-            # Similar to VE but with radius scaling
-            t_values = torch.linspace(1, num_steps, num_steps)
-            self.sigma_schedule = sigma_min * (sigma_max / sigma_min) ** (t_values / num_steps)
-        
-        self.betas = torch.linspace(beta_start, beta_end, num_steps)
-        self.alphas = 1.0 - self.betas
-        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
-        
-        # Pre-compute integration flow trajectory weights
-        self._precompute_integration_weights()
-        # Sampler initialized
-    
-    def _precompute_integration_weights(self):
-        """Pre-compute integration weights for direct trajectory learning."""
-        # Integration Flow: Learn the integral of ODE trajectory paths
-        t_values = torch.linspace(0, 1, self.num_steps)
-        
-        # Compute cumulative integration weights (trapezoidal rule)
-        dt = 1.0 / (self.num_steps - 1) if self.num_steps > 1 else 1.0
-        weights = torch.ones_like(t_values) * dt
-        if len(weights) > 1:
-            weights[0] *= 0.5  # Trapezoidal rule adjustment
-            weights[-1] *= 0.5
-        
-        self.integration_weights = torch.cumsum(weights, dim=0)
-    
-    def _apply_hipa_attention(self, x, task_id=None, freq_domain=True):
-        """Apply Task-Aware HiPA to intelligently enhance frequency details."""
-        if not freq_domain or x.numel() == 0:
-            return x
-        
-        try:
-            # Use task-aware HiPA system for intelligent enhancement
-            enhanced_x, modality_config = self.task_aware_hipa(x, task_id=task_id)
-            
-            # Log modality detection for debugging
-            if hasattr(self, '_debug_mode') and self._debug_mode:
-                print(f"  HiPA Modality Detection:")
-                print(f"  - Detected: {modality_config['modality']}")
-                print(f"  - HiPA Applied: {modality_config['use_hipa']}")
-                if modality_config['use_hipa']:
-                    print(f" - FFT Dims: {modality_config['fft_dims']}")
-                    print(f" - Enhancement: {modality_config['enhancement_strength']:.2f}")
-                else:
-                    print(f" - Reason: Protecting {modality_config['modality']} from frequency corruption")
-            
-            return enhanced_x
-            
-        except Exception as e:
-            print(f"Warning: Task-aware HiPA failed: {e}, using original tensor")
-            return x
-    
-    def _get_preconditioning_params(self, t):
-        """Get preconditioning parameters a_t and b_t based on model type."""
-        if self.model_type == 'VE':
-            # VE: a_t = σ_min/σ_t, b_t = 1 - σ_min/σ_t
-            sigma_t = self.sigma_schedule[min(t, len(self.sigma_schedule)-1)]
-            a_t = self.sigma_min / (sigma_t + 1e-8)
-            b_t = 1.0 - a_t
-        elif self.model_type == 'RectifiedFlow':
-            # Rectified Flow: a_t = 1, b_t = t/T
-            a_t = 1.0
-            b_t = t / self.num_steps
-        elif self.model_type == 'PFGM++':
-            # PFGM++: a_t = 1/√(1+σ_t²), b_t = σ_t/√(1+σ_t²)
-            sigma_t = self.sigma_schedule[min(t, len(self.sigma_schedule)-1)]
-            denom = torch.sqrt(1 + sigma_t**2)
-            a_t = 1.0 / denom
-            b_t = sigma_t / denom
-        else:
-            # Default to simple linear
-            a_t = 1.0
-            b_t = 0.5
-        
-        return a_t, b_t
-    
-    def one_step_sample(self, shape, context_fn, task_id, time_device, text_condition=None,
-                       iterative_refinement=True, num_refinement_steps=2):
-        """Ultra-fast one-step generation using Integration Flow with Task-Aware HiPA."""
-        # Start with noise based on model type
-        if self.model_type == 'VE' or self.model_type == 'PFGM++':
-            # Start with scaled noise
-            x_noise = torch.randn(shape, device=time_device) * self.sigma_max
-        else:  # RectifiedFlow
-            # Start with standard noise
-            x_noise = torch.randn(shape, device=time_device)
-        
-        # Integration Flow: Direct trajectory integration
-        # Use final timestep for one-step generation
-        t_integration = self.num_steps - 1
-        t_tensor = torch.full((shape[0],), t_integration, device=time_device, dtype=torch.long)
-        
-        # Initialize estimate
-        x_est = torch.zeros_like(x_noise)
-        
-        # Iterative refinement as described in Integration Flow paper
-        for step in range(num_refinement_steps if iterative_refinement else 1):
-            try:
-                # Get model prediction G_θ(x_0^(n), x_t, t)
-                if text_condition is not None:
-                    # For TTS with text conditioning - need to adapt context_fn
-                    if hasattr(context_fn, '__call__'):
-                        # Assume context_fn can handle text_condition
-                        G_pred = context_fn(x_noise, t_tensor, task_id, text_condition)
-                    else:
-                        G_pred = context_fn(x_noise, t_tensor, task_id)
-                else:
-                    G_pred = context_fn(x_noise, t_tensor, task_id)
-                
-                # Get preconditioning parameters
-                a_t, b_t = self._get_preconditioning_params(t_integration)
-                
-                # Integration Flow formula: g_θ(x_0, x_t, t) = a_t * x_t + b_t * G_θ(x_0, x_t, t)
-                x_est_new = a_t * x_noise + b_t * G_pred
-                
-                # Apply integration flow strength
-                x_est = x_est + self.integration_flow_strength * (x_est_new - x_est)
-                
-            except Exception as e:
-                # Integration Flow failed
-                if self.model_type == 'VE':
-                    x_est = x_noise / self.sigma_max
-                else:
-                    x_est = x_noise
-                break
-        
-        # Apply Task-Aware HiPA for intelligent frequency enhancement
-        x_final = self._apply_hipa_attention(x_est, task_id=task_id, freq_domain=True)
-        
-        return x_final
-    
-    def sample(self, shape, context_fn, task_id, time_device, text_condition=None,
-              use_one_step=True, **kwargs):
-        """Main sampling function with option for one-step or multi-step."""
-        if use_one_step:
-            return self.one_step_sample(
-                shape, context_fn, task_id, time_device, text_condition,
-                iterative_refinement=kwargs.get('iterative_refinement', True),
-                num_refinement_steps=kwargs.get('num_refinement_steps', 2)
-            )
-        else:
-            # Fallback to multi-step with HiPA enhancement
-            return self._multi_step_sample_with_hipa(
-                shape, context_fn, task_id, time_device, text_condition
-            )
-    
-    def _multi_step_sample_with_hipa(self, shape, context_fn, task_id, time_device, text_condition=None):
-        """Multi-step sampling with HiPA enhancement as fallback."""
-        # Start with appropriate noise
-        if self.model_type == 'VE' or self.model_type == 'PFGM++':
-            x = torch.randn(shape, device=time_device) * self.sigma_max
-        else:
-            x = torch.randn(shape, device=time_device)
-        
-        # Reduced steps with HiPA enhancement
-        step_size = max(1, self.num_steps // 10)  # Use only 10% of steps
-        
-        for i in range(0, self.num_steps, step_size):
-            t = self.num_steps - 1 - i
-            if t < 0:
-                break
-                
-            t_tensor = torch.full((shape[0],), t, device=time_device, dtype=torch.long)
-            
-            try:
-                # Get model prediction
-                if text_condition is not None:
-                    eps_theta = context_fn(x, t_tensor, task_id, text_condition)
-                else:
-                    eps_theta = context_fn(x, t_tensor, task_id)
-                
-                # Apply denoising step based on model type
-                if self.model_type == 'VE':
-                    # VE denoising
-                    sigma_t = self.sigma_schedule[min(t, len(self.sigma_schedule)-1)]
-                    x = x - sigma_t * eps_theta
-                elif self.model_type == 'RectifiedFlow':
-                    # Rectified flow step
-                    dt = 1.0 / self.num_steps
-                    x = x - dt * eps_theta
-                else:  # PFGM++
-                    # Similar to VE
-                    sigma_t = self.sigma_schedule[min(t, len(self.sigma_schedule)-1)]
-                    x = x - sigma_t * eps_theta
-                
-                # Apply HiPA enhancement every few steps
-                if i % (step_size * 2) == 0:
-                    x = self._apply_hipa_attention(x, task_id=task_id, freq_domain=True)
-                    
-            except Exception as e:
-               print(f"Warning: Multi-step sampling failed at step {i}: {e}")
-               break        
-        # Final HiPA enhancement
-        x_final = self._apply_hipa_attention(x, task_id=task_id, freq_domain=True)
-        
-        return x_final
+
 
 class JEPAPredictor(nn.Module):
     """
@@ -3769,4 +1882,3 @@ class JEPAPredictor(nn.Module):
         # x is expected to be the representation of context patches, e.g., (B, D_embed)
         # Output will be (B, patch_embedding_dim * num_target_blocks)
         return self.network(x)
-
